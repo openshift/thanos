@@ -39,7 +39,6 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
-
 	// Load the package into main to make sure minium Go version is met.
 	_ "github.com/prometheus/prometheus/tsdb/goversion"
 	"github.com/prometheus/prometheus/tsdb/wal"
@@ -114,10 +113,6 @@ type Options struct {
 	// Unit agnostic as long as unit is consistent with MinBlockDuration and RetentionDuration.
 	// Typically it is in milliseconds.
 	MaxBlockDuration int64
-
-	// SeriesLifecycleCallback specifies a list of callbacks that will be called during a lifecycle of a series.
-	// It is always a no-op in Prometheus and mainly meant for external users who import TSDB.
-	SeriesLifecycleCallback SeriesLifecycleCallback
 }
 
 // DB handles reads and writes of time series falling into
@@ -313,7 +308,7 @@ func (db *DBReadOnly) FlushWAL(dir string) (returnErr error) {
 	if err != nil {
 		return err
 	}
-	head, err := NewHead(nil, db.logger, w, 1, db.dir, nil, DefaultStripeSize, nil)
+	head, err := NewHead(nil, db.logger, w, 1, DefaultStripeSize)
 	if err != nil {
 		return err
 	}
@@ -372,7 +367,7 @@ func (db *DBReadOnly) Querier(ctx context.Context, mint, maxt int64) (storage.Qu
 		blocks[i] = b
 	}
 
-	head, err := NewHead(nil, db.logger, nil, 1, db.dir, nil, DefaultStripeSize, nil)
+	head, err := NewHead(nil, db.logger, nil, 1, DefaultStripeSize)
 	if err != nil {
 		return nil, err
 	}
@@ -383,14 +378,11 @@ func (db *DBReadOnly) Querier(ctx context.Context, mint, maxt int64) (storage.Qu
 
 	// Also add the WAL if the current blocks don't cover the requests time range.
 	if maxBlockTime <= maxt {
-		if err := head.Close(); err != nil {
-			return nil, err
-		}
 		w, err := wal.Open(db.logger, filepath.Join(db.dir, "wal"))
 		if err != nil {
 			return nil, err
 		}
-		head, err = NewHead(nil, db.logger, w, 1, db.dir, nil, DefaultStripeSize, nil)
+		head, err = NewHead(nil, db.logger, w, 1, DefaultStripeSize)
 		if err != nil {
 			return nil, err
 		}
@@ -402,9 +394,9 @@ func (db *DBReadOnly) Querier(ctx context.Context, mint, maxt int64) (storage.Qu
 		// Set the wal to nil to disable all wal operations.
 		// This is mainly to avoid blocking when closing the head.
 		head.wal = nil
-	}
 
-	db.closers = append(db.closers, head)
+		db.closers = append(db.closers, head)
+	}
 
 	// TODO: Refactor so that it is possible to obtain a Querier without initializing a writable DB instance.
 	// Option 1: refactor DB to have the Querier implementation using the DBReadOnly.Querier implementation not the opposite.
@@ -590,20 +582,19 @@ func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs
 
 	var wlog *wal.WAL
 	segmentSize := wal.DefaultSegmentSize
-	walDir := filepath.Join(dir, "wal")
 	// Wal is enabled.
 	if opts.WALSegmentSize >= 0 {
 		// Wal is set to a custom size.
 		if opts.WALSegmentSize > 0 {
 			segmentSize = opts.WALSegmentSize
 		}
-		wlog, err = wal.NewSize(l, r, walDir, segmentSize, opts.WALCompression)
+		wlog, err = wal.NewSize(l, r, filepath.Join(dir, "wal"), segmentSize, opts.WALCompression)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	db.head, err = NewHead(r, l, wlog, rngs[0], dir, db.chunkPool, opts.StripeSize, opts.SeriesLifecycleCallback)
+	db.head, err = NewHead(r, l, wlog, rngs[0], opts.StripeSize)
 	if err != nil {
 		return nil, err
 	}
@@ -750,7 +741,7 @@ func (db *DB) Compact() (err error) {
 		// consistently, we explicitly remove the last value
 		// from the block interval here.
 		head := NewRangeHead(db.head, mint, maxt-1)
-		if err := db.compactHead(head); err != nil {
+		if err := db.compactHead(head, mint, maxt); err != nil {
 			return err
 		}
 	}
@@ -759,20 +750,17 @@ func (db *DB) Compact() (err error) {
 }
 
 // CompactHead compacts the given the RangeHead.
-func (db *DB) CompactHead(head *RangeHead) (err error) {
+func (db *DB) CompactHead(head *RangeHead, mint, maxt int64) (err error) {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 
-	return db.compactHead(head)
+	return db.compactHead(head, mint, maxt)
 }
 
 // compactHead compacts the given the RangeHead.
 // The compaction mutex should be held before calling this method.
-func (db *DB) compactHead(head *RangeHead) (err error) {
-	// Add +1 millisecond to block maxt because block intervals are half-open: [b.MinTime, b.MaxTime).
-	// Because of this block intervals are always +1 than the total samples it includes.
-	maxt := head.MaxTime() + 1
-	uid, err := db.compactor.Write(db.dir, head, head.MinTime(), maxt, nil)
+func (db *DB) compactHead(head *RangeHead, mint, maxt int64) (err error) {
+	uid, err := db.compactor.Write(db.dir, head, mint, maxt, nil)
 	if err != nil {
 		return errors.Wrap(err, "persist head block")
 	}
@@ -1029,10 +1017,9 @@ func (db *DB) beyondSizeRetention(blocks []*Block) (deletable map[ulid.ULID]*Blo
 	deletable = make(map[ulid.ULID]*Block)
 
 	walSize, _ := db.Head().wal.Size()
-	headChunksSize := db.Head().chunkDiskMapper.Size()
-	// Initializing size counter with WAL size and Head chunks
-	// written to disk, as that is part of the retention strategy.
-	blocksSize := walSize + headChunksSize
+	// Initializing size counter with WAL size,
+	// as that is part of the retention strategy.
+	blocksSize := walSize
 	for i, block := range blocks {
 		blocksSize += block.Size()
 		if blocksSize > int64(db.opts.MaxBytes) {

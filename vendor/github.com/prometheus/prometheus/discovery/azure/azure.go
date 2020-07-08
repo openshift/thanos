@@ -302,9 +302,11 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 				labels[azureLabelMachineScaleSet] = model.LabelValue(vm.ScaleSet)
 			}
 
-			for k, v := range vm.Tags {
-				name := strutil.SanitizeLabelName(k)
-				labels[azureLabelMachineTag+model.LabelName(name)] = model.LabelValue(*v)
+			if vm.Tags != nil {
+				for k, v := range vm.Tags {
+					name := strutil.SanitizeLabelName(k)
+					labels[azureLabelMachineTag+model.LabelName(name)] = model.LabelValue(*v)
+				}
 			}
 
 			// Get the IP address information via separate call to the network provider.

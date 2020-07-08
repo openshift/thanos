@@ -24,7 +24,7 @@ import (
 
 	"golang.org/x/tools/go/internal/packagesdriver"
 	"golang.org/x/tools/internal/gocommand"
-	"golang.org/x/xerrors"
+	"golang.org/x/tools/internal/packagesinternal"
 )
 
 // debug controls verbose logging.
@@ -142,7 +142,7 @@ func goListDriver(cfg *Config, patterns ...string) (*driverResponse, error) {
 		sizeswg.Add(1)
 		go func() {
 			var sizes types.Sizes
-			sizes, sizeserr = packagesdriver.GetSizesGolist(ctx, cfg.BuildFlags, cfg.Env, cfg.gocmdRunner, cfg.Dir)
+			sizes, sizeserr = packagesdriver.GetSizesGolist(ctx, cfg.BuildFlags, cfg.Env, cfg.Dir, usesExportData(cfg))
 			// types.SizesFor always returns nil or a *types.StdSizes.
 			response.dr.Sizes, _ = sizes.(*types.StdSizes)
 			sizeswg.Done()
@@ -381,7 +381,7 @@ type jsonPackage struct {
 	Imports         []string
 	ImportMap       map[string]string
 	Deps            []string
-	Module          *Module
+	Module          *packagesinternal.Module
 	TestGoFiles     []string
 	TestImports     []string
 	XTestGoFiles    []string
@@ -540,26 +540,7 @@ func (state *golistState) createDriverResponse(words ...string) (*driverResponse
 			CompiledGoFiles: absJoin(p.Dir, p.CompiledGoFiles),
 			OtherFiles:      absJoin(p.Dir, otherFiles(p)...),
 			forTest:         p.ForTest,
-			Module:          p.Module,
-		}
-
-		if (state.cfg.Mode&TypecheckCgo) != 0 && len(p.CgoFiles) != 0 {
-			if len(p.CompiledGoFiles) > len(p.GoFiles) {
-				// We need the cgo definitions, which are in the first
-				// CompiledGoFile after the non-cgo ones. This is a hack but there
-				// isn't currently a better way to find it. We also need the pure
-				// Go files and unprocessed cgo files, all of which are already
-				// in pkg.GoFiles.
-				cgoTypes := p.CompiledGoFiles[len(p.GoFiles)]
-				pkg.CompiledGoFiles = append([]string{cgoTypes}, pkg.GoFiles...)
-			} else {
-				// golang/go#38990: go list silently fails to do cgo processing
-				pkg.CompiledGoFiles = nil
-				pkg.Errors = append(pkg.Errors, Error{
-					Msg:  "go list failed to return CompiledGoFiles; https://golang.org/issue/38990?",
-					Kind: ListError,
-				})
-			}
+			module:          p.Module,
 		}
 
 		// Work around https://golang.org/issue/28749:
@@ -735,7 +716,7 @@ func golistargs(cfg *Config, words []string) []string {
 func (state *golistState) invokeGo(verb string, args ...string) (*bytes.Buffer, error) {
 	cfg := state.cfg
 
-	inv := gocommand.Invocation{
+	inv := &gocommand.Invocation{
 		Verb:       verb,
 		Args:       args,
 		BuildFlags: cfg.BuildFlags,
@@ -743,11 +724,8 @@ func (state *golistState) invokeGo(verb string, args ...string) (*bytes.Buffer, 
 		Logf:       cfg.Logf,
 		WorkingDir: cfg.Dir,
 	}
-	gocmdRunner := cfg.gocmdRunner
-	if gocmdRunner == nil {
-		gocmdRunner = &gocommand.Runner{}
-	}
-	stdout, stderr, _, err := gocmdRunner.RunRaw(cfg.Context, inv)
+
+	stdout, stderr, _, err := inv.RunRaw(cfg.Context)
 	if err != nil {
 		// Check for 'go' executable not being found.
 		if ee, ok := err.(*exec.Error); ok && ee.Err == exec.ErrNotFound {
@@ -758,7 +736,7 @@ func (state *golistState) invokeGo(verb string, args ...string) (*bytes.Buffer, 
 		if !ok {
 			// Catastrophic error:
 			// - context cancellation
-			return nil, xerrors.Errorf("couldn't run 'go': %w", err)
+			return nil, fmt.Errorf("couldn't run 'go': %v", err)
 		}
 
 		// Old go version?

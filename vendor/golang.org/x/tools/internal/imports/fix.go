@@ -50,8 +50,7 @@ var importToGroup = []func(env *ProcessEnv, importPath string) (num int, ok bool
 		return
 	},
 	func(_ *ProcessEnv, importPath string) (num int, ok bool) {
-		firstComponent := strings.Split(importPath, "/")[0]
-		if strings.Contains(firstComponent, ".") {
+		if strings.Contains(importPath, ".") {
 			return 1, true
 		}
 		return
@@ -748,8 +747,6 @@ func getPackageExports(ctx context.Context, wrapped func(PackageExport), searchP
 type ProcessEnv struct {
 	LocalPrefix string
 
-	GocmdRunner *gocommand.Runner
-
 	BuildFlags []string
 
 	// If non-empty, these will be used instead of the
@@ -833,7 +830,7 @@ func (e *ProcessEnv) invokeGo(ctx context.Context, verb string, args ...string) 
 		Logf:       e.Logf,
 		WorkingDir: e.WorkingDir,
 	}
-	return e.GocmdRunner.Run(ctx, inv)
+	return inv.Run(ctx)
 }
 
 func addStdlibCandidates(pass *pass, refs references) {

@@ -38,28 +38,17 @@ func (i *isolationState) Close() {
 	i.prev.next = i.next
 }
 
-type isolationAppender struct {
-	appendID uint64
-	prev     *isolationAppender
-	next     *isolationAppender
-}
-
 // isolation is the global isolation state.
 type isolation struct {
 	// Mutex for accessing lastAppendID and appendsOpen.
-	appendMtx sync.RWMutex
+	appendMtx sync.Mutex
+	// Each append is given an internal id.
+	lastAppendID uint64
 	// Which appends are currently in progress.
-	appendsOpen map[uint64]*isolationAppender
-	// New appenders with higher appendID are added to the end. First element keeps lastAppendId.
-	// appendsOpenList.next points to the first element and appendsOpenList.prev points to the last element.
-	// If there are no appenders, both point back to appendsOpenList.
-	appendsOpenList *isolationAppender
-	// Pool of reusable *isolationAppender to save on allocations.
-	appendersPool sync.Pool
-
+	appendsOpen map[uint64]struct{}
 	// Mutex for accessing readsOpen.
 	// If taking both appendMtx and readMtx, take appendMtx first.
-	readMtx sync.RWMutex
+	readMtx sync.Mutex
 	// All current in use isolationStates. This is a doubly-linked list.
 	readsOpen *isolationState
 }
@@ -69,46 +58,47 @@ func newIsolation() *isolation {
 	isoState.next = isoState
 	isoState.prev = isoState
 
-	appender := &isolationAppender{}
-	appender.next = appender
-	appender.prev = appender
-
 	return &isolation{
-		appendsOpen:     map[uint64]*isolationAppender{},
-		appendsOpenList: appender,
-		readsOpen:       isoState,
-		appendersPool:   sync.Pool{New: func() interface{} { return &isolationAppender{} }},
+		appendsOpen: map[uint64]struct{}{},
+		readsOpen:   isoState,
 	}
 }
 
 // lowWatermark returns the appendID below which we no longer need to track
 // which appends were from which appendID.
 func (i *isolation) lowWatermark() uint64 {
-	i.appendMtx.RLock() // Take appendMtx first.
-	defer i.appendMtx.RUnlock()
-	i.readMtx.RLock()
-	defer i.readMtx.RUnlock()
+	i.appendMtx.Lock() // Take appendMtx first.
+	defer i.appendMtx.Unlock()
+	i.readMtx.Lock()
+	defer i.readMtx.Unlock()
 	if i.readsOpen.prev != i.readsOpen {
 		return i.readsOpen.prev.lowWatermark
 	}
-
-	// Lowest appendID from appenders, or lastAppendId.
-	return i.appendsOpenList.next.appendID
+	lw := i.lastAppendID
+	for k := range i.appendsOpen {
+		if k < lw {
+			lw = k
+		}
+	}
+	return lw
 }
 
 // State returns an object used to control isolation
 // between a query and appends. Must be closed when complete.
 func (i *isolation) State() *isolationState {
-	i.appendMtx.RLock() // Take append mutex before read mutex.
-	defer i.appendMtx.RUnlock()
+	i.appendMtx.Lock() // Take append mutex before read mutex.
+	defer i.appendMtx.Unlock()
 	isoState := &isolationState{
-		maxAppendID:       i.appendsOpenList.appendID,
-		lowWatermark:      i.appendsOpenList.next.appendID, // Lowest appendID from appenders, or lastAppendId.
+		maxAppendID:       i.lastAppendID,
+		lowWatermark:      i.lastAppendID,
 		incompleteAppends: make(map[uint64]struct{}, len(i.appendsOpen)),
 		isolation:         i,
 	}
 	for k := range i.appendsOpen {
 		isoState.incompleteAppends[k] = struct{}{}
+		if k < isoState.lowWatermark {
+			isoState.lowWatermark = k
+		}
 	}
 
 	i.readMtx.Lock()
@@ -125,44 +115,15 @@ func (i *isolation) State() *isolationState {
 func (i *isolation) newAppendID() uint64 {
 	i.appendMtx.Lock()
 	defer i.appendMtx.Unlock()
-
-	// Last used appendID is stored in head element.
-	i.appendsOpenList.appendID++
-
-	app := i.appendersPool.Get().(*isolationAppender)
-	app.appendID = i.appendsOpenList.appendID
-	app.prev = i.appendsOpenList.prev
-	app.next = i.appendsOpenList
-
-	i.appendsOpenList.prev.next = app
-	i.appendsOpenList.prev = app
-
-	i.appendsOpen[app.appendID] = app
-	return app.appendID
-}
-
-func (i *isolation) lastAppendID() uint64 {
-	i.appendMtx.RLock()
-	defer i.appendMtx.RUnlock()
-
-	return i.appendsOpenList.appendID
+	i.lastAppendID++
+	i.appendsOpen[i.lastAppendID] = struct{}{}
+	return i.lastAppendID
 }
 
 func (i *isolation) closeAppend(appendID uint64) {
 	i.appendMtx.Lock()
 	defer i.appendMtx.Unlock()
-
-	app := i.appendsOpen[appendID]
-	if app != nil {
-		app.prev.next = app.next
-		app.next.prev = app.prev
-
-		delete(i.appendsOpen, appendID)
-
-		// Clear all fields, and return to the pool.
-		*app = isolationAppender{}
-		i.appendersPool.Put(app)
-	}
+	delete(i.appendsOpen, appendID)
 }
 
 // The transactionID ring buffer.
