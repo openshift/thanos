@@ -5,9 +5,6 @@ package storepb
 
 import (
 	"bytes"
-	"fmt"
-	"sort"
-	"strconv"
 	"strings"
 	"unsafe"
 

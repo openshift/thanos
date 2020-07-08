@@ -32,7 +32,7 @@ require (
 	github.com/leanovate/gopter v0.2.4
 	github.com/lightstep/lightstep-tracer-go v0.18.1
 	github.com/lovoo/gcloud-opentracing v0.3.0
-	github.com/miekg/dns v1.1.29
+	github.com/miekg/dns v1.1.27
 	github.com/minio/minio-go/v6 v6.0.56
 	github.com/mozillazg/go-cos v0.13.0
 	github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f
@@ -74,9 +74,8 @@ replace (
 	// Mitigation for: https://github.com/Azure/go-autorest/issues/414
 	github.com/Azure/go-autorest => github.com/Azure/go-autorest v12.3.0+incompatible
 	// Make sure Cortex is not forcing us to some other Prometheus version.
-	github.com/prometheus/prometheus => github.com/prometheus/prometheus v1.8.2-0.20200609165731-66dfb951c4ca
-	k8s.io/klog => k8s.io/klog v0.3.1
-	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20190228160746-b3a7cee44a30
+	github.com/prometheus/prometheus => github.com/prometheus/prometheus v1.8.2-0.20200420120812-fc3fb3265a0f // @fc3fb3265a0f0061d07d0bf5fb4103e2144565b2 (master around v2.17.2).
+	k8s.io/klog => github.com/simonpasquier/klog-gokit v0.1.0
 )
 
 go 1.13

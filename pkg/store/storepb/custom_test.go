@@ -380,17 +380,6 @@ func expandSeriesSet(t *testing.T, gotSS SeriesSet) (ret []rawSeries) {
 	return ret
 }
 
-func TestExtendLabels(t *testing.T) {
-	testutil.Equals(t, []Label{{Name: "a", Value: "1"}, {Name: "replica", Value: "01"}, {Name: "xb", Value: "2"}},
-		ExtendLabels([]Label{{Name: "xb", Value: "2"}, {Name: "a", Value: "1"}}, labels.FromStrings("replica", "01")))
-
-	testutil.Equals(t, []Label{{Name: "replica", Value: "01"}},
-		ExtendLabels([]Label{}, labels.FromStrings("replica", "01")))
-
-	testutil.Equals(t, []Label{{Name: "a", Value: "1"}, {Name: "replica", Value: "01"}, {Name: "xb", Value: "2"}},
-		ExtendLabels([]Label{{Name: "xb", Value: "2"}, {Name: "replica", Value: "NOT01"}, {Name: "a", Value: "1"}}, labels.FromStrings("replica", "01")))
-}
-
 // Test the cost of merging series sets for different number of merged sets and their size.
 func BenchmarkMergedSeriesSet(b *testing.B) {
 	b.Run("overlapping chunks", func(b *testing.B) {
