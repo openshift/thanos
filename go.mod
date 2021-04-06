@@ -23,7 +23,7 @@ require (
 	github.com/gogo/protobuf v1.3.1
 	github.com/gogo/status v1.0.3
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e
-	github.com/golang/snappy v0.0.2
+	github.com/golang/snappy v0.0.3
 	github.com/googleapis/gax-go v2.0.2+incompatible
 	github.com/gophercloud/gophercloud v0.13.0
 	github.com/grpc-ecosystem/go-grpc-middleware v1.1.0
