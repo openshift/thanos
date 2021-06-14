@@ -3,22 +3,36 @@ component: "Monitoring"
 reviewers:
 - kakkoyun
 - paulfantom
-- s-urbaniak
 - simonpasquier
 - squat
 - bwplotka
 - dgrisonnet
 - jan--f
+- slashpai
+- prashbnair
+- arajkumar
+- sthaha
+- PhilipGough
+- bison
+- fpetkovski
+- raptorsun
 
 approvers:
 - kakkoyun
 - paulfantom
-- s-urbaniak
 - simonpasquier
 - squat
 - bwplotka
 - dgrisonnet
 - jan--f
+- slashpai
+- prashbnair
+- arajkumar
+- sthaha
+- PhilipGough
+- bison
+- fpetkovski
+- raptorsun
 
 emeritus_approvers:
 - metalmatze
@@ -26,3 +40,4 @@ emeritus_approvers:
 - brancz
 - krasi-georgiev
 - pgier
+- s-urbaniak
