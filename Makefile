@@ -11,13 +11,13 @@ arch = $(shell uname -m)
 # Run `DOCKER_CLI_EXPERIMENTAL=enabled docker manifest inspect quay.io/prometheus/busybox:latest` to get SHA or
 # just visit https://quay.io/repository/prometheus/busybox?tag=latest&tab=tags.
 # TODO(bwplotka): Pinning is important but somehow quay kills the old images, so make sure to update regularly.
-# Update at 2021.6.07
+# Update at 2021.12.08
 ifeq ($(arch), x86_64)
     # amd64
-    BASE_DOCKER_SHA="de4af55df1f648a334e16437c550a2907e0aed4f0b0edf454b0b215a9349bdbb"
+    BASE_DOCKER_SHA="768a51a5f71827471e6e58f0d6200c2fa24f2cb5cde1ecbd67fe28f93d4ef464"
 else ifeq ($(arch), armv8)
     # arm64
-    BASE_DOCKER_SHA="5591971699f6cf8abf6776495385e9d62751111a8cba56bf4946cf1d0de425ed"
+    BASE_DOCKER_SHA="042d6195e1793b226d1632117cccb4c4906c8ab393b8b68328ad43cf59c64f9d"
 else
     echo >&2 "only support amd64 or arm64 arch" && exit 1
 endif
