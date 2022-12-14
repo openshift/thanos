@@ -29,6 +29,8 @@ import (
 	"github.com/leanovate/gopter/gen"
 	"github.com/leanovate/gopter/prop"
 	"github.com/oklog/ulid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
@@ -36,10 +38,10 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/encoding"
-	"github.com/thanos-io/objstore/providers/filesystem"
 	"go.uber.org/atomic"
 
 	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/providers/filesystem"
 
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/indexheader"
@@ -1082,7 +1084,7 @@ func uploadTestBlock(t testing.TB, tmpDir string, bkt objstore.Bucket, series in
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = tmpDir
 	headOpts.ChunkRange = 1000
-	h, err := tsdb.NewHead(nil, nil, nil, headOpts, nil)
+	h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
 	testutil.Ok(t, err)
 	defer func() {
 		testutil.Ok(t, h.Close())
@@ -1460,7 +1462,7 @@ func TestBucketSeries_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 	// This allows to pick time range that will correspond to number of series picked 1:1.
 	{
 		// Block 1.
-		h, err := tsdb.NewHead(nil, nil, nil, headOpts, nil)
+		h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
 		testutil.Ok(t, err)
 		defer func() { testutil.Ok(t, h.Close()) }()
 
@@ -1499,7 +1501,7 @@ func TestBucketSeries_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 	var b2 *bucketBlock
 	{
 		// Block 2, do not load this block yet.
-		h, err := tsdb.NewHead(nil, nil, nil, headOpts, nil)
+		h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
 		testutil.Ok(t, err)
 		defer func() { testutil.Ok(t, h.Close()) }()
 
@@ -1740,7 +1742,7 @@ func TestSeries_BlockWithMultipleChunks(t *testing.T) {
 	headOpts.ChunkDirRoot = filepath.Join(tmpDir, "block")
 	headOpts.ChunkRange = 10000000000
 
-	h, err := tsdb.NewHead(nil, nil, nil, headOpts, nil)
+	h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, h.Close()) }()
 
@@ -1887,7 +1889,7 @@ func createBlockWithOneSeriesWithStep(t testutil.TB, dir string, lbls labels.Lab
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = dir
 	headOpts.ChunkRange = int64(totalSamples) * step
-	h, err := tsdb.NewHead(nil, nil, nil, headOpts, nil)
+	h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, h.Close()) }()
 
@@ -2286,6 +2288,11 @@ func benchmarkBlockSeriesWithConcurrency(b *testing.B, concurrency int, blockMet
 	// No limits.
 	chunksLimiter := NewChunksLimiterFactory(0)(nil)
 	seriesLimiter := NewSeriesLimiterFactory(0)(nil)
+	dummyCounter := promauto.NewCounter(prometheus.CounterOpts{
+		Name: "dummy",
+		Help: "dummy help",
+	})
+	ctx := context.Background()
 
 	// Run multiple workers to execute the queries.
 	wg := sync.WaitGroup{}
@@ -2319,7 +2326,7 @@ func benchmarkBlockSeriesWithConcurrency(b *testing.B, concurrency int, blockMet
 				indexReader := blk.indexReader()
 				chunkReader := blk.chunkReader()
 
-				seriesSet, _, err := blockSeries(context.Background(), nil, indexReader, chunkReader, matchers, chunksLimiter, seriesLimiter, req.SkipChunks, req.MinTime, req.MaxTime, req.Aggregates, nil)
+				seriesSet, _, err := blockSeries(ctx, nil, indexReader, chunkReader, matchers, chunksLimiter, seriesLimiter, req.SkipChunks, req.MinTime, req.MaxTime, req.Aggregates, nil, dummyCounter)
 				testutil.Ok(b, err)
 
 				// Ensure at least 1 series has been returned (as expected).
