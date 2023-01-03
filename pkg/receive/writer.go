@@ -13,7 +13,6 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 
-	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 )
@@ -50,6 +49,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		numSamplesOutOfOrder  = 0
 		numSamplesDuplicates  = 0
 		numSamplesOutOfBounds = 0
+		numSamplesTooOld      = 0
 
 		numExemplarsOutOfOrder  = 0
 		numExemplarsDuplicate   = 0
@@ -72,7 +72,7 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 
 	var (
 		ref  storage.SeriesRef
-		errs errutil.MultiError
+		errs writeErrors
 	)
 	for _, t := range wreq.Timeseries {
 		// Check if time series labels are valid. If not, skip the time series
@@ -120,6 +120,9 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 			case storage.ErrOutOfBounds:
 				numSamplesOutOfBounds++
 				level.Debug(tLogger).Log("msg", "Out of bounds metric", "lset", lset, "value", s.Value, "timestamp", s.Timestamp)
+			case storage.ErrTooOldSample:
+				numSamplesTooOld++
+				level.Debug(tLogger).Log("msg", "Sample is too old", "lset", lset, "value", s.Value, "timestamp", s.Timestamp)
 			default:
 				if err != nil {
 					level.Debug(tLogger).Log("msg", "Error ingesting sample", "err", err)
@@ -185,6 +188,10 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 		level.Warn(tLogger).Log("msg", "Error on ingesting samples that are too old or are too far into the future", "numDropped", numSamplesOutOfBounds)
 		errs.Add(errors.Wrapf(storage.ErrOutOfBounds, "add %d samples", numSamplesOutOfBounds))
 	}
+	if numSamplesTooOld > 0 {
+		level.Warn(tLogger).Log("msg", "Error on ingesting samples that are outside of the allowed out-of-order time window", "numDropped", numSamplesTooOld)
+		errs.Add(errors.Wrapf(storage.ErrTooOldSample, "add %d samples", numSamplesTooOld))
+	}
 
 	if numExemplarsOutOfOrder > 0 {
 		level.Warn(tLogger).Log("msg", "Error on ingesting out-of-order exemplars", "numDropped", numExemplarsOutOfOrder)
@@ -202,5 +209,5 @@ func (r *Writer) Write(ctx context.Context, tenantID string, wreq *prompb.WriteR
 	if err := app.Commit(); err != nil {
 		errs.Add(errors.Wrap(err, "commit samples"))
 	}
-	return errs.Err()
+	return errs.ErrOrNil()
 }
