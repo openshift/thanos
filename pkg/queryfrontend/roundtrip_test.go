@@ -19,12 +19,12 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/weaveworks/common/user"
 
+	"github.com/efficientgo/core/testutil"
 	cortexcache "github.com/thanos-io/thanos/internal/cortex/chunk/cache"
 	"github.com/thanos-io/thanos/internal/cortex/cortexpb"
 	"github.com/thanos-io/thanos/internal/cortex/querier/queryrange"
 	cortexvalidation "github.com/thanos-io/thanos/internal/cortex/util/validation"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 const (
@@ -75,6 +75,7 @@ func TestRoundTripRetryMiddleware(t *testing.T) {
 		Start: 0,
 		End:   2 * hour,
 		Step:  10 * seconds,
+		Query: "foo",
 	}
 
 	testLabelsRequest := &ThanosLabelsRequest{Path: "/api/v1/labels", Start: 0, End: 2 * hour}
@@ -222,6 +223,7 @@ func TestRoundTripSplitIntervalMiddleware(t *testing.T) {
 		Start: 0,
 		End:   2 * hour,
 		Step:  10 * seconds,
+		Query: "foo",
 	}
 
 	testLabelsRequest := &ThanosLabelsRequest{
@@ -395,6 +397,7 @@ func TestRoundTripQueryRangeCacheMiddleware(t *testing.T) {
 		Step:                10 * seconds,
 		MaxSourceResolution: 1 * seconds,
 		Dedup:               true, // Deduplication is enabled by default.
+		Query:               "foo",
 	}
 
 	testRequestWithoutDedup := &ThanosQueryRangeRequest{
@@ -404,6 +407,7 @@ func TestRoundTripQueryRangeCacheMiddleware(t *testing.T) {
 		Step:                10 * seconds,
 		MaxSourceResolution: 1 * seconds,
 		Dedup:               false,
+		Query:               "foo",
 	}
 
 	// Same query params as testRequest, different maxSourceResolution
@@ -415,6 +419,7 @@ func TestRoundTripQueryRangeCacheMiddleware(t *testing.T) {
 		Step:                10 * seconds,
 		MaxSourceResolution: 10 * seconds,
 		Dedup:               true,
+		Query:               "foo",
 	}
 
 	// Same query params as testRequest, different maxSourceResolution
@@ -426,6 +431,7 @@ func TestRoundTripQueryRangeCacheMiddleware(t *testing.T) {
 		Step:                10 * seconds,
 		MaxSourceResolution: 1 * hour,
 		Dedup:               true,
+		Query:               "foo",
 	}
 
 	// Same query params as testRequest, but with storeMatchers
@@ -437,6 +443,7 @@ func TestRoundTripQueryRangeCacheMiddleware(t *testing.T) {
 		MaxSourceResolution: 1 * seconds,
 		StoreMatchers:       [][]*labels.Matcher{{labels.MustNewMatcher(labels.MatchEqual, "foo", "bar")}},
 		Dedup:               true,
+		Query:               "foo",
 	}
 
 	cacheConf := &queryrange.ResultsCacheConfig{
@@ -487,6 +494,7 @@ func TestRoundTripQueryRangeCacheMiddleware(t *testing.T) {
 				End:   25 * hour,
 				Step:  10 * seconds,
 				Dedup: true,
+				Query: "foo",
 			},
 			expected: 6,
 		},
@@ -498,6 +506,7 @@ func TestRoundTripQueryRangeCacheMiddleware(t *testing.T) {
 				End:   25 * hour,
 				Step:  10 * seconds,
 				Dedup: true,
+				Query: "foo",
 			},
 			expected: 6,
 		},
