@@ -21,13 +21,13 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/exemplars/exemplarspb"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func TestMultiTSDB(t *testing.T) {
@@ -166,11 +166,11 @@ func TestMultiTSDB(t *testing.T) {
 var (
 	expectedFooResp = &storepb.Series{
 		Labels: []labelpb.ZLabel{{Name: "a", Value: "1"}, {Name: "b", Value: "2"}, {Name: "replica", Value: "01"}, {Name: "tenant_id", Value: "foo"}},
-		Chunks: []storepb.AggrChunk{{MinTime: 1, MaxTime: 3, Raw: &storepb.Chunk{Data: []byte("\000\003\002@\003L\235\2354X\315\001\330\r\257Mui\251\327:U")}}},
+		Chunks: []storepb.AggrChunk{{MinTime: 1, MaxTime: 3, Raw: &storepb.Chunk{Data: []byte("\000\003\002@\003L\235\2354X\315\001\330\r\257Mui\251\327:U"), Hash: 9768694233508509040}}},
 	}
 	expectedBarResp = &storepb.Series{
 		Labels: []labelpb.ZLabel{{Name: "a", Value: "1"}, {Name: "b", Value: "2"}, {Name: "replica", Value: "01"}, {Name: "tenant_id", Value: "bar"}},
-		Chunks: []storepb.AggrChunk{{MinTime: 1, MaxTime: 3, Raw: &storepb.Chunk{Data: []byte("\000\003\002@4i\223\263\246\213\032\001\330\035i\337\322\352\323S\256t\270")}}},
+		Chunks: []storepb.AggrChunk{{MinTime: 1, MaxTime: 3, Raw: &storepb.Chunk{Data: []byte("\000\003\002@4i\223\263\246\213\032\001\330\035i\337\322\352\323S\256t\270"), Hash: 2304287992246504442}}},
 	}
 )
 
@@ -388,14 +388,14 @@ func TestMultiTSDBPrune(t *testing.T) {
 		{
 			name:            "prune tsdbs without object storage",
 			bucket:          nil,
-			expectedTenants: 1,
+			expectedTenants: 2,
 			expectedUploads: 0,
 		},
 		{
 			name:            "prune tsdbs with object storage",
 			bucket:          objstore.NewInMemBucket(),
-			expectedTenants: 1,
-			expectedUploads: 2,
+			expectedTenants: 2,
+			expectedUploads: 1,
 		},
 	}
 
@@ -419,7 +419,7 @@ func TestMultiTSDBPrune(t *testing.T) {
 
 			for i := 0; i < 100; i++ {
 				testutil.Ok(t, appendSample(m, "foo", time.UnixMilli(int64(10+i))))
-				testutil.Ok(t, appendSample(m, "bar", time.UnixMilli(int64(10+i))))
+				testutil.Ok(t, appendSample(m, "bar", time.Now().Add(-4*time.Hour)))
 				testutil.Ok(t, appendSample(m, "baz", time.Now().Add(time.Duration(i)*time.Second)))
 			}
 			testutil.Equals(t, 3, len(m.TSDBLocalClients()))

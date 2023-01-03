@@ -406,7 +406,6 @@ func runCompact(
 		defer cleanMtx.Unlock()
 
 		if err := sy.SyncMetas(ctx); err != nil {
-			cancel()
 			return errors.Wrap(err, "syncing metas")
 		}
 
@@ -557,7 +556,19 @@ func runCompact(
 		// since one iteration potentially could take a long time.
 		if conf.cleanupBlocksInterval > 0 {
 			g.Add(func() error {
-				return runutil.Repeat(conf.cleanupBlocksInterval, ctx.Done(), cleanPartialMarked)
+				return runutil.Repeat(conf.cleanupBlocksInterval, ctx.Done(), func() error {
+					err := cleanPartialMarked()
+					if err != nil && compact.IsRetryError(err) {
+						// The RetryError signals that we hit an retriable error (transient error, no connection).
+						// You should alert on this being triggered too frequently.
+						level.Error(logger).Log("msg", "retriable error", "err", err)
+						compactMetrics.retried.Inc()
+
+						return nil
+					}
+
+					return err
+				})
 			}, func(error) {
 				cancel()
 			})
@@ -576,6 +587,15 @@ func runCompact(
 				return runutil.Repeat(conf.progressCalculateInterval, ctx.Done(), func() error {
 
 					if err := sy.SyncMetas(ctx); err != nil {
+						// The RetryError signals that we hit an retriable error (transient error, no connection).
+						// You should alert on this being triggered too frequently.
+						if compact.IsRetryError(err) {
+							level.Error(logger).Log("msg", "retriable error", "err", err)
+							compactMetrics.retried.Inc()
+
+							return nil
+						}
+
 						return errors.Wrapf(err, "could not sync metas")
 					}
 
