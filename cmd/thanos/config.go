@@ -182,6 +182,7 @@ type queryConfig struct {
 	dnsSDInterval time.Duration
 	httpMethod    string
 	dnsSDResolver string
+	step          time.Duration
 }
 
 func (qc *queryConfig) registerFlag(cmd extkingpin.FlagClause) *queryConfig {
@@ -201,6 +202,8 @@ func (qc *queryConfig) registerFlag(cmd extkingpin.FlagClause) *queryConfig {
 	// See https://bugzilla.redhat.com/show_bug.cgi?id=1953518
 	cmd.Flag("query.sd-dns-resolver", "Resolver to use. Possible options: [golang, miekgdns]").
 		Default("miekgdns").Hidden().StringVar(&qc.dnsSDResolver)
+	cmd.Flag("query.default-step", "Default range query step to use. This is only used in stateless Ruler and alert state restoration.").
+		Default("1s").DurationVar(&qc.step)
 	return qc
 }
 

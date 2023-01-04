@@ -17,11 +17,11 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/cacheutil"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/queryfrontend"
-	"github.com/thanos-io/thanos/pkg/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 	"github.com/thanos-io/thanos/test/e2e/e2ethanos"
 )
@@ -594,7 +594,7 @@ func TestRangeQueryShardingWithRandomData(t *testing.T) {
 func TestRangeQueryDynamicHorizontalSharding(t *testing.T) {
 	t.Parallel()
 
-	e, err := e2e.NewDockerEnvironment("query-frontend")
+	e, err := e2e.New(e2e.WithName("qfe-dyn-sharding"))
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 

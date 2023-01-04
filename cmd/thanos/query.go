@@ -29,6 +29,7 @@ import (
 
 	v1 "github.com/prometheus/prometheus/web/api/v1"
 	"github.com/thanos-community/promql-engine/engine"
+
 	apiv1 "github.com/thanos-io/thanos/pkg/api/query"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
@@ -97,7 +98,8 @@ func registerQuery(app *extkingpin.App) {
 
 	queryTimeout := extkingpin.ModelDuration(cmd.Flag("query.timeout", "Maximum time to process query by query node.").
 		Default("2m"))
-	promqlEngine := cmd.Flag("query.promql-engine", "PromQL engine to use.").Default(string(promqlEnginePrometheus)).Hidden().
+
+	promqlEngine := cmd.Flag("query.promql-engine", "PromQL engine to use.").Default(string(promqlEnginePrometheus)).
 		Enum(string(promqlEnginePrometheus), string(promqlEngineThanos))
 
 	maxConcurrentQueries := cmd.Flag("query.max-concurrent", "Maximum number of queries processed concurrently by query node.").
@@ -108,6 +110,10 @@ func registerQuery(app *extkingpin.App) {
 
 	maxConcurrentSelects := cmd.Flag("query.max-concurrent-select", "Maximum number of select requests made concurrently per a query.").
 		Default("4").Int()
+
+	queryConnMetricLabels := cmd.Flag("query.conn-metric.label", "Optional selection of query connection metric labels to be collected from endpoint set").
+		Default(string(query.ExternalLabels), string(query.StoreType)).
+		Enums(string(query.ExternalLabels), string(query.StoreType))
 
 	queryReplicaLabels := cmd.Flag("query.replica-label", "Labels to treat as a replica indicator along which data is deduplicated. Still you will be able to query without deduplication using 'dedup=false' parameter. Data includes time series, recording rules, and alerting rules.").
 		Strings()
@@ -280,6 +286,7 @@ func registerQuery(app *extkingpin.App) {
 			*dynamicLookbackDelta,
 			time.Duration(*defaultEvaluationInterval),
 			time.Duration(*storeResponseTimeout),
+			*queryConnMetricLabels,
 			*queryReplicaLabels,
 			selectorLset,
 			getFlagsMap(cmd.Flags()),
@@ -355,6 +362,7 @@ func runQuery(
 	dynamicLookbackDelta bool,
 	defaultEvaluationInterval time.Duration,
 	storeResponseTimeout time.Duration,
+	queryConnMetricLabels []string,
 	queryReplicaLabels []string,
 	selectorLset labels.Labels,
 	flagsMap map[string]string,
@@ -497,6 +505,7 @@ func runQuery(
 			dialOpts,
 			unhealthyStoreTimeout,
 			endpointInfoTimeout,
+			queryConnMetricLabels...,
 		)
 		proxy            = store.NewProxyStore(logger, reg, endpoints.GetStoreClients, component.Query, selectorLset, storeResponseTimeout, store.RetrievalStrategy(grpcProxyStrategy))
 		rulesProxy       = rules.NewProxy(logger, endpoints.GetRulesClients)
