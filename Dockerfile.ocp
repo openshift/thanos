@@ -4,6 +4,7 @@ COPY . .
 ENV GOFLAGS="-mod=vendor"
 ENV GO111MODULE=on
 ENV GOPROXY=direct
+RUN go version
 # Installing using the upstream Makefile doesn't work with older versions of Git and newer versions of Go.
 # Instead install promu from the upstream tarball.
 # For downstream builds, promu is available from the package repositories.
