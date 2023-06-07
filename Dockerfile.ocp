@@ -1,3 +1,4 @@
+# test
 FROM registry.ci.openshift.org/ocp/builder:rhel-8-golang-1.18-openshift-4.11 AS builder
 WORKDIR /go/src/github.com/improbable-eng/thanos
 COPY . .
