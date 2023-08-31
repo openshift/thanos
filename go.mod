@@ -66,7 +66,7 @@ require (
 	github.com/prometheus/client_golang v1.12.1
 	github.com/prometheus/client_model v0.2.0
 	github.com/prometheus/common v0.34.0
-	github.com/prometheus/exporter-toolkit v0.7.1
+	github.com/prometheus/exporter-toolkit v0.7.3
 	github.com/prometheus/prometheus v1.8.2-0.20220308163432-03831554a519
 	github.com/tencentyun/cos-go-sdk-v5 v0.7.31
 	github.com/uber/jaeger-client-go v2.30.0+incompatible
