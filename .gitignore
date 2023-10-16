@@ -10,7 +10,7 @@ kube/.kube
 kube/.minikube
 
 # Ignore e2e working dirs.
-data/
+/data/
 test/e2e/e2e_*
 
 # Ignore promu artifacts.
