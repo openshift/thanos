@@ -11,6 +11,7 @@ import (
 	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/prometheus/prometheus/promql/parser"
 
@@ -28,12 +29,12 @@ var DefaultOptimizers = []Optimizer{
 }
 
 type Plan interface {
-	Optimize([]Optimizer) Plan
+	Optimize([]Optimizer) (Plan, annotations.Annotations)
 	Expr() parser.Expr
 }
 
 type Optimizer interface {
-	Optimize(expr parser.Expr, opts *query.Options) parser.Expr
+	Optimize(plan parser.Expr, opts *query.Options) (parser.Expr, annotations.Annotations)
 }
 
 type plan struct {
@@ -46,18 +47,24 @@ func New(expr parser.Expr, opts *query.Options) Plan {
 	setOffsetForAtModifier(opts.Start.UnixMilli(), expr)
 	setOffsetForInnerSubqueries(expr, opts)
 
+	// the engine handles sorting at the presentation layer
+	expr = trimSorts(expr)
+
 	return &plan{
 		expr: expr,
 		opts: opts,
 	}
 }
 
-func (p *plan) Optimize(optimizers []Optimizer) Plan {
+func (p *plan) Optimize(optimizers []Optimizer) (Plan, annotations.Annotations) {
+	annos := annotations.New()
 	for _, o := range optimizers {
-		p.expr = o.Optimize(p.expr, p.opts)
+		var a annotations.Annotations
+		p.expr, a = o.Optimize(p.expr, p.opts)
+		annos.Merge(a)
 	}
 
-	return &plan{expr: p.expr, opts: p.opts}
+	return &plan{expr: p.expr, opts: p.opts}, *annos
 }
 
 func (p *plan) Expr() parser.Expr {
@@ -67,11 +74,16 @@ func (p *plan) Expr() parser.Expr {
 func traverse(expr *parser.Expr, transform func(*parser.Expr)) {
 	switch node := (*expr).(type) {
 	case *parser.StepInvariantExpr:
-		transform(&node.Expr)
+		traverse(&node.Expr, transform)
 	case *parser.VectorSelector:
 		transform(expr)
+	case *VectorSelector:
+		var x parser.Expr = node.VectorSelector
+		transform(expr)
+		traverse(&x, transform)
 	case *parser.MatrixSelector:
-		transform(&node.VectorSelector)
+		transform(expr)
+		traverse(&node.VectorSelector, transform)
 	case *parser.AggregateExpr:
 		transform(expr)
 		traverse(&node.Expr, transform)
@@ -94,12 +106,20 @@ func traverse(expr *parser.Expr, transform func(*parser.Expr)) {
 
 func TraverseBottomUp(parent *parser.Expr, current *parser.Expr, transform func(parent *parser.Expr, node *parser.Expr) bool) bool {
 	switch node := (*current).(type) {
+	case *parser.StringLiteral:
+		return false
 	case *parser.NumberLiteral:
 		return false
 	case *parser.StepInvariantExpr:
 		return TraverseBottomUp(current, &node.Expr, transform)
 	case *parser.VectorSelector:
 		return transform(parent, current)
+	case *VectorSelector:
+		if stop := transform(parent, current); stop {
+			return stop
+		}
+		var x parser.Expr = node.VectorSelector
+		return TraverseBottomUp(current, &x, transform)
 	case *parser.MatrixSelector:
 		return transform(current, &node.VectorSelector)
 	case *parser.AggregateExpr:
@@ -124,12 +144,32 @@ func TraverseBottomUp(parent *parser.Expr, current *parser.Expr, transform func(
 	case *parser.UnaryExpr:
 		return TraverseBottomUp(current, &node.Expr, transform)
 	case *parser.ParenExpr:
-		return TraverseBottomUp(current, &node.Expr, transform)
+		if stop := TraverseBottomUp(current, &node.Expr, transform); stop {
+			return stop
+		}
+		return transform(parent, current)
 	case *parser.SubqueryExpr:
 		return TraverseBottomUp(current, &node.Expr, transform)
 	}
 
 	return true
+}
+
+func trimSorts(expr parser.Expr) parser.Expr {
+	TraverseBottomUp(nil, &expr, func(parent, current *parser.Expr) bool {
+		if current == nil || parent == nil {
+			return true
+		}
+		switch e := (*parent).(type) {
+		case *parser.Call:
+			switch e.Func.Name {
+			case "sort", "sort_desc":
+				*parent = *current
+			}
+		}
+		return false
+	})
+	return expr
 }
 
 // preprocessExpr wraps all possible step invariant parts of the given expression with
