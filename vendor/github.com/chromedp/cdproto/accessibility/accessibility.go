@@ -53,7 +53,7 @@ type GetPartialAXTreeParams struct {
 	NodeID         cdp.NodeID             `json:"nodeId,omitempty"`         // Identifier of the node to get the partial accessibility tree for.
 	BackendNodeID  cdp.BackendNodeID      `json:"backendNodeId,omitempty"`  // Identifier of the backend node to get the partial accessibility tree for.
 	ObjectID       runtime.RemoteObjectID `json:"objectId,omitempty"`       // JavaScript object id of the node wrapper to get the partial accessibility tree for.
-	FetchRelatives bool                   `json:"fetchRelatives,omitempty"` // Whether to fetch this nodes ancestors, siblings and children. Defaults to true.
+	FetchRelatives bool                   `json:"fetchRelatives,omitempty"` // Whether to fetch this node's ancestors, siblings and children. Defaults to true.
 }
 
 // GetPartialAXTree fetches the accessibility node and partial accessibility
@@ -87,7 +87,7 @@ func (p GetPartialAXTreeParams) WithObjectID(objectID runtime.RemoteObjectID) *G
 	return &p
 }
 
-// WithFetchRelatives whether to fetch this nodes ancestors, siblings and
+// WithFetchRelatives whether to fetch this node's ancestors, siblings and
 // children. Defaults to true.
 func (p GetPartialAXTreeParams) WithFetchRelatives(fetchRelatives bool) *GetPartialAXTreeParams {
 	p.FetchRelatives = fetchRelatives
@@ -102,7 +102,8 @@ type GetPartialAXTreeReturns struct {
 // Do executes Accessibility.getPartialAXTree against the provided context.
 //
 // returns:
-//   nodes - The Accessibility.AXNode for this DOM node, if it exists, plus its ancestors, siblings and children, if requested.
+//
+//	nodes - The Accessibility.AXNode for this DOM node, if it exists, plus its ancestors, siblings and children, if requested.
 func (p *GetPartialAXTreeParams) Do(ctx context.Context) (nodes []*Node, err error) {
 	// execute
 	var res GetPartialAXTreeReturns
@@ -152,7 +153,8 @@ type GetFullAXTreeReturns struct {
 // Do executes Accessibility.getFullAXTree against the provided context.
 //
 // returns:
-//   nodes
+//
+//	nodes
 func (p *GetFullAXTreeParams) Do(ctx context.Context) (nodes []*Node, err error) {
 	// execute
 	var res GetFullAXTreeReturns
@@ -195,7 +197,8 @@ type GetRootAXNodeReturns struct {
 // Do executes Accessibility.getRootAXNode against the provided context.
 //
 // returns:
-//   node
+//
+//	node
 func (p *GetRootAXNodeParams) Do(ctx context.Context) (node *Node, err error) {
 	// execute
 	var res GetRootAXNodeReturns
@@ -251,7 +254,8 @@ type GetAXNodeAndAncestorsReturns struct {
 // Do executes Accessibility.getAXNodeAndAncestors against the provided context.
 //
 // returns:
-//   nodes
+//
+//	nodes
 func (p *GetAXNodeAndAncestorsParams) Do(ctx context.Context) (nodes []*Node, err error) {
 	// execute
 	var res GetAXNodeAndAncestorsReturns
@@ -276,7 +280,8 @@ type GetChildAXNodesParams struct {
 // See: https://chromedevtools.github.io/devtools-protocol/tot/Accessibility#method-getChildAXNodes
 //
 // parameters:
-//   id
+//
+//	id
 func GetChildAXNodes(id NodeID) *GetChildAXNodesParams {
 	return &GetChildAXNodesParams{
 		ID: id,
@@ -298,7 +303,8 @@ type GetChildAXNodesReturns struct {
 // Do executes Accessibility.getChildAXNodes against the provided context.
 //
 // returns:
-//   nodes
+//
+//	nodes
 func (p *GetChildAXNodesParams) Do(ctx context.Context) (nodes []*Node, err error) {
 	// execute
 	var res GetChildAXNodesReturns
@@ -379,7 +385,8 @@ type QueryAXTreeReturns struct {
 // Do executes Accessibility.queryAXTree against the provided context.
 //
 // returns:
-//   nodes - A list of Accessibility.AXNode matching the specified attributes, including nodes that are ignored for accessibility.
+//
+//	nodes - A list of Accessibility.AXNode matching the specified attributes, including nodes that are ignored for accessibility.
 func (p *QueryAXTreeParams) Do(ctx context.Context) (nodes []*Node, err error) {
 	// execute
 	var res QueryAXTreeReturns

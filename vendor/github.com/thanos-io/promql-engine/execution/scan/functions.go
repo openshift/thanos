@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/histogram"
 
+	"github.com/thanos-io/promql-engine/execution/aggregate"
 	"github.com/thanos-io/promql-engine/execution/parse"
 )
 
@@ -108,6 +109,16 @@ var rangeVectorFuncs = map[string]FunctionCall{
 			return 0., nil, false
 		}
 		return 1., nil, true
+	},
+	"quantile_over_time": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
+		if len(f.Samples) == 0 {
+			return 0., nil, false
+		}
+		floats := make([]float64, len(f.Samples))
+		for i, v := range f.Samples {
+			floats[i] = v.F
+		}
+		return aggregate.Quantile(f.ScalarPoints[0], floats), nil, true
 	},
 	"changes": func(f FunctionArgs) (float64, *histogram.FloatHistogram, bool) {
 		if len(f.Samples) == 0 {
@@ -381,6 +392,11 @@ func extendedRate(samples []Sample, isCounter, isRate bool, stepTime int64, sele
 // points[0] to be a histogram. It returns nil if any other Point in points is
 // not a histogram.
 func histogramRate(points []Sample, isCounter bool) *histogram.FloatHistogram {
+	// Calculating a rate on a single sample is not defined.
+	if len(points) < 2 {
+		return nil
+	}
+
 	prev := points[0].H // We already know that this is a histogram.
 	last := points[len(points)-1].H
 	if last == nil {
