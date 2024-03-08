@@ -1,4 +1,4 @@
-FROM registry.ci.openshift.org/ocp/builder:rhel-8-golang-1.21-openshift-4.16 AS builder
+FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.21-openshift-4.16 AS builder
 WORKDIR /go/src/github.com/improbable-eng/thanos
 COPY . .
 ENV GOFLAGS="-mod=vendor"
@@ -11,7 +11,7 @@ RUN if ! yum install -y prometheus-promu; then \
         curl -s -L https://github.com/prometheus/promu/releases/download/v0.5.0/promu-0.5.0.linux-amd64.tar.gz | tar -xzvf - -C /usr/bin  --strip-components 1 promu-0.5.0.linux-amd64/promu; \
     fi; \
     promu build;
-FROM registry.ci.openshift.org/ocp/4.16:base
+FROM registry.ci.openshift.org/ocp/4.16:base-rhel9
 LABEL io.k8s.display-name="OpenShift Thanos" \
       io.k8s.description="Highly available Prometheus setup with long term storage capabilities." \
       io.openshift.tags="prometheus,monitoring" \
