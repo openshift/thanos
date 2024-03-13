@@ -4,7 +4,6 @@ reviewers:
 - simonpasquier
 - jan--f
 - slashpai
-- raptorsun
 - marioferh
 - danielmellado
 - rexagod
@@ -14,7 +13,6 @@ approvers:
 - simonpasquier
 - jan--f
 - slashpai
-- raptorsun
 - marioferh
 - danielmellado
 - rexagod
@@ -40,3 +38,4 @@ emeritus_approvers:
 - sthaha
 - JoaoBraveCoding
 - juanrh
+- raptorsun
