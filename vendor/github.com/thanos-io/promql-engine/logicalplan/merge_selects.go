@@ -7,8 +7,6 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/util/annotations"
 
-	"github.com/prometheus/prometheus/promql/parser"
-
 	"github.com/thanos-io/promql-engine/query"
 )
 
@@ -23,7 +21,7 @@ import (
 // and apply an additional filter for {c="d"}.
 type MergeSelectsOptimizer struct{}
 
-func (m MergeSelectsOptimizer) Optimize(plan parser.Expr, _ *query.Options) (parser.Expr, annotations.Annotations) {
+func (m MergeSelectsOptimizer) Optimize(plan Node, _ *query.Options) (Node, annotations.Annotations) {
 	heap := make(matcherHeap)
 	extractSelectors(heap, plan)
 	replaceMatchers(heap, &plan)
@@ -31,9 +29,9 @@ func (m MergeSelectsOptimizer) Optimize(plan parser.Expr, _ *query.Options) (par
 	return plan, nil
 }
 
-func extractSelectors(selectors matcherHeap, expr parser.Expr) {
-	traverse(&expr, func(node *parser.Expr) {
-		e, ok := (*node).(*parser.VectorSelector)
+func extractSelectors(selectors matcherHeap, expr Node) {
+	Traverse(&expr, func(node *Node) {
+		e, ok := (*node).(*VectorSelector)
 		if !ok {
 			return
 		}
@@ -45,12 +43,10 @@ func extractSelectors(selectors matcherHeap, expr parser.Expr) {
 	})
 }
 
-func replaceMatchers(selectors matcherHeap, expr *parser.Expr) {
-	traverse(expr, func(node *parser.Expr) {
+func replaceMatchers(selectors matcherHeap, expr *Node) {
+	Traverse(expr, func(node *Node) {
 		var matchers []*labels.Matcher
 		switch e := (*node).(type) {
-		case *parser.VectorSelector:
-			matchers = e.LabelMatchers
 		case *VectorSelector:
 			matchers = e.LabelMatchers
 		default:
@@ -85,12 +81,6 @@ func replaceMatchers(selectors matcherHeap, expr *parser.Expr) {
 			}
 
 			switch e := (*node).(type) {
-			case *parser.VectorSelector:
-				e.LabelMatchers = replacement
-				*node = &VectorSelector{
-					VectorSelector: e,
-					Filters:        filters,
-				}
 			case *VectorSelector:
 				e.LabelMatchers = replacement
 				e.Filters = filters

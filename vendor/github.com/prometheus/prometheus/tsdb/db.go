@@ -23,7 +23,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"strconv"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +33,6 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/atomic"
-	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/prometheus/prometheus/config"
@@ -70,19 +69,21 @@ var ErrNotReady = errors.New("TSDB not ready")
 // millisecond precision timestamps.
 func DefaultOptions() *Options {
 	return &Options{
-		WALSegmentSize:            wlog.DefaultSegmentSize,
-		MaxBlockChunkSegmentSize:  chunks.DefaultChunkSegmentSize,
-		RetentionDuration:         int64(15 * 24 * time.Hour / time.Millisecond),
-		MinBlockDuration:          DefaultBlockDuration,
-		MaxBlockDuration:          DefaultBlockDuration,
-		NoLockfile:                false,
-		SamplesPerChunk:           DefaultSamplesPerChunk,
-		WALCompression:            wlog.CompressionNone,
-		StripeSize:                DefaultStripeSize,
-		HeadChunksWriteBufferSize: chunks.DefaultWriteBufferSize,
-		IsolationDisabled:         defaultIsolationDisabled,
-		HeadChunksWriteQueueSize:  chunks.DefaultWriteQueueSize,
-		OutOfOrderCapMax:          DefaultOutOfOrderCapMax,
+		WALSegmentSize:              wlog.DefaultSegmentSize,
+		MaxBlockChunkSegmentSize:    chunks.DefaultChunkSegmentSize,
+		RetentionDuration:           int64(15 * 24 * time.Hour / time.Millisecond),
+		MinBlockDuration:            DefaultBlockDuration,
+		MaxBlockDuration:            DefaultBlockDuration,
+		NoLockfile:                  false,
+		SamplesPerChunk:             DefaultSamplesPerChunk,
+		WALCompression:              wlog.CompressionNone,
+		StripeSize:                  DefaultStripeSize,
+		HeadChunksWriteBufferSize:   chunks.DefaultWriteBufferSize,
+		IsolationDisabled:           defaultIsolationDisabled,
+		HeadChunksWriteQueueSize:    chunks.DefaultWriteQueueSize,
+		OutOfOrderCapMax:            DefaultOutOfOrderCapMax,
+		EnableOverlappingCompaction: true,
+		EnableSharding:              false,
 	}
 }
 
@@ -177,6 +178,17 @@ type Options struct {
 	// OutOfOrderCapMax is maximum capacity for OOO chunks (in samples).
 	// If it is <=0, the default value is assumed.
 	OutOfOrderCapMax int64
+
+	// Compaction of overlapping blocks are allowed if EnableOverlappingCompaction is true.
+	// This is an optional flag for overlapping blocks.
+	// The reason why this flag exists is because there are various users of the TSDB
+	// that do not want vertical compaction happening on ingest time. Instead,
+	// they'd rather keep overlapping blocks and let another component do the overlapping compaction later.
+	// For Prometheus, this will always be true.
+	EnableOverlappingCompaction bool
+
+	// EnableSharding enables query sharding support in TSDB.
+	EnableSharding bool
 }
 
 type BlocksToDeleteFunc func(blocks []*Block) map[ulid.ULID]struct{}
@@ -306,8 +318,11 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		return float64(db.blocks[0].meta.MinTime)
 	})
 	m.tombCleanTimer = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name: "prometheus_tsdb_tombstone_cleanup_seconds",
-		Help: "The time taken to recompact blocks to remove tombstones.",
+		Name:                            "prometheus_tsdb_tombstone_cleanup_seconds",
+		Help:                            "The time taken to recompact blocks to remove tombstones.",
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: 1 * time.Hour,
 	})
 	m.blocksBytes = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_storage_blocks_bytes",
@@ -442,8 +457,7 @@ func (db *DBReadOnly) FlushWAL(dir string) (returnErr error) {
 		nil,
 		db.logger,
 		ExponentialBlockRanges(DefaultOptions().MinBlockDuration, 3, 5),
-		chunkenc.NewPool(),
-		nil,
+		chunkenc.NewPool(), nil,
 	)
 	if err != nil {
 		return fmt.Errorf("create leveled compactor: %w", err)
@@ -515,9 +529,10 @@ func (db *DBReadOnly) loadDataAsQueryable(maxt int64) (storage.SampleAndChunkQue
 		if err := head.Init(maxBlockTime); err != nil {
 			return nil, fmt.Errorf("read WAL: %w", err)
 		}
-		// Set the wal to nil to disable all wal operations.
+		// Set the wal and the wbl to nil to disable related operations.
 		// This is mainly to avoid blocking when closing the head.
 		head.wal = nil
+		head.wbl = nil
 	}
 
 	db.closers = append(db.closers, head)
@@ -764,10 +779,6 @@ func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs
 	walDir := filepath.Join(dir, "wal")
 	wblDir := filepath.Join(dir, wlog.WblDirName)
 
-	// Migrate old WAL if one exists.
-	if err := MigrateWAL(l, walDir); err != nil {
-		return nil, fmt.Errorf("migrate WAL: %w", err)
-	}
 	for _, tmpDir := range []string{walDir, dir} {
 		// Remove tmp dirs.
 		if err := removeBestEffortTmpDirs(l, tmpDir); err != nil {
@@ -817,7 +828,10 @@ func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	db.compactor, err = NewLeveledCompactorWithChunkSize(ctx, r, l, rngs, db.chunkPool, opts.MaxBlockChunkSegmentSize, nil)
+	db.compactor, err = NewLeveledCompactorWithOptions(ctx, r, l, rngs, db.chunkPool, LeveledCompactorOptions{
+		MaxBlockChunkSegmentSize:    opts.MaxBlockChunkSegmentSize,
+		EnableOverlappingCompaction: opts.EnableOverlappingCompaction,
+	})
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("create leveled compactor: %w", err)
@@ -864,6 +878,7 @@ func open(dir string, l log.Logger, r prometheus.Registerer, opts *Options, rngs
 	headOpts.EnableNativeHistograms.Store(opts.EnableNativeHistograms)
 	headOpts.OutOfOrderTimeWindow.Store(opts.OutOfOrderTimeWindow)
 	headOpts.OutOfOrderCapMax.Store(opts.OutOfOrderCapMax)
+	headOpts.EnableSharding = opts.EnableSharding
 	if opts.WALReplayConcurrency > 0 {
 		headOpts.WALReplayConcurrency = opts.WALReplayConcurrency
 	}
@@ -1596,7 +1611,7 @@ func BeyondTimeRetention(db *DB, blocks []*Block) (deletable map[ulid.ULID]struc
 	for i, block := range blocks {
 		// The difference between the first block and this block is larger than
 		// the retention period so any blocks after that are added as deletable.
-		if i > 0 && blocks[0].Meta().MaxTime-block.Meta().MaxTime > db.opts.RetentionDuration {
+		if i > 0 && blocks[0].Meta().MaxTime-block.Meta().MaxTime >= db.opts.RetentionDuration {
 			for _, b := range blocks[i:] {
 				deletable[b.meta.ULID] = struct{}{}
 			}
@@ -2192,39 +2207,6 @@ func blockDirs(dir string) ([]string, error) {
 		}
 	}
 	return dirs, nil
-}
-
-func sequenceFiles(dir string) ([]string, error) {
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	var res []string
-
-	for _, fi := range files {
-		if _, err := strconv.ParseUint(fi.Name(), 10, 64); err != nil {
-			continue
-		}
-		res = append(res, filepath.Join(dir, fi.Name()))
-	}
-	return res, nil
-}
-
-func nextSequenceFile(dir string) (string, int, error) {
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return "", 0, err
-	}
-
-	i := uint64(0)
-	for _, f := range files {
-		j, err := strconv.ParseUint(f.Name(), 10, 64)
-		if err != nil {
-			continue
-		}
-		i = j
-	}
-	return filepath.Join(dir, fmt.Sprintf("%0.6d", i+1)), int(i + 1), nil
 }
 
 func exponential(d, min, max time.Duration) time.Duration {

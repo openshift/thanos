@@ -4,6 +4,8 @@
 package engine
 
 import (
+	"math"
+
 	"github.com/prometheus/prometheus/promql"
 
 	"github.com/thanos-io/promql-engine/execution/model"
@@ -28,22 +30,45 @@ type ExplainOutputNode struct {
 
 var _ ExplainableQuery = &compatibilityQuery{}
 
-func analyzeVector(obsv model.ObservableVectorOperator) *AnalyzeOutputNode {
-	telemetry, obsVectors := obsv.Analyze()
+func (a *AnalyzeOutputNode) TotalSamples() int64 {
+	var total int64
+	for _, child := range a.Children {
+		total += child.TotalSamples()
+	}
+	if a.OperatorTelemetry.Samples() != nil {
+		total += a.OperatorTelemetry.Samples().TotalSamples
+	}
+	return total
+}
 
-	var children []AnalyzeOutputNode
-	for _, vector := range obsVectors {
-		children = append(children, *analyzeVector(vector))
+func (a *AnalyzeOutputNode) PeakSamples() int64 {
+	var peak int64
+	for _, child := range a.Children {
+		peak = int64(math.Max(float64(peak), float64(child.PeakSamples())))
+	}
+	if a.OperatorTelemetry.Samples() != nil {
+		peak = int64(math.Max(float64(peak), float64(a.OperatorTelemetry.Samples().PeakSamples)))
+	}
+	return peak
+}
+
+func analyzeQuery(obsv model.ObservableVectorOperator) *AnalyzeOutputNode {
+	children := obsv.Explain()
+	var childTelemetry []AnalyzeOutputNode
+	for _, child := range children {
+		if obsChild, ok := child.(model.ObservableVectorOperator); ok {
+			childTelemetry = append(childTelemetry, *analyzeQuery(obsChild))
+		}
 	}
 
 	return &AnalyzeOutputNode{
-		OperatorTelemetry: telemetry,
-		Children:          children,
+		OperatorTelemetry: obsv,
+		Children:          childTelemetry,
 	}
 }
 
 func explainVector(v model.VectorOperator) *ExplainOutputNode {
-	name, vectors := v.Explain()
+	vectors := v.Explain()
 
 	var children []ExplainOutputNode
 	for _, vector := range vectors {
@@ -51,7 +76,7 @@ func explainVector(v model.VectorOperator) *ExplainOutputNode {
 	}
 
 	return &ExplainOutputNode{
-		OperatorName: name,
+		OperatorName: v.String(),
 		Children:     children,
 	}
 }
