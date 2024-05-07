@@ -15,14 +15,13 @@ import (
 	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/prometheus/prometheus/promql/parser"
-	"github.com/prometheus/prometheus/promql/parser/posrange"
 
 	"github.com/thanos-io/promql-engine/api"
 	"github.com/thanos-io/promql-engine/query"
 )
 
 var (
-	RewrittenExternalLabelWarning = errors.Newf("%s: rewriting an external label with label_replace could lead to unpredictable results", annotations.PromQLWarning.Error())
+	RewrittenExternalLabelWarning = errors.Newf("%s: rewriting an external label with label_replace can disable distributed query execution", annotations.PromQLWarning.Error())
 )
 
 type timeRange struct {
@@ -80,11 +79,16 @@ func (rs RemoteExecutions) String() string {
 // RemoteExecution is a logical plan that describes a
 // remote execution of a Query against the given PromQL Engine.
 type RemoteExecution struct {
+	LeafNode
 	Engine          api.RemoteEngine
-	Query           string
+	Query           Node
 	QueryRangeStart time.Time
+}
 
-	valueType parser.ValueType
+func (r RemoteExecution) Clone() Node {
+	clone := r
+	clone.Query = r.Query.Clone()
+	return clone
 }
 
 func (r RemoteExecution) String() string {
@@ -94,42 +98,44 @@ func (r RemoteExecution) String() string {
 	return fmt.Sprintf("remote(%s) [%s]", r.Query, r.QueryRangeStart.UTC().String())
 }
 
-func (r RemoteExecution) Pretty(level int) string { return r.String() }
+func (r RemoteExecution) Type() NodeType { return RemoteExecutionNode }
 
-func (r RemoteExecution) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
-
-func (r RemoteExecution) Type() parser.ValueType { return r.valueType }
-
-func (r RemoteExecution) PromQLExpr() {}
+func (r RemoteExecution) ReturnType() parser.ValueType { return r.Query.ReturnType() }
 
 // Deduplicate is a logical plan which deduplicates samples from multiple RemoteExecutions.
 type Deduplicate struct {
+	LeafNode
 	Expressions RemoteExecutions
+}
+
+func (r Deduplicate) Clone() Node {
+	clone := r
+	clone.Expressions = make(RemoteExecutions, len(r.Expressions))
+	for i, e := range r.Expressions {
+		clone.Expressions[i] = e.Clone().(RemoteExecution)
+	}
+	return clone
 }
 
 func (r Deduplicate) String() string {
 	return fmt.Sprintf("dedup(%s)", r.Expressions.String())
 }
 
-func (r Deduplicate) Pretty(level int) string { return r.String() }
+func (r Deduplicate) ReturnType() parser.ValueType { return r.Expressions[0].ReturnType() }
 
-func (r Deduplicate) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
+func (r Deduplicate) Type() NodeType { return DeduplicateNode }
 
-func (r Deduplicate) Type() parser.ValueType { return r.Expressions[0].Type() }
+type Noop struct {
+	LeafNode
+}
 
-func (r Deduplicate) PromQLExpr() {}
-
-type Noop struct{}
+func (r Noop) Clone() Node { return r }
 
 func (r Noop) String() string { return "noop" }
 
-func (r Noop) Pretty(level int) string { return r.String() }
+func (r Noop) ReturnType() parser.ValueType { return parser.ValueTypeVector }
 
-func (r Noop) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
-
-func (r Noop) Type() parser.ValueType { return parser.ValueTypeVector }
-
-func (r Noop) PromQLExpr() {}
+func (r Noop) Type() NodeType { return NoopNode }
 
 // distributiveAggregations are all PromQL aggregations which support
 // distributed execution.
@@ -150,7 +156,7 @@ type DistributedExecutionOptimizer struct {
 	SkipBinaryPushdown bool
 }
 
-func (m DistributedExecutionOptimizer) Optimize(plan parser.Expr, opts *query.Options) (parser.Expr, annotations.Annotations) {
+func (m DistributedExecutionOptimizer) Optimize(plan Node, opts *query.Options) (Node, annotations.Annotations) {
 	engines := m.Endpoints.Engines()
 	sort.Slice(engines, func(i, j int) bool {
 		return engines[i].MinT() < engines[j].MinT()
@@ -171,54 +177,76 @@ func (m DistributedExecutionOptimizer) Optimize(plan parser.Expr, opts *query.Op
 		}
 	}
 	minEngineOverlap := labelRanges.minOverlap()
-	if rewritesEngineLabels(plan, engineLabels) {
-		return plan, annotations.New().Add(RewrittenExternalLabelWarning)
-	}
 
-	TraverseBottomUp(nil, &plan, func(parent, current *parser.Expr) (stop bool) {
+	// TODO(fpetkovski): Consider changing TraverseBottomUp to pass in a list of parents in the transform function.
+	parents := make(map[*Node]*Node)
+	TraverseBottomUp(nil, &plan, func(parent, current *Node) (stop bool) {
+		parents[current] = parent
+		return false
+	})
+
+	var warns = annotations.New()
+	TraverseBottomUp(nil, &plan, func(parent, current *Node) (stop bool) {
 		// If the current operation is not distributive, stop the traversal.
-		if !isDistributive(current, m.SkipBinaryPushdown) {
+		if !isDistributive(current, m.SkipBinaryPushdown, engineLabels, warns) {
 			return true
 		}
 
 		// If the current node is an aggregation, distribute the operation and
 		// stop the traversal.
-		if aggr, ok := (*current).(*parser.AggregateExpr); ok {
+		if aggr, ok := (*current).(*Aggregation); ok {
 			localAggregation := aggr.Op
 			if aggr.Op == parser.COUNT {
 				localAggregation = parser.SUM
 			}
 
 			remoteAggregation := newRemoteAggregation(aggr, engines)
-			subQueries := m.distributeQuery(&remoteAggregation, engines, opts, minEngineOverlap)
-			*current = &parser.AggregateExpr{
+			subQueries := m.distributeQuery(&remoteAggregation, engines, m.subqueryOpts(parents, current, opts), minEngineOverlap)
+			*current = &Aggregation{
 				Op:       localAggregation,
 				Expr:     subQueries,
 				Param:    aggr.Param,
 				Grouping: aggr.Grouping,
 				Without:  aggr.Without,
-				PosRange: aggr.PosRange,
 			}
 			return true
 		}
 		if isAbsent(*current) {
-			*current = m.distributeAbsent(*current, engines, calculateStartOffset(current, opts.LookbackDelta), opts)
+			*current = m.distributeAbsent(*current, engines, calculateStartOffset(current, opts.LookbackDelta), m.subqueryOpts(parents, current, opts))
 			return true
 		}
 
 		// If the parent operation is distributive, continue the traversal.
-		if isDistributive(parent, m.SkipBinaryPushdown) {
+		if isDistributive(parent, m.SkipBinaryPushdown, engineLabels, warns) {
 			return false
 		}
 
-		*current = m.distributeQuery(current, engines, opts, minEngineOverlap)
+		*current = m.distributeQuery(current, engines, m.subqueryOpts(parents, current, opts), minEngineOverlap)
 		return true
 	})
 
-	return plan, nil
+	return plan, *warns
 }
 
-func newRemoteAggregation(rootAggregation *parser.AggregateExpr, engines []api.RemoteEngine) parser.Expr {
+func (m DistributedExecutionOptimizer) subqueryOpts(parents map[*Node]*Node, current *Node, opts *query.Options) *query.Options {
+	subqueryParents := make([]*Subquery, 0, len(parents))
+	for p := parents[current]; p != nil; p = parents[p] {
+		if subquery, ok := (*p).(*Subquery); ok {
+			subqueryParents = append(subqueryParents, subquery)
+		}
+	}
+	for i := len(subqueryParents) - 1; i >= 0; i-- {
+		opts = query.NestedOptionsForSubquery(
+			opts,
+			subqueryParents[i].Step,
+			subqueryParents[i].Range,
+			subqueryParents[i].Offset,
+		)
+	}
+	return opts
+}
+
+func newRemoteAggregation(rootAggregation *Aggregation, engines []api.RemoteEngine) Node {
 	groupingSet := make(map[string]struct{})
 	for _, lbl := range rootAggregation.Grouping {
 		groupingSet[lbl] = struct{}{}
@@ -250,9 +278,12 @@ func newRemoteAggregation(rootAggregation *parser.AggregateExpr, engines []api.R
 // distributeQuery takes a PromQL expression in the form of *parser.Expr and a set of remote engines.
 // For each engine which matches the time range of the query, it creates a RemoteExecution scoped to the range of the engine.
 // All remote executions are wrapped in a Deduplicate logical node to make sure that results from overlapping engines are deduplicated.
-func (m DistributedExecutionOptimizer) distributeQuery(expr *parser.Expr, engines []api.RemoteEngine, opts *query.Options, allowedStartOffset time.Duration) parser.Expr {
+func (m DistributedExecutionOptimizer) distributeQuery(expr *Node, engines []api.RemoteEngine, opts *query.Options, allowedStartOffset time.Duration) Node {
 	startOffset := calculateStartOffset(expr, opts.LookbackDelta)
 	if allowedStartOffset < startOffset {
+		return *expr
+	}
+	if IsConstantExpr(*expr) {
 		return *expr
 	}
 
@@ -282,9 +313,8 @@ func (m DistributedExecutionOptimizer) distributeQuery(expr *parser.Expr, engine
 
 		remoteQueries = append(remoteQueries, RemoteExecution{
 			Engine:          e,
-			Query:           (*expr).String(),
+			Query:           (*expr).Clone(),
 			QueryRangeStart: start,
-			valueType:       (*expr).Type(),
 		})
 	}
 
@@ -297,7 +327,7 @@ func (m DistributedExecutionOptimizer) distributeQuery(expr *parser.Expr, engine
 	}
 }
 
-func (m DistributedExecutionOptimizer) distributeAbsent(expr parser.Expr, engines []api.RemoteEngine, startOffset time.Duration, opts *query.Options) parser.Expr {
+func (m DistributedExecutionOptimizer) distributeAbsent(expr Node, engines []api.RemoteEngine, startOffset time.Duration, opts *query.Options) Node {
 	queries := make(RemoteExecutions, 0, len(engines))
 	for i, e := range engines {
 		if e.MaxT() < opts.Start.UnixMilli()-startOffset.Milliseconds() {
@@ -308,9 +338,8 @@ func (m DistributedExecutionOptimizer) distributeAbsent(expr parser.Expr, engine
 		}
 		queries = append(queries, RemoteExecution{
 			Engine:          engines[i],
-			Query:           expr.String(),
+			Query:           expr.Clone(),
 			QueryRangeStart: opts.Start,
-			valueType:       expr.Type(),
 		})
 	}
 	// We need to make sure that absent is at least evaluated against one engine.
@@ -320,15 +349,14 @@ func (m DistributedExecutionOptimizer) distributeAbsent(expr parser.Expr, engine
 	if len(queries) == 0 && len(engines) > 0 {
 		return RemoteExecution{
 			Engine:          engines[len(engines)-1],
-			Query:           expr.String(),
+			Query:           expr,
 			QueryRangeStart: opts.Start,
-			valueType:       expr.Type(),
 		}
 	}
 
-	var rootExpr parser.Expr = queries[0]
+	var rootExpr Node = queries[0]
 	for i := 1; i < len(queries); i++ {
-		rootExpr = &parser.BinaryExpr{
+		rootExpr = &Binary{
 			Op:             parser.MUL,
 			LHS:            rootExpr,
 			RHS:            queries[i],
@@ -339,8 +367,8 @@ func (m DistributedExecutionOptimizer) distributeAbsent(expr parser.Expr, engine
 	return rootExpr
 }
 
-func isAbsent(expr parser.Expr) bool {
-	call, ok := expr.(*parser.Call)
+func isAbsent(expr Node) bool {
+	call, ok := expr.(*FunctionCall)
 	if !ok {
 		return false
 	}
@@ -402,19 +430,21 @@ func calculateStepAlignedStart(opts *query.Options, engineMinTime time.Time) tim
 // 6h can correctly evaluate only the last 5h of the range.
 // The first 1 hour of data cannot be correctly calculated since the range selector in the engine
 // will not be able to gather enough points.
-func calculateStartOffset(expr *parser.Expr, lookbackDelta time.Duration) time.Duration {
+func calculateStartOffset(expr *Node, lookbackDelta time.Duration) time.Duration {
 	if expr == nil {
 		return lookbackDelta
 	}
 
 	var selectRange time.Duration
 	var offset time.Duration
-	traverse(expr, func(node *parser.Expr) {
-		if matrixSelector, ok := (*node).(*parser.MatrixSelector); ok {
-			selectRange = matrixSelector.Range
-		}
-		if vectorSelector, ok := (*node).(*parser.VectorSelector); ok {
-			offset = vectorSelector.Offset
+	Traverse(expr, func(node *Node) {
+		switch n := (*node).(type) {
+		case *Subquery:
+			selectRange += n.Range
+		case *MatrixSelector:
+			selectRange += n.Range
+		case *VectorSelector:
+			offset = n.Offset
 		}
 	})
 	return maxDuration(offset+selectRange, lookbackDelta)
@@ -424,33 +454,41 @@ func numSteps(start, end time.Time, step time.Duration) int64 {
 	return (end.UnixMilli()-start.UnixMilli())/step.Milliseconds() + 1
 }
 
-func isDistributive(expr *parser.Expr, skipBinaryPushdown bool) bool {
+func isDistributive(expr *Node, skipBinaryPushdown bool, engineLabels map[string]struct{}, warns *annotations.Annotations) bool {
 	if expr == nil {
 		return false
 	}
 
-	switch aggr := (*expr).(type) {
-	case *parser.BinaryExpr:
-		return isBinaryExpressionWithOneConstantSide(aggr) || (!skipBinaryPushdown && isBinaryExpressionWithDistributableMatching(aggr))
-	case *parser.AggregateExpr:
+	switch e := (*expr).(type) {
+	case Deduplicate, RemoteExecution:
+		return false
+	case *Binary:
+		return isBinaryExpressionWithOneConstantSide(e) || (!skipBinaryPushdown && isBinaryExpressionWithDistributableMatching(e))
+	case *Aggregation:
 		// Certain aggregations are currently not supported.
-		if _, ok := distributiveAggregations[aggr.Op]; !ok {
+		if _, ok := distributiveAggregations[e.Op]; !ok {
 			return false
 		}
-	case *parser.Call:
-		return len(aggr.Args) > 0
+	case *FunctionCall:
+		if e.Func.Name == "label_replace" {
+			targetLabel := UnsafeUnwrapString(e.Args[1])
+			if _, ok := engineLabels[targetLabel]; ok {
+				warns.Add(RewrittenExternalLabelWarning)
+				return false
+			}
+		}
 	}
 
 	return true
 }
 
-func isBinaryExpressionWithOneConstantSide(expr *parser.BinaryExpr) bool {
-	lhsConstant := isConstantExpr(expr.LHS)
-	rhsConstant := isConstantExpr(expr.RHS)
-	return (lhsConstant || rhsConstant)
+func isBinaryExpressionWithOneConstantSide(expr *Binary) bool {
+	lhsConstant := IsConstantExpr(expr.LHS)
+	rhsConstant := IsConstantExpr(expr.RHS)
+	return lhsConstant || rhsConstant
 }
 
-func isBinaryExpressionWithDistributableMatching(expr *parser.BinaryExpr) bool {
+func isBinaryExpressionWithDistributableMatching(expr *Binary) bool {
 	if expr.VectorMatching == nil {
 		return false
 	}
@@ -461,13 +499,13 @@ func isBinaryExpressionWithDistributableMatching(expr *parser.BinaryExpr) bool {
 }
 
 // matchesExternalLabels returns false if given matchers are not matching external labels.
-func matchesExternalLabelSet(expr parser.Expr, externalLabelSet []labels.Labels) bool {
+func matchesExternalLabelSet(expr Node, externalLabelSet []labels.Labels) bool {
 	if len(externalLabelSet) == 0 {
 		return true
 	}
 	var selectorSet [][]*labels.Matcher
-	traverse(&expr, func(current *parser.Expr) {
-		vs, ok := (*current).(*parser.VectorSelector)
+	Traverse(&expr, func(current *Node) {
+		vs, ok := (*current).(*VectorSelector)
 		if ok {
 			selectorSet = append(selectorSet, vs.LabelMatchers)
 		}
@@ -499,39 +537,6 @@ func matchesExternalLabels(ms []*labels.Matcher, externalLabels labels.Labels) b
 		}
 	}
 	return true
-}
-
-func isConstantExpr(expr parser.Expr) bool {
-	// TODO: there are more possibilities for constant expressions
-	switch texpr := expr.(type) {
-	case *parser.NumberLiteral:
-		return true
-	case *parser.StepInvariantExpr:
-		return isConstantExpr(texpr.Expr)
-	case *parser.ParenExpr:
-		return isConstantExpr(texpr.Expr)
-	case *parser.BinaryExpr:
-		return isConstantExpr(texpr.LHS) && isConstantExpr(texpr.RHS)
-	default:
-		return false
-	}
-}
-
-func rewritesEngineLabels(e parser.Expr, engineLabels map[string]struct{}) bool {
-	var result bool
-	TraverseBottomUp(nil, &e, func(parent *parser.Expr, node *parser.Expr) bool {
-		call, ok := (*node).(*parser.Call)
-		if !ok || call.Func.Name != "label_replace" {
-			return false
-		}
-		targetLabel := call.Args[1].(*parser.StringLiteral).Val
-		if _, ok := engineLabels[targetLabel]; ok {
-			result = true
-			return true
-		}
-		return false
-	})
-	return result
 }
 
 func maxTime(a, b time.Time) time.Time {

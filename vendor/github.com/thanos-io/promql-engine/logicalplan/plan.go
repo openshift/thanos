@@ -4,16 +4,13 @@
 package logicalplan
 
 import (
-	"fmt"
 	"math"
+	"strings"
 	"time"
 
-	"github.com/efficientgo/core/errors"
-	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/util/annotations"
-
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/util/annotations"
 
 	"github.com/thanos-io/promql-engine/query"
 )
@@ -30,30 +27,65 @@ var DefaultOptimizers = []Optimizer{
 
 type Plan interface {
 	Optimize([]Optimizer) (Plan, annotations.Annotations)
-	Expr() parser.Expr
+	Root() Node
 }
 
 type Optimizer interface {
-	Optimize(plan parser.Expr, opts *query.Options) (parser.Expr, annotations.Annotations)
+	Optimize(plan Node, opts *query.Options) (Node, annotations.Annotations)
 }
 
 type plan struct {
-	expr parser.Expr
-	opts *query.Options
+	expr     Node
+	opts     *query.Options
+	planOpts PlanOptions
 }
 
-func New(expr parser.Expr, opts *query.Options) Plan {
-	expr = preprocessExpr(expr, opts.Start, opts.End)
-	setOffsetForAtModifier(opts.Start.UnixMilli(), expr)
-	setOffsetForInnerSubqueries(expr, opts)
+type PlanOptions struct {
+	DisableDuplicateLabelCheck bool
+}
+
+// New creates a new logical plan from logical node.
+func New(root Node, queryOpts *query.Options, planOpts PlanOptions) Plan {
+	return &plan{
+		expr:     root,
+		opts:     queryOpts,
+		planOpts: planOpts,
+	}
+}
+
+func NewFromAST(ast parser.Expr, queryOpts *query.Options, planOpts PlanOptions) Plan {
+	ast = promql.PreprocessExpr(ast, queryOpts.Start, queryOpts.End)
+	setOffsetForAtModifier(queryOpts.Start.UnixMilli(), ast)
+	setOffsetForInnerSubqueries(ast, queryOpts)
+
+	// replace scanners by our logical nodes
+	expr := replacePrometheusNodes(ast)
 
 	// the engine handles sorting at the presentation layer
 	expr = trimSorts(expr)
 
 	return &plan{
-		expr: expr,
-		opts: opts,
+		expr:     expr,
+		opts:     queryOpts,
+		planOpts: planOpts,
 	}
+}
+
+// NewFromBytes creates a new logical plan from a byte slice created with Marshal.
+// This method is used to deserialize a logical plan which has been sent over the wire.
+func NewFromBytes(bytes []byte, queryOpts *query.Options, planOpts PlanOptions) (Plan, error) {
+	root, err := Unmarshal(bytes)
+	if err != nil {
+		return nil, err
+	}
+	// the engine handles sorting at the presentation layer
+	root = trimSorts(root)
+
+	return &plan{
+		expr:     root,
+		opts:     queryOpts,
+		planOpts: planOpts,
+	}, nil
 }
 
 func (p *plan) Optimize(optimizers []Optimizer) (Plan, annotations.Annotations) {
@@ -63,105 +95,159 @@ func (p *plan) Optimize(optimizers []Optimizer) (Plan, annotations.Annotations) 
 		p.expr, a = o.Optimize(p.expr, p.opts)
 		annos.Merge(a)
 	}
+	// parens are just annoying and getting rid of them doesn't change the query
+	// NOTE: we need to do this here to not break the distributed optimizer since
+	// rendering subqueries String() method depends on parens sometimes.
+	expr := trimParens(p.expr)
 
-	return &plan{expr: p.expr, opts: p.opts}, *annos
+	if !p.planOpts.DisableDuplicateLabelCheck {
+		expr = insertDuplicateLabelChecks(expr)
+	}
+
+	return &plan{expr: expr, opts: p.opts}, *annos
 }
 
-func (p *plan) Expr() parser.Expr {
+func (p *plan) Root() Node {
 	return p.expr
 }
 
-func traverse(expr *parser.Expr, transform func(*parser.Expr)) {
-	switch node := (*expr).(type) {
-	case *parser.StepInvariantExpr:
-		traverse(&node.Expr, transform)
-	case *parser.VectorSelector:
-		transform(expr)
-	case *VectorSelector:
-		var x parser.Expr = node.VectorSelector
-		transform(expr)
-		traverse(&x, transform)
-	case *parser.MatrixSelector:
-		transform(expr)
-		traverse(&node.VectorSelector, transform)
-	case *parser.AggregateExpr:
-		transform(expr)
-		traverse(&node.Expr, transform)
-	case *parser.Call:
-		for i := range node.Args {
-			traverse(&(node.Args[i]), transform)
-		}
-	case *parser.BinaryExpr:
-		transform(expr)
-		traverse(&node.LHS, transform)
-		traverse(&node.RHS, transform)
-	case *parser.UnaryExpr:
-		traverse(&node.Expr, transform)
-	case *parser.ParenExpr:
-		traverse(&node.Expr, transform)
-	case *parser.SubqueryExpr:
-		traverse(&node.Expr, transform)
+func Traverse(expr *Node, transform func(*Node)) {
+	children := (*expr).Children()
+	transform(expr)
+	for _, c := range children {
+		Traverse(c, transform)
 	}
 }
 
-func TraverseBottomUp(parent *parser.Expr, current *parser.Expr, transform func(parent *parser.Expr, node *parser.Expr) bool) bool {
-	switch node := (*current).(type) {
+func TraverseBottomUp(parent *Node, current *Node, transform func(parent *Node, node *Node) bool) bool {
+	var stop bool
+	for _, c := range (*current).Children() {
+		stop = TraverseBottomUp(current, c, transform) || stop
+	}
+	if stop {
+		return stop
+	}
+	return transform(parent, current)
+}
+
+func replacePrometheusNodes(plan parser.Expr) Node {
+	switch t := (plan).(type) {
 	case *parser.StringLiteral:
-		return false
+		return &StringLiteral{Val: t.Val}
 	case *parser.NumberLiteral:
-		return false
+		return &NumberLiteral{Val: t.Val}
 	case *parser.StepInvariantExpr:
-		return TraverseBottomUp(current, &node.Expr, transform)
-	case *parser.VectorSelector:
-		return transform(parent, current)
-	case *VectorSelector:
-		if stop := transform(parent, current); stop {
-			return stop
-		}
-		var x parser.Expr = node.VectorSelector
-		return TraverseBottomUp(current, &x, transform)
+		return &StepInvariantExpr{Expr: replacePrometheusNodes(t.Expr)}
 	case *parser.MatrixSelector:
-		return transform(current, &node.VectorSelector)
-	case *parser.AggregateExpr:
-		if stop := TraverseBottomUp(current, &node.Expr, transform); stop {
-			return stop
+		return &MatrixSelector{
+			VectorSelector: &VectorSelector{
+				VectorSelector: t.VectorSelector.(*parser.VectorSelector),
+			},
+			Range:          t.Range,
+			OriginalString: t.String(),
 		}
-		return transform(parent, current)
+	case *parser.VectorSelector:
+		return &VectorSelector{VectorSelector: t}
+
+	// TODO: we dont yet have logical nodes for these, keep traversing here but set fields in-place
 	case *parser.Call:
-		for i := range node.Args {
-			if stop := TraverseBottomUp(current, &node.Args[i], transform); stop {
-				return stop
+		if t.Func.Name == "timestamp" {
+			// pushed-down timestamp function
+			switch v := UnwrapParens(t.Args[0]).(type) {
+			case *parser.VectorSelector:
+				return &VectorSelector{VectorSelector: v, SelectTimestamp: true}
+			case *parser.StepInvariantExpr:
+				vs, ok := UnwrapParens(v.Expr).(*parser.VectorSelector)
+				if ok {
+					// Prometheus weirdness
+					if vs.Timestamp != nil {
+						vs.OriginalOffset = 0
+					}
+					return &StepInvariantExpr{
+						Expr: &VectorSelector{VectorSelector: vs, SelectTimestamp: true},
+					}
+				}
 			}
 		}
-		return transform(parent, current)
-	case *parser.BinaryExpr:
-		lstop := TraverseBottomUp(current, &node.LHS, transform)
-		rstop := TraverseBottomUp(current, &node.RHS, transform)
-		if lstop || rstop {
-			return true
+		args := make([]Node, len(t.Args))
+		// nested timestamp functions
+		for i, arg := range t.Args {
+			args[i] = replacePrometheusNodes(arg)
 		}
-		return transform(parent, current)
-	case *parser.UnaryExpr:
-		return TraverseBottomUp(current, &node.Expr, transform)
+		return &FunctionCall{
+			Func: *t.Func,
+			Args: args,
+		}
 	case *parser.ParenExpr:
-		if stop := TraverseBottomUp(current, &node.Expr, transform); stop {
-			return stop
+		return &Parens{
+			Expr: replacePrometheusNodes(t.Expr),
 		}
-		return transform(parent, current)
+	case *parser.UnaryExpr:
+		return &Unary{
+			Op:   t.Op,
+			Expr: replacePrometheusNodes(t.Expr),
+		}
+	case *parser.AggregateExpr:
+		return &Aggregation{
+			Op:       t.Op,
+			Expr:     replacePrometheusNodes(t.Expr),
+			Param:    replacePrometheusNodes(t.Param),
+			Grouping: t.Grouping,
+			Without:  t.Without,
+		}
+	case *parser.BinaryExpr:
+		return &Binary{
+			Op:             t.Op,
+			LHS:            replacePrometheusNodes(t.LHS),
+			RHS:            replacePrometheusNodes(t.RHS),
+			VectorMatching: t.VectorMatching,
+			ReturnBool:     t.ReturnBool,
+		}
 	case *parser.SubqueryExpr:
-		return TraverseBottomUp(current, &node.Expr, transform)
+		return &Subquery{
+			Expr:           replacePrometheusNodes(t.Expr),
+			Range:          t.Range,
+			OriginalOffset: t.OriginalOffset,
+			Offset:         t.Offset,
+			Timestamp:      t.Timestamp,
+			Step:           t.Step,
+			StartOrEnd:     t.StartOrEnd,
+		}
+	case nil:
+		return nil
 	}
-
-	return true
+	panic("Unrecognized AST node")
 }
 
-func trimSorts(expr parser.Expr) parser.Expr {
-	TraverseBottomUp(nil, &expr, func(parent, current *parser.Expr) bool {
+func trimSorts(expr Node) Node {
+	canTrimSorts := true
+	// We cannot trim inner sort if its an argument to a timestamp function.
+	// If we would do it we could transform "timestamp(sort(X))" into "timestamp(X)"
+	// Which might return actual timestamps of samples instead of query execution timestamp.
+	TraverseBottomUp(nil, &expr, func(parent, current *Node) bool {
+		if current == nil || parent == nil {
+			return true
+		}
+		e, pok := (*parent).(*FunctionCall)
+		f, cok := (*current).(*FunctionCall)
+
+		if pok && cok {
+			if e.Func.Name == "timestamp" && strings.HasPrefix(f.Func.Name, "sort") {
+				canTrimSorts = false
+				return true
+			}
+		}
+		return false
+	})
+	if !canTrimSorts {
+		return expr
+	}
+	TraverseBottomUp(nil, &expr, func(parent, current *Node) bool {
 		if current == nil || parent == nil {
 			return true
 		}
 		switch e := (*parent).(type) {
-		case *parser.Call:
+		case *FunctionCall:
 			switch e.Func.Name {
 			case "sort", "sort_desc":
 				*parent = *current
@@ -172,116 +258,34 @@ func trimSorts(expr parser.Expr) parser.Expr {
 	return expr
 }
 
-// preprocessExpr wraps all possible step invariant parts of the given expression with
-// StepInvariantExpr. It also resolves the preprocessors.
-// Copied from Prometheus and adjusted to work with the vendored parser:
-// https://github.com/prometheus/prometheus/blob/3ac49d4ae210869043e6c33e3a82f13f2f849361/promql/engine.go#L2676-L2684
-func preprocessExpr(expr parser.Expr, start, end time.Time) parser.Expr {
-	isStepInvariant := preprocessExprHelper(expr, start, end)
-	if isStepInvariant {
-		return newStepInvariantExpr(expr)
-	}
+func trimParens(expr Node) Node {
+	TraverseBottomUp(nil, &expr, func(parent, current *Node) bool {
+		if current == nil || parent == nil {
+			return true
+		}
+		switch (*parent).(type) {
+		case *Parens:
+			*parent = *current
+		}
+		return false
+	})
 	return expr
 }
 
-// preprocessExprHelper wraps the child nodes of the expression
-// with a StepInvariantExpr wherever it's step invariant. The returned boolean is true if the
-// passed expression qualifies to be wrapped by StepInvariantExpr.
-// It also resolves the preprocessors.
-func preprocessExprHelper(expr parser.Expr, start, end time.Time) bool {
-	switch n := expr.(type) {
-	case *parser.VectorSelector:
-		if n.StartOrEnd == parser.START {
-			n.Timestamp = makeInt64Pointer(timestamp.FromTime(start))
-		} else if n.StartOrEnd == parser.END {
-			n.Timestamp = makeInt64Pointer(timestamp.FromTime(end))
-		}
-		return n.Timestamp != nil
-
-	case *parser.AggregateExpr:
-		return preprocessExprHelper(n.Expr, start, end)
-
-	case *parser.BinaryExpr:
-		isInvariant1, isInvariant2 := preprocessExprHelper(n.LHS, start, end), preprocessExprHelper(n.RHS, start, end)
-		if isInvariant1 && isInvariant2 {
-			return true
-		}
-
-		if isInvariant1 {
-			n.LHS = newStepInvariantExpr(n.LHS)
-		}
-		if isInvariant2 {
-			n.RHS = newStepInvariantExpr(n.RHS)
-		}
-
-		return false
-
-	case *parser.Call:
-		_, ok := promql.AtModifierUnsafeFunctions[n.Func.Name]
-		isStepInvariant := !ok
-		isStepInvariantSlice := make([]bool, len(n.Args))
-		for i := range n.Args {
-			isStepInvariantSlice[i] = preprocessExprHelper(n.Args[i], start, end)
-			isStepInvariant = isStepInvariant && isStepInvariantSlice[i]
-		}
-
-		if isStepInvariant {
-			// The function and all arguments are step invariant.
-			return true
-		}
-
-		for i, isi := range isStepInvariantSlice {
-			if isi {
-				n.Args[i] = newStepInvariantExpr(n.Args[i])
+func insertDuplicateLabelChecks(expr Node) Node {
+	Traverse(&expr, func(node *Node) {
+		switch t := (*node).(type) {
+		case *CheckDuplicateLabels:
+			return
+		case *Aggregation, *Unary, *Binary, *FunctionCall:
+			*node = &CheckDuplicateLabels{Expr: t}
+		case *VectorSelector:
+			if t.SelectTimestamp {
+				*node = &CheckDuplicateLabels{Expr: t}
 			}
 		}
-		return false
-
-	case *parser.MatrixSelector:
-		return preprocessExprHelper(n.VectorSelector, start, end)
-
-	case *parser.SubqueryExpr:
-		// Since we adjust offset for the @ modifier evaluation,
-		// it gets tricky to adjust it for every subquery step.
-		// Hence we wrap the inside of subquery irrespective of
-		// @ on subquery (given it is also step invariant) so that
-		// it is evaluated only once w.r.t. the start time of subquery.
-		isInvariant := preprocessExprHelper(n.Expr, start, end)
-		if isInvariant {
-			n.Expr = newStepInvariantExpr(n.Expr)
-		}
-		if n.StartOrEnd == parser.START {
-			n.Timestamp = makeInt64Pointer(timestamp.FromTime(start))
-		} else if n.StartOrEnd == parser.END {
-			n.Timestamp = makeInt64Pointer(timestamp.FromTime(end))
-		}
-		return n.Timestamp != nil
-
-	case *parser.ParenExpr:
-		return preprocessExprHelper(n.Expr, start, end)
-
-	case *parser.UnaryExpr:
-		return preprocessExprHelper(n.Expr, start, end)
-
-	case *parser.NumberLiteral:
-		return true
-	case *parser.StringLiteral:
-		// strings should be used as fixed strings; no need
-		// to wrap under stepInvariantExpr
-		return false
-	}
-
-	panic(fmt.Sprintf("found unexpected node %#v", expr))
-}
-
-func makeInt64Pointer(val int64) *int64 {
-	valp := new(int64)
-	*valp = val
-	return valp
-}
-
-func newStepInvariantExpr(expr parser.Expr) parser.Expr {
-	return &parser.StepInvariantExpr{Expr: expr}
+	})
+	return expr
 }
 
 // Copy from https://github.com/prometheus/prometheus/blob/v2.39.1/promql/engine.go#L2658.
@@ -347,14 +351,14 @@ func subqueryTimes(path []parser.Node) (time.Duration, time.Duration, *int64) {
 }
 
 func setOffsetForInnerSubqueries(expr parser.Expr, opts *query.Options) {
-	parser.Inspect(expr, func(node parser.Node, path []parser.Node) error {
-		switch n := node.(type) {
-		case *parser.SubqueryExpr:
-			nOpts := query.NestedOptionsForSubquery(opts, n)
-			setOffsetForAtModifier(nOpts.Start.UnixMilli(), n.Expr)
-			setOffsetForInnerSubqueries(n.Expr, nOpts)
-			return errors.New("stop iteration")
+	switch n := expr.(type) {
+	case *parser.SubqueryExpr:
+		nOpts := query.NestedOptionsForSubquery(opts, n.Step, n.Range, n.Offset)
+		setOffsetForAtModifier(nOpts.Start.UnixMilli(), n.Expr)
+		setOffsetForInnerSubqueries(n.Expr, nOpts)
+	default:
+		for _, c := range parser.Children(n) {
+			setOffsetForInnerSubqueries(c.(parser.Expr), opts)
 		}
-		return nil
-	})
+	}
 }

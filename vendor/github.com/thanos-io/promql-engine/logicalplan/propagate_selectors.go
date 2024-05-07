@@ -18,9 +18,9 @@ import (
 // two vector selectors in a binary expression.
 type PropagateMatchersOptimizer struct{}
 
-func (m PropagateMatchersOptimizer) Optimize(plan parser.Expr, _ *query.Options) (parser.Expr, annotations.Annotations) {
-	traverse(&plan, func(expr *parser.Expr) {
-		binOp, ok := (*expr).(*parser.BinaryExpr)
+func (m PropagateMatchersOptimizer) Optimize(plan Node, _ *query.Options) (Node, annotations.Annotations) {
+	Traverse(&plan, func(expr *Node) {
+		binOp, ok := (*expr).(*Binary)
 		if !ok {
 			return
 		}
@@ -46,12 +46,12 @@ func (m PropagateMatchersOptimizer) Optimize(plan parser.Expr, _ *query.Options)
 	return plan, nil
 }
 
-func propagateMatchers(binOp *parser.BinaryExpr) {
-	lhSelector, ok := binOp.LHS.(*parser.VectorSelector)
+func propagateMatchers(binOp *Binary) {
+	lhSelector, ok := binOp.LHS.(*VectorSelector)
 	if !ok {
 		return
 	}
-	rhSelector, ok := binOp.RHS.(*parser.VectorSelector)
+	rhSelector, ok := binOp.RHS.(*VectorSelector)
 	if !ok {
 		return
 	}
@@ -106,7 +106,7 @@ func makeUnion(lhMatchers map[string]*labels.Matcher, rhMatchers map[string]*lab
 	return union, false
 }
 
-func toMatcherMap(lhSelector *parser.VectorSelector) map[string]*labels.Matcher {
+func toMatcherMap(lhSelector *VectorSelector) map[string]*labels.Matcher {
 	lhMatchers := make(map[string]*labels.Matcher)
 	for _, m := range lhSelector.LabelMatchers {
 		lhMatchers[m.Name] = m

@@ -22,20 +22,20 @@ import (
 	"math"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/grafana/regexp"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/exp/slices"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
@@ -65,6 +65,9 @@ const (
 	// The getHPointSlice and getFPointSlice functions are called with an estimated size which often can be
 	// over-estimated.
 	maxPointsSliceSize = 5000
+
+	// The default buffer size for points used by the matrix selector.
+	matrixSelectorSliceSize = 16
 )
 
 type engineMetrics struct {
@@ -110,6 +113,12 @@ func (e ErrTooManySamples) Error() string {
 
 func (e ErrStorage) Error() string {
 	return e.Err.Error()
+}
+
+// QueryEngine defines the interface for the *promql.Engine, so it can be replaced, wrapped or mocked.
+type QueryEngine interface {
+	NewInstantQuery(ctx context.Context, q storage.Queryable, opts QueryOpts, qs string, ts time.Time) (Query, error)
+	NewRangeQuery(ctx context.Context, q storage.Queryable, opts QueryOpts, qs string, start, end time.Time, interval time.Duration) (Query, error)
 }
 
 // QueryLogger is an interface that can be used to log all the queries logged
@@ -1072,12 +1081,10 @@ type EvalNodeHelper struct {
 	Out Vector
 
 	// Caches.
-	// DropMetricName and label_*.
+	// label_*.
 	Dmn map[uint64]labels.Labels
 	// funcHistogramQuantile for classic histograms.
 	signatureToMetricWithBuckets map[string]*metricWithBuckets
-	// label_replace.
-	regex *regexp.Regexp
 
 	lb           *labels.Builder
 	lblBuf       []byte
@@ -1095,21 +1102,6 @@ func (enh *EvalNodeHelper) resetBuilder(lbls labels.Labels) {
 	} else {
 		enh.lb.Reset(lbls)
 	}
-}
-
-// DropMetricName is a cached version of DropMetricName.
-func (enh *EvalNodeHelper) DropMetricName(l labels.Labels) labels.Labels {
-	if enh.Dmn == nil {
-		enh.Dmn = make(map[uint64]labels.Labels, len(enh.Out))
-	}
-	h := l.Hash()
-	ret, ok := enh.Dmn[h]
-	if ok {
-		return ret
-	}
-	ret = dropMetricName(l)
-	enh.Dmn[h] = ret
-	return ret
 }
 
 // rangeEval evaluates the given expressions, and then for each step calls
@@ -1210,6 +1202,9 @@ func (ev *evaluator) rangeEval(prepSeries func(labels.Labels, *EvalSeriesHelper)
 				if prepSeries != nil {
 					bufHelpers[i] = append(bufHelpers[i], seriesHelpers[i][si])
 				}
+				// Don't add histogram size here because we only
+				// copy the pointer above, not the whole
+				// histogram.
 				ev.currentSamples++
 				if ev.currentSamples > ev.maxSamples {
 					ev.error(ErrTooManySamples(env))
@@ -1235,7 +1230,6 @@ func (ev *evaluator) rangeEval(prepSeries func(labels.Labels, *EvalSeriesHelper)
 		if ev.currentSamples > ev.maxSamples {
 			ev.error(ErrTooManySamples(env))
 		}
-		ev.samplesStats.UpdatePeak(ev.currentSamples)
 
 		// If this could be an instant query, shortcut so as not to change sort order.
 		if ev.endTimestamp == ev.startTimestamp {
@@ -1420,6 +1414,15 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 				break
 			}
 		}
+
+		// Special handling for functions that work on series not samples.
+		switch e.Func.Name {
+		case "label_replace":
+			return ev.evalLabelReplace(e.Args)
+		case "label_join":
+			return ev.evalLabelJoin(e.Args)
+		}
+
 		if !matrixArg {
 			// Does not have a matrix argument.
 			return ev.rangeEval(nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
@@ -1463,6 +1466,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		// Reuse objects across steps to save memory allocations.
 		var floats []FPoint
 		var histograms []HPoint
+		var prevSS *Series
 		inMatrix := make(Matrix, 1)
 		inArgs[matrixArgIndex] = inMatrix
 		enh := &EvalNodeHelper{Out: make(Vector, 0, 1)}
@@ -1470,6 +1474,9 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		it := storage.NewBuffer(selRange)
 		var chkIter chunkenc.Iterator
 		for i, s := range selVS.Series {
+			if err := contextDone(ev.ctx, "expression evaluation"); err != nil {
+				ev.error(err)
+			}
 			ev.currentSamples -= len(floats) + totalHPointSize(histograms)
 			if floats != nil {
 				floats = floats[:0]
@@ -1485,7 +1492,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 			// vector functions, the only change needed is to drop the
 			// metric name in the output.
 			if e.Func.Name != "last_over_time" {
-				metric = dropMetricName(metric)
+				metric = metric.DropMetricName()
 			}
 			ss := Series{
 				Metric: metric,
@@ -1501,10 +1508,14 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 						otherInArgs[j][0].F = otherArgs[j][0].Floats[step].F
 					}
 				}
-				maxt := ts - offset
-				mint := maxt - selRange
-				// Evaluate the matrix selector for this series for this step.
-				floats, histograms = ev.matrixIterSlice(it, mint, maxt, floats, histograms)
+				// Evaluate the matrix selector for this series
+				// for this step, but only if this is the 1st
+				// iteration or no @ modifier has been used.
+				if ts == ev.startTimestamp || selVS.Timestamp == nil {
+					maxt := ts - offset
+					mint := maxt - selRange
+					floats, histograms = ev.matrixIterSlice(it, mint, maxt, floats, histograms)
+				}
 				if len(floats)+len(histograms) == 0 {
 					continue
 				}
@@ -1520,12 +1531,13 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 				if len(outVec) > 0 {
 					if outVec[0].H == nil {
 						if ss.Floats == nil {
-							ss.Floats = getFPointSlice(numSteps)
+							ss.Floats = reuseOrGetFPointSlices(prevSS, numSteps)
 						}
+
 						ss.Floats = append(ss.Floats, FPoint{F: outVec[0].F, T: ts})
 					} else {
 						if ss.Histograms == nil {
-							ss.Histograms = getHPointSlice(numSteps)
+							ss.Histograms = reuseOrGetHPointSlices(prevSS, numSteps)
 						}
 						ss.Histograms = append(ss.Histograms, HPoint{H: outVec[0].H, T: ts})
 					}
@@ -1534,21 +1546,34 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 				it.ReduceDelta(stepRange)
 			}
 			histSamples := totalHPointSize(ss.Histograms)
+
 			if len(ss.Floats)+histSamples > 0 {
-				if ev.currentSamples+len(ss.Floats)+histSamples <= ev.maxSamples {
-					mat = append(mat, ss)
-					ev.currentSamples += len(ss.Floats) + histSamples
-				} else {
+				if ev.currentSamples+len(ss.Floats)+histSamples > ev.maxSamples {
 					ev.error(ErrTooManySamples(env))
 				}
+				mat = append(mat, ss)
+				prevSS = &mat[len(mat)-1]
+				ev.currentSamples += len(ss.Floats) + histSamples
 			}
 			ev.samplesStats.UpdatePeak(ev.currentSamples)
+
+			if e.Func.Name == "rate" || e.Func.Name == "increase" {
+				samples := inMatrix[0]
+				metricName := samples.Metric.Get(labels.MetricName)
+				if metricName != "" && len(samples.Floats) > 0 &&
+					!strings.HasSuffix(metricName, "_total") &&
+					!strings.HasSuffix(metricName, "_sum") &&
+					!strings.HasSuffix(metricName, "_count") &&
+					!strings.HasSuffix(metricName, "_bucket") {
+					warnings.Add(annotations.NewPossibleNonCounterInfo(metricName, e.Args[0].PositionRange()))
+				}
+			}
 		}
 		ev.samplesStats.UpdatePeak(ev.currentSamples)
 
 		ev.currentSamples -= len(floats) + totalHPointSize(histograms)
 		putFPointSlice(floats)
-		putHPointSlice(histograms)
+		putMatrixSelectorHPointSlice(histograms)
 
 		// The absent_over_time function returns 0 or 1 series. So far, the matrix
 		// contains multiple series. The following code will create a new series
@@ -1605,7 +1630,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		mat := val.(Matrix)
 		if e.Op == parser.SUB {
 			for i := range mat {
-				mat[i].Metric = dropMetricName(mat[i].Metric)
+				mat[i].Metric = mat[i].Metric.DropMetricName()
 				for j := range mat[i].Floats {
 					mat[i].Floats[j].F = -mat[i].Floats[j].F
 				}
@@ -1674,9 +1699,13 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 			ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), ws})
 		}
 		mat := make(Matrix, 0, len(e.Series))
+		var prevSS *Series
 		it := storage.NewMemoizedEmptyIterator(durationMilliseconds(ev.lookbackDelta))
 		var chkIter chunkenc.Iterator
 		for i, s := range e.Series {
+			if err := contextDone(ev.ctx, "expression evaluation"); err != nil {
+				ev.error(err)
+			}
 			chkIter = s.Iterator(chkIter)
 			it.Reset(chkIter)
 			ss := Series{
@@ -1687,32 +1716,35 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 				step++
 				_, f, h, ok := ev.vectorSelectorSingle(it, e, ts)
 				if ok {
-					if ev.currentSamples < ev.maxSamples {
-						if h == nil {
-							if ss.Floats == nil {
-								ss.Floats = getFPointSlice(numSteps)
-							}
-							ss.Floats = append(ss.Floats, FPoint{F: f, T: ts})
-							ev.currentSamples++
-							ev.samplesStats.IncrementSamplesAtStep(step, 1)
-						} else {
-							if ss.Histograms == nil {
-								ss.Histograms = getHPointSlice(numSteps)
-							}
-							point := HPoint{H: h, T: ts}
-							ss.Histograms = append(ss.Histograms, point)
-							histSize := point.size()
-							ev.currentSamples += histSize
-							ev.samplesStats.IncrementSamplesAtStep(step, int64(histSize))
+					if h == nil {
+						ev.currentSamples++
+						ev.samplesStats.IncrementSamplesAtStep(step, 1)
+						if ev.currentSamples > ev.maxSamples {
+							ev.error(ErrTooManySamples(env))
 						}
+						if ss.Floats == nil {
+							ss.Floats = reuseOrGetFPointSlices(prevSS, numSteps)
+						}
+						ss.Floats = append(ss.Floats, FPoint{F: f, T: ts})
 					} else {
-						ev.error(ErrTooManySamples(env))
+						point := HPoint{H: h, T: ts}
+						histSize := point.size()
+						ev.currentSamples += histSize
+						ev.samplesStats.IncrementSamplesAtStep(step, int64(histSize))
+						if ev.currentSamples > ev.maxSamples {
+							ev.error(ErrTooManySamples(env))
+						}
+						if ss.Histograms == nil {
+							ss.Histograms = reuseOrGetHPointSlices(prevSS, numSteps)
+						}
+						ss.Histograms = append(ss.Histograms, point)
 					}
 				}
 			}
 
 			if len(ss.Floats)+len(ss.Histograms) > 0 {
 				mat = append(mat, ss)
+				prevSS = &mat[len(mat)-1]
 			}
 		}
 		ev.samplesStats.UpdatePeak(ev.currentSamples)
@@ -1833,6 +1865,30 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 	panic(fmt.Errorf("unhandled expression of type: %T", expr))
 }
 
+// reuseOrGetHPointSlices reuses the space from previous slice to create new slice if the former has lots of room.
+// The previous slices capacity is adjusted so when it is re-used from the pool it doesn't overflow into the new one.
+func reuseOrGetHPointSlices(prevSS *Series, numSteps int) (r []HPoint) {
+	if prevSS != nil && cap(prevSS.Histograms)-2*len(prevSS.Histograms) > 0 {
+		r = prevSS.Histograms[len(prevSS.Histograms):]
+		prevSS.Histograms = prevSS.Histograms[0:len(prevSS.Histograms):len(prevSS.Histograms)]
+		return
+	}
+
+	return getHPointSlice(numSteps)
+}
+
+// reuseOrGetFPointSlices reuses the space from previous slice to create new slice if the former has lots of room.
+// The previous slices capacity is adjusted so when it is re-used from the pool it doesn't overflow into the new one.
+func reuseOrGetFPointSlices(prevSS *Series, numSteps int) (r []FPoint) {
+	if prevSS != nil && cap(prevSS.Floats)-2*len(prevSS.Floats) > 0 {
+		r = prevSS.Floats[len(prevSS.Floats):]
+		prevSS.Floats = prevSS.Floats[0:len(prevSS.Floats):len(prevSS.Floats)]
+		return
+	}
+
+	return getFPointSlice(numSteps)
+}
+
 func (ev *evaluator) rangeEvalTimestampFunctionOverVectorSelector(vs *parser.VectorSelector, call FunctionCall, e *parser.Call) (parser.Value, annotations.Annotations) {
 	ws, err := checkAndExpandSeriesSet(ev.ctx, vs)
 	if err != nil {
@@ -1921,6 +1977,13 @@ func (ev *evaluator) vectorSelectorSingle(it *storage.MemoizedSeriesIterator, no
 var (
 	fPointPool zeropool.Pool[[]FPoint]
 	hPointPool zeropool.Pool[[]HPoint]
+
+	// matrixSelectorHPool holds reusable histogram slices used by the matrix
+	// selector. The key difference between this pool and the hPointPool is that
+	// slices returned by this pool should never hold multiple copies of the same
+	// histogram pointer since histogram objects are reused across query evaluation
+	// steps.
+	matrixSelectorHPool zeropool.Pool[[]HPoint]
 )
 
 func getFPointSlice(sz int) []FPoint {
@@ -1960,6 +2023,20 @@ func getHPointSlice(sz int) []HPoint {
 func putHPointSlice(p []HPoint) {
 	if p != nil {
 		hPointPool.Put(p[:0])
+	}
+}
+
+func getMatrixSelectorHPoints() []HPoint {
+	if p := matrixSelectorHPool.Get(); p != nil {
+		return p
+	}
+
+	return make([]HPoint, 0, matrixSelectorSliceSize)
+}
+
+func putMatrixSelectorHPointSlice(p []HPoint) {
+	if p != nil {
+		matrixSelectorHPool.Put(p[:0])
 	}
 }
 
@@ -2052,7 +2129,12 @@ func (ev *evaluator) matrixIterSlice(
 		var drop int
 		for drop = 0; histograms[drop].T < mint; drop++ {
 		}
+		// Rotate the buffer around the drop index so that points before mint can be
+		// reused to store new histograms.
+		tail := make([]HPoint, drop)
+		copy(tail, histograms[:drop])
 		copy(histograms, histograms[drop:])
+		copy(histograms[len(histograms)-drop:], tail)
 		histograms = histograms[:len(histograms)-drop]
 		ev.currentSamples -= totalHPointSize(histograms)
 		// Only append points with timestamps after the last timestamp we have.
@@ -2078,21 +2160,27 @@ loop:
 		case chunkenc.ValNone:
 			break loop
 		case chunkenc.ValFloatHistogram, chunkenc.ValHistogram:
-			t, h := buf.AtFloatHistogram()
-			if value.IsStaleNaN(h.Sum) {
-				continue loop
-			}
+			t := buf.AtT()
 			// Values in the buffer are guaranteed to be smaller than maxt.
 			if t >= mintHistograms {
-				if ev.currentSamples >= ev.maxSamples {
+				if histograms == nil {
+					histograms = getMatrixSelectorHPoints()
+				}
+				n := len(histograms)
+				if n < cap(histograms) {
+					histograms = histograms[:n+1]
+				} else {
+					histograms = append(histograms, HPoint{H: &histogram.FloatHistogram{}})
+				}
+				histograms[n].T, histograms[n].H = buf.AtFloatHistogram(histograms[n].H)
+				if value.IsStaleNaN(histograms[n].H.Sum) {
+					histograms = histograms[:n]
+					continue loop
+				}
+				ev.currentSamples += histograms[n].size()
+				if ev.currentSamples > ev.maxSamples {
 					ev.error(ErrTooManySamples(env))
 				}
-				point := HPoint{T: t, H: h}
-				if histograms == nil {
-					histograms = getHPointSlice(16)
-				}
-				histograms = append(histograms, point)
-				ev.currentSamples += point.size()
 			}
 		case chunkenc.ValFloat:
 			t, f := buf.At()
@@ -2101,10 +2189,10 @@ loop:
 			}
 			// Values in the buffer are guaranteed to be smaller than maxt.
 			if t >= mintFloats {
-				if ev.currentSamples >= ev.maxSamples {
+				ev.currentSamples++
+				if ev.currentSamples > ev.maxSamples {
 					ev.error(ErrTooManySamples(env))
 				}
-				ev.currentSamples++
 				if floats == nil {
 					floats = getFPointSlice(16)
 				}
@@ -2115,29 +2203,39 @@ loop:
 	// The sought sample might also be in the range.
 	switch soughtValueType {
 	case chunkenc.ValFloatHistogram, chunkenc.ValHistogram:
-		t, h := it.AtFloatHistogram()
-		if t == maxt && !value.IsStaleNaN(h.Sum) {
-			if ev.currentSamples >= ev.maxSamples {
-				ev.error(ErrTooManySamples(env))
-			}
-			if histograms == nil {
-				histograms = getHPointSlice(16)
-			}
-			point := HPoint{T: t, H: h}
-			histograms = append(histograms, point)
-			ev.currentSamples += point.size()
+		if it.AtT() != maxt {
+			break
 		}
+		if histograms == nil {
+			histograms = getMatrixSelectorHPoints()
+		}
+		n := len(histograms)
+		if n < cap(histograms) {
+			histograms = histograms[:n+1]
+		} else {
+			histograms = append(histograms, HPoint{H: &histogram.FloatHistogram{}})
+		}
+		histograms[n].T, histograms[n].H = it.AtFloatHistogram(histograms[n].H)
+		if value.IsStaleNaN(histograms[n].H.Sum) {
+			histograms = histograms[:n]
+			break
+		}
+		ev.currentSamples += histograms[n].size()
+		if ev.currentSamples > ev.maxSamples {
+			ev.error(ErrTooManySamples(env))
+		}
+
 	case chunkenc.ValFloat:
 		t, f := it.At()
 		if t == maxt && !value.IsStaleNaN(f) {
-			if ev.currentSamples >= ev.maxSamples {
+			ev.currentSamples++
+			if ev.currentSamples > ev.maxSamples {
 				ev.error(ErrTooManySamples(env))
 			}
 			if floats == nil {
 				floats = getFPointSlice(16)
 			}
 			floats = append(floats, FPoint{T: t, F: f})
-			ev.currentSamples++
 		}
 	}
 	ev.samplesStats.UpdatePeak(ev.currentSamples)
@@ -2306,7 +2404,7 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 		}
 		metric := resultMetric(ls.Metric, rs.Metric, op, matching, enh)
 		if returnBool {
-			metric = enh.DropMetricName(metric)
+			metric = metric.DropMetricName()
 		}
 		insertedSigs, exists := matchedSigs[sig]
 		if matching.Card == parser.CardOneToOne {
@@ -2428,16 +2526,12 @@ func (ev *evaluator) VectorscalarBinop(op parser.ItemType, lhs Vector, rhs Scala
 			lhsSample.F = float
 			lhsSample.H = histogram
 			if shouldDropMetricName(op) || returnBool {
-				lhsSample.Metric = enh.DropMetricName(lhsSample.Metric)
+				lhsSample.Metric = lhsSample.Metric.DropMetricName()
 			}
 			enh.Out = append(enh.Out, lhsSample)
 		}
 	}
 	return enh.Out
-}
-
-func dropMetricName(l labels.Labels) labels.Labels {
-	return labels.NewBuilder(l).Del(labels.MetricName).Labels()
 }
 
 // scalarBinop evaluates a binary operation between two Scalars.
@@ -2478,22 +2572,12 @@ func vectorElemBinop(op parser.ItemType, lhs, rhs float64, hlhs, hrhs *histogram
 	switch op {
 	case parser.ADD:
 		if hlhs != nil && hrhs != nil {
-			// The histogram being added must have the larger schema
-			// code (i.e. the higher resolution).
-			if hrhs.Schema >= hlhs.Schema {
-				return 0, hlhs.Copy().Add(hrhs).Compact(0), true
-			}
-			return 0, hrhs.Copy().Add(hlhs).Compact(0), true
+			return 0, hlhs.Copy().Add(hrhs).Compact(0), true
 		}
 		return lhs + rhs, nil, true
 	case parser.SUB:
 		if hlhs != nil && hrhs != nil {
-			// The histogram being subtracted must have the larger schema
-			// code (i.e. the higher resolution).
-			if hrhs.Schema >= hlhs.Schema {
-				return 0, hlhs.Copy().Sub(hrhs).Compact(0), true
-			}
-			return 0, hrhs.Copy().Mul(-1).Add(hlhs).Compact(0), true
+			return 0, hlhs.Copy().Sub(hrhs).Compact(0), true
 		}
 		return lhs - rhs, nil, true
 	case parser.MUL:
@@ -2678,13 +2762,7 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, grouping []string, par
 			if s.H != nil {
 				group.hasHistogram = true
 				if group.histogramValue != nil {
-					// The histogram being added must have
-					// an equal or larger schema.
-					if s.H.Schema >= group.histogramValue.Schema {
-						group.histogramValue.Add(s.H)
-					} else {
-						group.histogramValue = s.H.Copy().Add(group.histogramValue)
-					}
+					group.histogramValue.Add(s.H)
 				}
 				// Otherwise the aggregation contained floats
 				// previously and will be invalid anyway. No
@@ -2701,15 +2779,8 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, grouping []string, par
 				if group.histogramMean != nil {
 					left := s.H.Copy().Div(float64(group.groupCount))
 					right := group.histogramMean.Copy().Div(float64(group.groupCount))
-					// The histogram being added/subtracted must have
-					// an equal or larger schema.
-					if s.H.Schema >= group.histogramMean.Schema {
-						toAdd := right.Mul(-1).Add(left)
-						group.histogramMean.Add(toAdd)
-					} else {
-						toAdd := left.Sub(right)
-						group.histogramMean = toAdd.Add(group.histogramMean)
-					}
+					toAdd := left.Sub(right)
+					group.histogramMean.Add(toAdd)
 				}
 				// Otherwise the aggregation contained floats
 				// previously and will be invalid anyway. No
@@ -2813,8 +2884,7 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, grouping []string, par
 		case parser.AVG:
 			if aggr.hasFloat && aggr.hasHistogram {
 				// We cannot aggregate histogram sample with a float64 sample.
-				metricName := aggr.labels.Get(labels.MetricName)
-				annos.Add(annotations.NewMixedFloatsHistogramsWarning(metricName, e.Expr.PositionRange()))
+				annos.Add(annotations.NewMixedFloatsHistogramsAggWarning(e.Expr.PositionRange()))
 				continue
 			}
 			if aggr.hasHistogram {
@@ -2867,8 +2937,7 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, grouping []string, par
 		case parser.SUM:
 			if aggr.hasFloat && aggr.hasHistogram {
 				// We cannot aggregate histogram sample with a float64 sample.
-				metricName := aggr.labels.Get(labels.MetricName)
-				annos.Add(annotations.NewMixedFloatsHistogramsWarning(metricName, e.Expr.PositionRange()))
+				annos.Add(annotations.NewMixedFloatsHistogramsAggWarning(e.Expr.PositionRange()))
 				continue
 			}
 			if aggr.hasHistogram {

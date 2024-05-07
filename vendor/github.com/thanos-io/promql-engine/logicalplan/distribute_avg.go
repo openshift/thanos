@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Community Authors.
+// Licensed under the Apache License 2.0.
+
 package logicalplan
 
 import (
@@ -13,23 +16,24 @@ type DistributeAvgOptimizer struct {
 	SkipBinaryPushdown bool
 }
 
-func (r DistributeAvgOptimizer) Optimize(plan parser.Expr, _ *query.Options) (parser.Expr, annotations.Annotations) {
-	TraverseBottomUp(nil, &plan, func(parent, current *parser.Expr) (stop bool) {
-		if !isDistributiveOrAverage(current, r.SkipBinaryPushdown) {
+func (r DistributeAvgOptimizer) Optimize(plan Node, _ *query.Options) (Node, annotations.Annotations) {
+	var warns = annotations.New()
+	TraverseBottomUp(nil, &plan, func(parent, current *Node) (stop bool) {
+		if !isDistributiveOrAverage(current, r.SkipBinaryPushdown, warns) {
 			return true
 		}
 		// If the current node is avg(), distribute the operation and
 		// stop the traversal.
-		if aggr, ok := (*current).(*parser.AggregateExpr); ok {
+		if aggr, ok := (*current).(*Aggregation); ok {
 			if aggr.Op != parser.AVG {
 				return true
 			}
 
-			sum := *(*current).(*parser.AggregateExpr)
+			sum := *(*current).(*Aggregation)
 			sum.Op = parser.SUM
-			count := *(*current).(*parser.AggregateExpr)
+			count := *(*current).(*Aggregation)
 			count.Op = parser.COUNT
-			*current = &parser.BinaryExpr{
+			*current = &Binary{
 				Op:  parser.DIV,
 				LHS: &sum,
 				RHS: &count,
@@ -41,18 +45,18 @@ func (r DistributeAvgOptimizer) Optimize(plan parser.Expr, _ *query.Options) (pa
 			}
 			return true
 		}
-		return !isDistributiveOrAverage(parent, r.SkipBinaryPushdown)
+		return !isDistributiveOrAverage(parent, r.SkipBinaryPushdown, warns)
 	})
 	return plan, nil
 }
 
-func isDistributiveOrAverage(expr *parser.Expr, skipBinaryPushdown bool) bool {
+func isDistributiveOrAverage(expr *Node, skipBinaryPushdown bool, warns *annotations.Annotations) bool {
 	if expr == nil {
 		return false
 	}
 	var isAvg bool
-	if aggr, ok := (*expr).(*parser.AggregateExpr); ok {
+	if aggr, ok := (*expr).(*Aggregation); ok {
 		isAvg = aggr.Op == parser.AVG
 	}
-	return isDistributive(expr, skipBinaryPushdown) || isAvg
+	return isDistributive(expr, skipBinaryPushdown, map[string]struct{}{}, warns) || isAvg
 }
