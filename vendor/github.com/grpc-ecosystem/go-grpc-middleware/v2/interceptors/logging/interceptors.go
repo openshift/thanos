@@ -1,3 +1,6 @@
+// Copyright (c) The go-grpc-middleware Authors.
+// Licensed under the Apache License 2.0.
+
 package logging
 
 import (
@@ -6,130 +9,203 @@ import (
 	"io"
 	"time"
 
-	"google.golang.org/grpc"
-
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors"
-	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/tags"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/protobuf/proto"
 )
 
-// extractFields returns all fields from tags.
-func extractFields(tags tags.Tags) Fields {
-	var fields Fields
-	for k, v := range tags.Values() {
-		fields = append(fields, k, v)
-	}
-	return fields
-}
-
 type reporter struct {
+	interceptors.CallMeta
+
 	ctx             context.Context
-	typ             interceptors.GRPCType
-	service, method string
-	startCallLogged bool
-	opts            *options
-	logger          Logger
 	kind            string
-}
+	startCallLogged bool
 
-func (c *reporter) logMessage(logger Logger, err error, msg string, duration time.Duration) {
-	code := c.opts.codeFunc(err)
-	logger = logger.With("grpc.code", code.String())
-	if err != nil {
-		logger = logger.With("grpc.error", fmt.Sprintf("%v", err))
-	}
-	logger = logger.With(extractFields(tags.Extract(c.ctx))...)
-	logger.With(c.opts.durationFieldFunc(duration)...).Log(c.opts.levelFunc(code), msg)
-}
-
-func (c *reporter) PostCall(err error, duration time.Duration) {
-	switch c.opts.shouldLog(interceptors.FullMethod(c.service, c.method), err) {
-	case LogFinishCall, LogStartAndFinishCall:
-		if err == io.EOF {
-			err = nil
-		}
-		c.logMessage(c.logger, err, "finished call", duration)
-	default:
-		return
-	}
-}
-
-func (c *reporter) PostMsgSend(_ interface{}, err error, duration time.Duration) {
-	if c.startCallLogged {
-		return
-	}
-	switch c.opts.shouldLog(interceptors.FullMethod(c.service, c.method), err) {
-	case LogStartAndFinishCall:
-		c.startCallLogged = true
-		c.logMessage(c.logger, err, "started call", duration)
-	}
-}
-
-func (c *reporter) PostMsgReceive(_ interface{}, err error, duration time.Duration) {
-	if c.startCallLogged {
-		return
-	}
-	switch c.opts.shouldLog(interceptors.FullMethod(c.service, c.method), err) {
-	case LogStartAndFinishCall:
-		c.startCallLogged = true
-		c.logMessage(c.logger, err, "started call", duration)
-	}
-}
-
-type reportable struct {
 	opts   *options
+	fields Fields
 	logger Logger
 }
 
-func (r *reportable) ServerReporter(ctx context.Context, _ interface{}, typ interceptors.GRPCType, service string, method string) (interceptors.Reporter, context.Context) {
-	return r.reporter(ctx, typ, service, method, KindServerFieldValue)
-}
-
-func (r *reportable) ClientReporter(ctx context.Context, _ interface{}, typ interceptors.GRPCType, service string, method string) (interceptors.Reporter, context.Context) {
-	return r.reporter(ctx, typ, service, method, KindClientFieldValue)
-}
-
-func (r *reportable) reporter(ctx context.Context, typ interceptors.GRPCType, service string, method string, kind string) (interceptors.Reporter, context.Context) {
-	fields := commonFields(kind, typ, service, method)
-	fields = append(fields, "grpc.start_time", time.Now().Format(time.RFC3339))
-	if d, ok := ctx.Deadline(); ok {
-		fields = append(fields, "grpc.request.deadline", d.Format(time.RFC3339))
+func (c *reporter) PostCall(err error, duration time.Duration) {
+	if !has(c.opts.loggableEvents, FinishCall) {
+		return
 	}
-	return &reporter{
-		ctx:             ctx,
-		typ:             typ,
-		service:         service,
-		method:          method,
-		startCallLogged: false,
-		opts:            r.opts,
-		logger:          r.logger.With(fields...),
-		kind:            kind,
-	}, ctx
+	if err == io.EOF {
+		err = nil
+	}
+
+	code := c.opts.codeFunc(err)
+	fields := c.fields.WithUnique(ExtractFields(c.ctx))
+	fields = fields.AppendUnique(Fields{"grpc.code", code.String()})
+	if err != nil {
+		fields = fields.AppendUnique(Fields{"grpc.error", fmt.Sprintf("%v", err)})
+	}
+	c.logger.Log(c.ctx, c.opts.levelFunc(code), "finished call", fields.AppendUnique(c.opts.durationFieldFunc(duration))...)
+}
+
+func (c *reporter) PostMsgSend(payload any, err error, duration time.Duration) {
+	logLvl := c.opts.levelFunc(c.opts.codeFunc(err))
+	fields := c.fields.WithUnique(ExtractFields(c.ctx))
+	if err != nil {
+		fields = fields.AppendUnique(Fields{"grpc.error", fmt.Sprintf("%v", err)})
+	}
+	if !c.startCallLogged && has(c.opts.loggableEvents, StartCall) {
+		c.startCallLogged = true
+		c.logger.Log(c.ctx, logLvl, "started call", fields.AppendUnique(c.opts.durationFieldFunc(duration))...)
+	}
+
+	if err != nil || !has(c.opts.loggableEvents, PayloadSent) {
+		return
+	}
+	if c.CallMeta.IsClient {
+		p, ok := payload.(proto.Message)
+		if !ok {
+			c.logger.Log(
+				c.ctx,
+				LevelError,
+				"payload is not a google.golang.org/protobuf/proto.Message; programmatic error?",
+				fields.AppendUnique(Fields{"grpc.request.type", fmt.Sprintf("%T", payload)})...,
+			)
+			return
+		}
+
+		fields = fields.AppendUnique(Fields{"grpc.send.duration", duration.String(), "grpc.request.content", p})
+		fields = fields.AppendUnique(c.opts.durationFieldFunc(duration))
+		c.logger.Log(c.ctx, logLvl, "request sent", fields...)
+	} else {
+		p, ok := payload.(proto.Message)
+		if !ok {
+			c.logger.Log(
+				c.ctx,
+				LevelError,
+				"payload is not a google.golang.org/protobuf/proto.Message; programmatic error?",
+				fields.AppendUnique(Fields{"grpc.response.type", fmt.Sprintf("%T", payload)})...,
+			)
+			return
+		}
+
+		fields = fields.AppendUnique(Fields{"grpc.send.duration", duration.String(), "grpc.response.content", p})
+		fields = fields.AppendUnique(c.opts.durationFieldFunc(duration))
+		c.logger.Log(c.ctx, logLvl, "response sent", fields...)
+	}
+}
+
+func (c *reporter) PostMsgReceive(payload any, err error, duration time.Duration) {
+	logLvl := c.opts.levelFunc(c.opts.codeFunc(err))
+	fields := c.fields.WithUnique(ExtractFields(c.ctx))
+	if err != nil {
+		fields = fields.AppendUnique(Fields{"grpc.error", fmt.Sprintf("%v", err)})
+	}
+	if !c.startCallLogged && has(c.opts.loggableEvents, StartCall) {
+		c.startCallLogged = true
+		c.logger.Log(c.ctx, logLvl, "started call", fields.AppendUnique(c.opts.durationFieldFunc(duration))...)
+	}
+
+	if err != nil || !has(c.opts.loggableEvents, PayloadReceived) {
+		return
+	}
+	if !c.CallMeta.IsClient {
+		p, ok := payload.(proto.Message)
+		if !ok {
+			c.logger.Log(
+				c.ctx,
+				LevelError,
+				"payload is not a google.golang.org/protobuf/proto.Message; programmatic error?",
+				fields.AppendUnique(Fields{"grpc.request.type", fmt.Sprintf("%T", payload)})...,
+			)
+			return
+		}
+
+		fields = fields.AppendUnique(Fields{"grpc.recv.duration", duration.String(), "grpc.request.content", p})
+		fields = fields.AppendUnique(c.opts.durationFieldFunc(duration))
+		c.logger.Log(c.ctx, logLvl, "request received", fields...)
+	} else {
+		p, ok := payload.(proto.Message)
+		if !ok {
+			c.logger.Log(
+				c.ctx,
+				LevelError,
+				"payload is not a google.golang.org/protobuf/proto.Message; programmatic error?",
+				fields.AppendUnique(Fields{"grpc.response.type", fmt.Sprintf("%T", payload)})...,
+			)
+			return
+		}
+
+		fields = fields.AppendUnique(Fields{"grpc.recv.duration", duration.String(), "grpc.response.content", p})
+		fields = fields.AppendUnique(c.opts.durationFieldFunc(duration))
+		c.logger.Log(c.ctx, logLvl, "response received", fields...)
+	}
+}
+
+func reportable(logger Logger, opts *options) interceptors.CommonReportableFunc {
+	return func(ctx context.Context, c interceptors.CallMeta) (interceptors.Reporter, context.Context) {
+		kind := KindServerFieldValue
+		if c.IsClient {
+			kind = KindClientFieldValue
+		}
+
+		// Field dups from context override the common fields.
+		fields := newCommonFields(kind, c)
+		if opts.disableGrpcLogFields != nil {
+			fields = disableCommonLoggingFields(kind, c, opts.disableGrpcLogFields)
+		}
+		fields = fields.WithUnique(ExtractFields(ctx))
+
+		if !c.IsClient {
+			if peer, ok := peer.FromContext(ctx); ok {
+				fields = append(fields, "peer.address", peer.Addr.String())
+			}
+		}
+		if opts.fieldsFromCtxCallMetaFn != nil {
+			// fieldsFromCtxFn dups override the existing fields.
+			fields = opts.fieldsFromCtxCallMetaFn(ctx, c).AppendUnique(fields)
+		}
+
+		singleUseFields := Fields{"grpc.start_time", time.Now().Format(opts.timestampFormat)}
+		if d, ok := ctx.Deadline(); ok {
+			singleUseFields = singleUseFields.AppendUnique(Fields{"grpc.request.deadline", d.Format(opts.timestampFormat)})
+		}
+		return &reporter{
+			CallMeta:        c,
+			ctx:             ctx,
+			startCallLogged: false,
+			opts:            opts,
+			fields:          fields.WithUnique(singleUseFields),
+			logger:          logger,
+			kind:            kind,
+		}, InjectFields(ctx, fields)
+	}
 }
 
 // UnaryClientInterceptor returns a new unary client interceptor that optionally logs the execution of external gRPC calls.
-// Logger will use all tags (from tags package) available in current context as fields.
+// Logger will read existing and write new logging.Fields available in current context.
+// See `ExtractFields` and `InjectFields` for details.
 func UnaryClientInterceptor(logger Logger, opts ...Option) grpc.UnaryClientInterceptor {
 	o := evaluateClientOpt(opts)
-	return interceptors.UnaryClientInterceptor(&reportable{logger: logger, opts: o})
+	return interceptors.UnaryClientInterceptor(reportable(logger, o))
 }
 
 // StreamClientInterceptor returns a new streaming client interceptor that optionally logs the execution of external gRPC calls.
-// Logger will use all tags (from tags package) available in current context as fields.
+// Logger will read existing and write new logging.Fields available in current context.
+// See `ExtractFields` and `InjectFields` for details.
 func StreamClientInterceptor(logger Logger, opts ...Option) grpc.StreamClientInterceptor {
 	o := evaluateClientOpt(opts)
-	return interceptors.StreamClientInterceptor(&reportable{logger: logger, opts: o})
+	return interceptors.StreamClientInterceptor(reportable(logger, o))
 }
 
 // UnaryServerInterceptor returns a new unary server interceptors that optionally logs endpoint handling.
-// Logger will use all tags (from tags package) available in current context as fields.
+// Logger will read existing and write new logging.Fields available in current context.
+// See `ExtractFields` and `InjectFields` for details.
 func UnaryServerInterceptor(logger Logger, opts ...Option) grpc.UnaryServerInterceptor {
 	o := evaluateServerOpt(opts)
-	return interceptors.UnaryServerInterceptor(&reportable{logger: logger, opts: o})
+	return interceptors.UnaryServerInterceptor(reportable(logger, o))
 }
 
 // StreamServerInterceptor returns a new stream server interceptors that optionally logs endpoint handling.
-// Logger will use all tags (from tags package) available in current context as fields.
+// Logger will read existing and write new logging.Fields available in current context.
+// See `ExtractFields` and `InjectFields` for details..
 func StreamServerInterceptor(logger Logger, opts ...Option) grpc.StreamServerInterceptor {
 	o := evaluateServerOpt(opts)
-	return interceptors.StreamServerInterceptor(&reportable{logger: logger, opts: o})
+	return interceptors.StreamServerInterceptor(reportable(logger, o))
 }
