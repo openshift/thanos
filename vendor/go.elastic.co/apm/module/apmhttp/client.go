@@ -59,6 +59,7 @@ func WrapRoundTripper(r http.RoundTripper, o ...ClientOption) http.RoundTripper 
 		r:              r,
 		requestName:    ClientRequestName,
 		requestIgnorer: IgnoreNone,
+		spanType:       "external.http",
 	}
 	for _, o := range o {
 		o(rt)
@@ -71,6 +72,7 @@ type roundTripper struct {
 	requestName    RequestNameFunc
 	requestIgnorer RequestIgnorerFunc
 	traceRequests  bool
+	spanType       string
 }
 
 // RoundTrip delegates to r.r, emitting a span if req's context
@@ -97,12 +99,12 @@ func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	propagateLegacyHeader := tx.ShouldPropagateLegacyHeader()
 	traceContext := tx.TraceContext()
 	if !traceContext.Options.Recorded() {
-		r.setHeaders(req, traceContext, propagateLegacyHeader)
+		SetHeaders(req, traceContext, propagateLegacyHeader)
 		return r.r.RoundTrip(req)
 	}
 
 	name := r.requestName(req)
-	span := tx.StartSpan(name, "external.http", apm.SpanFromContext(ctx))
+	span := tx.StartSpan(name, r.spanType, apm.SpanFromContext(ctx))
 	var rt *requestTracer
 	if !span.Dropped() {
 		traceContext = span.TraceContext()
@@ -117,7 +119,7 @@ func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		span = nil
 	}
 
-	r.setHeaders(req, traceContext, propagateLegacyHeader)
+	SetHeaders(req, traceContext, propagateLegacyHeader)
 	resp, err := r.r.RoundTrip(req)
 	if span != nil {
 		if err != nil {
@@ -133,7 +135,8 @@ func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-func (r *roundTripper) setHeaders(req *http.Request, traceContext apm.TraceContext, propagateLegacyHeader bool) {
+// SetHeaders sets traceparent and tracestate headers on an http request.
+func SetHeaders(req *http.Request, traceContext apm.TraceContext, propagateLegacyHeader bool) {
 	headerValue := FormatTraceparentHeader(traceContext)
 	if propagateLegacyHeader {
 		req.Header.Set(ElasticTraceparentHeader, headerValue)
@@ -208,5 +211,14 @@ func WithClientRequestName(r RequestNameFunc) ClientOption {
 
 	return ClientOption(func(rt *roundTripper) {
 		rt.requestName = r
+	})
+}
+
+// WithClientSpanType sets the span type for HTTP client requests.
+//
+// Defaults to "external.http".
+func WithClientSpanType(spanType string) ClientOption {
+	return ClientOption(func(rt *roundTripper) {
+		rt.spanType = spanType
 	})
 }

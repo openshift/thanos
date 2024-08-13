@@ -1,12 +1,10 @@
-// Copyright 2016 Michal Witkowski. All Rights Reserved.
-// See LICENSE for licensing terms.
+// Copyright (c) The go-grpc-middleware Authors.
+// Licensed under the Apache License 2.0.
 
 package interceptors
 
 import (
 	"context"
-	"fmt"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -30,53 +28,48 @@ var (
 	}
 )
 
-func splitMethodName(fullMethod string) (string, string) {
-	fullMethod = strings.TrimPrefix(fullMethod, "/") // remove leading slash
-	if i := strings.Index(fullMethod, "/"); i >= 0 {
-		return fullMethod[:i], fullMethod[i+1:]
-	}
-	return "unknown", "unknown"
-}
-
-func FullMethod(service, method string) string {
-	return fmt.Sprintf("/%s/%s", service, method)
-}
-
 type ClientReportable interface {
-	ClientReporter(ctx context.Context, reqProtoOrNil interface{}, typ GRPCType, service string, method string) (Reporter, context.Context)
+	ClientReporter(context.Context, CallMeta) (Reporter, context.Context)
 }
 
 type ServerReportable interface {
-	ServerReporter(ctx context.Context, reqProtoOrNil interface{}, typ GRPCType, service string, method string) (Reporter, context.Context)
+	ServerReporter(context.Context, CallMeta) (Reporter, context.Context)
+}
+
+// CommonReportableFunc helper allows an easy way to implement reporter with common client and server logic.
+type CommonReportableFunc func(ctx context.Context, c CallMeta) (Reporter, context.Context)
+
+func (f CommonReportableFunc) ClientReporter(ctx context.Context, c CallMeta) (Reporter, context.Context) {
+	return f(ctx, c)
+}
+
+func (f CommonReportableFunc) ServerReporter(ctx context.Context, c CallMeta) (Reporter, context.Context) {
+	return f(ctx, c)
 }
 
 type Reporter interface {
 	PostCall(err error, rpcDuration time.Duration)
-
-	PostMsgSend(reqProto interface{}, err error, sendDuration time.Duration)
-	PostMsgReceive(replyProto interface{}, err error, recvDuration time.Duration)
+	PostMsgSend(reqProto any, err error, sendDuration time.Duration)
+	PostMsgReceive(replyProto any, err error, recvDuration time.Duration)
 }
 
 var _ Reporter = NoopReporter{}
 
 type NoopReporter struct{}
 
-func (NoopReporter) PostCall(error, time.Duration)                    {}
-func (NoopReporter) PostMsgSend(interface{}, error, time.Duration)    {}
-func (NoopReporter) PostMsgReceive(interface{}, error, time.Duration) {}
+func (NoopReporter) PostCall(error, time.Duration)            {}
+func (NoopReporter) PostMsgSend(any, error, time.Duration)    {}
+func (NoopReporter) PostMsgReceive(any, error, time.Duration) {}
 
 type report struct {
-	rpcType   GRPCType
-	service   string
-	method    string
+	callMeta  CallMeta
 	startTime time.Time
 }
 
-func newReport(typ GRPCType, fullMethod string) report {
+func newReport(callMeta CallMeta) report {
 	r := report{
 		startTime: time.Now(),
-		rpcType:   typ,
+		callMeta:  callMeta,
 	}
-	r.service, r.method = splitMethodName(fullMethod)
 	return r
 }
