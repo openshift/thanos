@@ -1,4 +1,6 @@
 // Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright (c) 2021 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
@@ -28,7 +30,7 @@ type config struct {
 	sampler                 trace.Sampler
 	samplingServerURL       string
 	samplingRefreshInterval time.Duration
-	samplingFetcher         samplingStrategyFetcher
+	samplingFetcher         SamplingStrategyFetcher
 	samplingParser          samplingStrategyParser
 	updaters                []samplerUpdater
 	posParams               perOperationSamplerParams
@@ -123,8 +125,10 @@ func WithLogger(logger logr.Logger) Option {
 	})
 }
 
-// samplingStrategyFetcher creates a Option that initializes sampling strategy fetcher.
-func withSamplingStrategyFetcher(fetcher samplingStrategyFetcher) Option {
+// WithSamplingStrategyFetcher creates an Option that initializes the sampling strategy fetcher.
+// Custom fetcher can be used for setting custom headers, timeouts, etc., or getting
+// sampling strategies from a different source, like files.
+func WithSamplingStrategyFetcher(fetcher SamplingStrategyFetcher) Option {
 	return optionFunc(func(c *config) {
 		c.samplingFetcher = fetcher
 	})

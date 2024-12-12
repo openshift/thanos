@@ -19,14 +19,14 @@ const (
 )
 
 type accumulator interface {
-	Add(v float64, h *histogram.FloatHistogram)
+	Add(v float64, h *histogram.FloatHistogram) error
 	Value() (float64, *histogram.FloatHistogram)
 	ValueType() ValueType
 	Reset(float64)
 }
 
 type vectorAccumulator interface {
-	AddVector(vs []float64, hs []*histogram.FloatHistogram)
+	AddVector(vs []float64, hs []*histogram.FloatHistogram) error
 	Value() (float64, *histogram.FloatHistogram)
 	ValueType() ValueType
 	Reset(float64)
@@ -42,36 +42,44 @@ func newSumAcc() *sumAcc {
 	return &sumAcc{}
 }
 
-func (s *sumAcc) AddVector(float64s []float64, histograms []*histogram.FloatHistogram) {
+func (s *sumAcc) AddVector(float64s []float64, histograms []*histogram.FloatHistogram) error {
 	if len(float64s) > 0 {
-		s.value += floats.Sum(float64s)
+		s.value += SumCompensated(float64s)
 		s.hasFloatVal = true
 	}
 
+	var err error
 	if len(histograms) > 0 {
-		s.histSum = histogramSum(s.histSum, histograms)
+		s.histSum, err = histogramSum(s.histSum, histograms)
 	}
+	return err
 }
 
-func (s *sumAcc) Add(v float64, h *histogram.FloatHistogram) {
+func (s *sumAcc) Add(v float64, h *histogram.FloatHistogram) error {
 	if h == nil {
 		s.hasFloatVal = true
 		s.value += v
-		return
+		return nil
 	}
 	if s.histSum == nil {
 		s.histSum = h.Copy()
-		return
+		return nil
 	}
 	// The histogram being added must have an equal or larger schema.
 	// https://github.com/prometheus/prometheus/blob/57bcbf18880f7554ae34c5b341d52fc53f059a97/promql/engine.go#L2448-L2456
+	var err error
 	if h.Schema >= s.histSum.Schema {
-		s.histSum = s.histSum.Add(h)
+		if s.histSum, err = s.histSum.Add(h); err != nil {
+			return err
+		}
 	} else {
 		t := h.Copy()
-		t.Add(s.histSum)
+		if _, err = t.Add(s.histSum); err != nil {
+			return err
+		}
 		s.histSum = t
 	}
+	return nil
 }
 
 func (s *sumAcc) Value() (float64, *histogram.FloatHistogram) {
@@ -103,27 +111,30 @@ type maxAcc struct {
 	hasValue bool
 }
 
-func (c *maxAcc) AddVector(vs []float64, hs []*histogram.FloatHistogram) {
+func (c *maxAcc) AddVector(vs []float64, hs []*histogram.FloatHistogram) error {
 	if len(vs) == 0 {
-		return
+		return nil
 	}
 	fst, rem := vs[0], vs[1:]
-	c.Add(fst, nil)
-	if len(rem) == 0 {
-		return
+	if err := c.Add(fst, nil); err != nil {
+		return err
 	}
-	c.Add(floats.Max(rem), nil)
+	if len(rem) == 0 {
+		return nil
+	}
+	return c.Add(floats.Max(rem), nil)
 }
 
-func (c *maxAcc) Add(v float64, h *histogram.FloatHistogram) {
+func (c *maxAcc) Add(v float64, h *histogram.FloatHistogram) error {
 	if !c.hasValue {
 		c.value = v
 		c.hasValue = true
-		return
+		return nil
 	}
 	if c.value < v || math.IsNaN(c.value) {
 		c.value = v
 	}
+	return nil
 }
 
 func (c *maxAcc) Value() (float64, *histogram.FloatHistogram) {
@@ -152,27 +163,30 @@ type minAcc struct {
 	hasValue bool
 }
 
-func (c *minAcc) AddVector(vs []float64, hs []*histogram.FloatHistogram) {
+func (c *minAcc) AddVector(vs []float64, hs []*histogram.FloatHistogram) error {
 	if len(vs) == 0 {
-		return
+		return nil
 	}
 	fst, rem := vs[0], vs[1:]
-	c.Add(fst, nil)
-	if len(rem) == 0 {
-		return
+	if err := c.Add(fst, nil); err != nil {
+		return err
 	}
-	c.Add(floats.Min(rem), nil)
+	if len(rem) == 0 {
+		return nil
+	}
+	return c.Add(floats.Min(rem), nil)
 }
 
-func (c *minAcc) Add(v float64, h *histogram.FloatHistogram) {
+func (c *minAcc) Add(v float64, h *histogram.FloatHistogram) error {
 	if !c.hasValue {
 		c.value = v
 		c.hasValue = true
-		return
+		return nil
 	}
 	if c.value > v || math.IsNaN(c.value) {
 		c.value = v
 	}
+	return nil
 }
 
 func (c *minAcc) Value() (float64, *histogram.FloatHistogram) {
@@ -201,17 +215,19 @@ type groupAcc struct {
 	hasValue bool
 }
 
-func (c *groupAcc) AddVector(vs []float64, hs []*histogram.FloatHistogram) {
+func (c *groupAcc) AddVector(vs []float64, hs []*histogram.FloatHistogram) error {
 	if len(vs) == 0 && len(hs) == 0 {
-		return
+		return nil
 	}
 	c.hasValue = true
 	c.value = 1
+	return nil
 }
 
-func (c *groupAcc) Add(v float64, h *histogram.FloatHistogram) {
+func (c *groupAcc) Add(v float64, h *histogram.FloatHistogram) error {
 	c.hasValue = true
 	c.value = 1
+	return nil
 }
 
 func (c *groupAcc) Value() (float64, *histogram.FloatHistogram) {
@@ -240,16 +256,18 @@ func newCountAcc() *countAcc {
 	return &countAcc{}
 }
 
-func (c *countAcc) AddVector(vs []float64, hs []*histogram.FloatHistogram) {
+func (c *countAcc) AddVector(vs []float64, hs []*histogram.FloatHistogram) error {
 	if len(vs) > 0 || len(hs) > 0 {
 		c.hasValue = true
 		c.value += float64(len(vs)) + float64(len(hs))
 	}
+	return nil
 }
 
-func (c *countAcc) Add(v float64, h *histogram.FloatHistogram) {
+func (c *countAcc) Add(v float64, h *histogram.FloatHistogram) error {
 	c.hasValue = true
 	c.value += 1
+	return nil
 }
 
 func (c *countAcc) Value() (float64, *histogram.FloatHistogram) {
@@ -272,18 +290,44 @@ type avgAcc struct {
 	avg      float64
 	count    int64
 	hasValue bool
+
+	histSum        *histogram.FloatHistogram
+	histScratch    *histogram.FloatHistogram
+	histSumScratch *histogram.FloatHistogram
+	histCount      float64
 }
 
 func newAvgAcc() *avgAcc {
 	return &avgAcc{}
 }
 
-func (a *avgAcc) Add(v float64, _ *histogram.FloatHistogram) {
+func (a *avgAcc) Add(v float64, h *histogram.FloatHistogram) error {
+	if h != nil {
+		a.histCount++
+		if a.histSum == nil {
+			a.histSum = h.Copy()
+			a.histScratch = &histogram.FloatHistogram{}
+			a.histSumScratch = &histogram.FloatHistogram{}
+			return nil
+		}
+
+		h.CopyTo(a.histScratch)
+		left := a.histScratch.Div(a.histCount)
+		a.histSum.CopyTo(a.histSumScratch)
+		right := a.histSumScratch.Div(a.histCount)
+		toAdd, err := left.Sub(right)
+		if err != nil {
+			return err
+		}
+		a.histSum, err = a.histSum.Add(toAdd)
+		return err
+	}
+
 	a.count++
 	if !a.hasValue {
 		a.hasValue = true
 		a.avg = v
-		return
+		return nil
 	}
 
 	a.hasValue = true
@@ -292,7 +336,7 @@ func (a *avgAcc) Add(v float64, _ *histogram.FloatHistogram) {
 			// The `avg` and `v` values are `Inf` of the same sign.  They
 			// can't be subtracted, but the value of `avg` is correct
 			// already.
-			return
+			return nil
 		}
 		if !math.IsInf(v, 0) && !math.IsNaN(v) {
 			// At this stage, the avg is an infinite. If the added
@@ -301,33 +345,51 @@ func (a *avgAcc) Add(v float64, _ *histogram.FloatHistogram) {
 			// This is required because our calculation below removes
 			// the avg value, which would look like Inf += x - Inf and
 			// end up as a NaN.
-			return
+			return nil
 		}
 	}
 
 	a.avg += v/float64(a.count) - a.avg/float64(a.count)
+	return nil
 }
 
-func (a *avgAcc) AddVector(vs []float64, _ []*histogram.FloatHistogram) {
+func (a *avgAcc) AddVector(vs []float64, hs []*histogram.FloatHistogram) error {
 	for _, v := range vs {
-		a.Add(v, nil)
+		if err := a.Add(v, nil); err != nil {
+			return err
+		}
 	}
+	for _, h := range hs {
+		if err := a.Add(0, h); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *avgAcc) Value() (float64, *histogram.FloatHistogram) {
-	return a.avg, nil
+	return a.avg, a.histSum
 }
 
-func (c *avgAcc) ValueType() ValueType {
-	if c.hasValue {
-		return SingleTypeValue
-	} else {
-		return NoValue
+func (a *avgAcc) ValueType() ValueType {
+	hasFloat := a.count > 0
+	hasHist := a.histCount > 0
+
+	if hasFloat && hasHist {
+		return MixedTypeValue
 	}
+	if hasFloat || hasHist {
+		return SingleTypeValue
+	}
+	return NoValue
 }
+
 func (a *avgAcc) Reset(_ float64) {
 	a.hasValue = false
 	a.count = 0
+
+	a.histCount = 0
+	a.histSum = nil
 }
 
 type statAcc struct {
@@ -337,13 +399,14 @@ type statAcc struct {
 	hasValue bool
 }
 
-func (s *statAcc) Add(v float64, h *histogram.FloatHistogram) {
+func (s *statAcc) Add(v float64, h *histogram.FloatHistogram) error {
 	s.hasValue = true
 	s.count++
 
 	delta := v - s.mean
 	s.mean += delta / s.count
 	s.value += delta * (v - s.mean)
+	return nil
 }
 
 func (s *statAcc) ValueType() ValueType {
@@ -400,9 +463,10 @@ func newQuantileAcc() accumulator {
 	return &quantileAcc{}
 }
 
-func (q *quantileAcc) Add(v float64, h *histogram.FloatHistogram) {
+func (q *quantileAcc) Add(v float64, h *histogram.FloatHistogram) error {
 	q.hasValue = true
 	q.points = append(q.points, v)
+	return nil
 }
 
 func (q *quantileAcc) Value() (float64, *histogram.FloatHistogram) {
@@ -421,4 +485,80 @@ func (q *quantileAcc) Reset(f float64) {
 	q.hasValue = false
 	q.arg = f
 	q.points = q.points[:0]
+}
+
+type histogramAvg struct {
+	sum      *histogram.FloatHistogram
+	count    int64
+	hasFloat bool
+}
+
+func newHistogramAvg() *histogramAvg {
+	return &histogramAvg{
+		sum: &histogram.FloatHistogram{},
+	}
+}
+
+func (acc *histogramAvg) Add(v float64, h *histogram.FloatHistogram) error {
+	if h == nil {
+		acc.hasFloat = true
+	}
+	if acc.count == 0 {
+		h.CopyTo(acc.sum)
+	}
+	var err error
+	if h.Schema >= acc.sum.Schema {
+		if acc.sum, err = acc.sum.Add(h); err != nil {
+			return err
+		}
+	} else {
+		t := h.Copy()
+		if _, err = t.Add(acc.sum); err != nil {
+			return err
+		}
+		acc.sum = t
+	}
+	acc.count++
+	return nil
+}
+
+func (acc *histogramAvg) Value() (float64, *histogram.FloatHistogram) {
+	return 0, acc.sum.Mul(1 / float64(acc.count))
+}
+
+func (acc *histogramAvg) ValueType() ValueType {
+	if acc.count > 0 && !acc.hasFloat {
+		return SingleTypeValue
+	}
+	return NoValue
+}
+
+func (acc *histogramAvg) Reset(f float64) {
+	acc.count = 0
+}
+
+// SumCompensated returns the sum of the elements of the slice calculated with greater
+// accuracy than Sum at the expense of additional computation.
+func SumCompensated(s []float64) float64 {
+	// SumCompensated uses an improved version of Kahan's compensated
+	// summation algorithm proposed by Neumaier.
+	// See https://en.wikipedia.org/wiki/Kahan_summation_algorithm for details.
+	var sum, c float64
+	for _, x := range s {
+		// This type conversion is here to prevent a sufficiently smart compiler
+		// from optimizing away these operations.
+		t := sum + x
+		switch {
+		case math.IsInf(t, 0):
+			c = 0
+
+		// Using Neumaier improvement, swap if next term larger than sum.
+		case math.Abs(sum) >= math.Abs(x):
+			c += (sum - t) + x
+		default:
+			c += (x - t) + sum
+		}
+		sum = t
+	}
+	return sum + c
 }
