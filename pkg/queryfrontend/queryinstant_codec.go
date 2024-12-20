@@ -164,6 +164,7 @@ func (c queryInstantCodec) DecodeRequest(_ context.Context, r *http.Request, for
 	result.Query = r.FormValue("query")
 	result.Path = r.URL.Path
 	result.Engine = r.FormValue("engine")
+	result.Stats = r.FormValue(queryv1.Stats)
 
 	for _, header := range forwardHeaders {
 		for h, hv := range r.Header {
@@ -189,6 +190,7 @@ func (c queryInstantCodec) EncodeRequest(ctx context.Context, r queryrange.Reque
 		queryv1.PartialResponseParam: []string{strconv.FormatBool(thanosReq.PartialResponse)},
 		queryv1.EngineParam:          []string{thanosReq.Engine},
 		queryv1.ReplicaLabelsParam:   thanosReq.ReplicaLabels,
+		queryv1.Stats:                []string{thanosReq.Stats},
 	}
 
 	if thanosReq.Time > 0 {
@@ -261,7 +263,10 @@ func (c queryInstantCodec) EncodeResponse(ctx context.Context, res queryrange.Re
 func (c queryInstantCodec) DecodeResponse(ctx context.Context, r *http.Response, req queryrange.Request) (queryrange.Response, error) {
 	if r.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(r.Body)
-		return nil, httpgrpc.Errorf(r.StatusCode, string(body))
+		return nil, httpgrpc.ErrorFromHTTPResponse(&httpgrpc.HTTPResponse{
+			Code: int32(r.StatusCode),
+			Body: body,
+		})
 	}
 	log, ctx := spanlogger.New(ctx, "ParseQueryInstantResponse") //nolint:ineffassign,staticcheck
 	defer log.Finish()

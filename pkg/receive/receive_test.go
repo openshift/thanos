@@ -26,6 +26,8 @@ func TestMain(m *testing.M) {
 }
 
 func TestAddingExternalLabelsForTenants(t *testing.T) {
+	t.Parallel()
+
 	for _, tc := range []struct {
 		name                      string
 		cfg                       []HashringConfig
@@ -208,7 +210,7 @@ func TestAddingExternalLabelsForTenants(t *testing.T) {
 
 			for _, c := range tc.cfg {
 				for _, tenantId := range c.Tenants {
-					if m.tenants[tenantId] == nil {
+					if m.testGetTenant(tenantId) == nil {
 						err = appendSample(m, tenantId, time.Now())
 						require.NoError(t, err)
 					}
@@ -238,6 +240,8 @@ func TestAddingExternalLabelsForTenants(t *testing.T) {
 }
 
 func TestLabelSetsOfTenantsWhenAddingTenants(t *testing.T) {
+	t.Parallel()
+
 	initialConfig := []HashringConfig{
 		{
 			Endpoints: []Endpoint{{Address: "node1"}},
@@ -290,7 +294,7 @@ func TestLabelSetsOfTenantsWhenAddingTenants(t *testing.T) {
 
 		for _, c := range initialConfig {
 			for _, tenantId := range c.Tenants {
-				if m.tenants[tenantId] == nil {
+				if m.testGetTenant(tenantId) == nil {
 					err = appendSample(m, tenantId, time.Now())
 					require.NoError(t, err)
 				}
@@ -315,7 +319,7 @@ func TestLabelSetsOfTenantsWhenAddingTenants(t *testing.T) {
 
 		for _, c := range changedConfig {
 			for _, tenantId := range c.Tenants {
-				if m.tenants[tenantId] == nil {
+				if m.testGetTenant(tenantId) == nil {
 					err = appendSample(m, tenantId, time.Now())
 					require.NoError(t, err)
 				}
@@ -347,6 +351,8 @@ func TestLabelSetsOfTenantsWhenAddingTenants(t *testing.T) {
 }
 
 func TestLabelSetsOfTenantsWhenChangingLabels(t *testing.T) {
+	t.Parallel()
+
 	initialConfig := []HashringConfig{
 		{
 			Endpoints: []Endpoint{{Address: "node1"}},
@@ -528,7 +534,7 @@ func TestLabelSetsOfTenantsWhenChangingLabels(t *testing.T) {
 
 			for _, c := range initialConfig {
 				for _, tenantId := range c.Tenants {
-					if m.tenants[tenantId] == nil {
+					if m.testGetTenant(tenantId) == nil {
 						err = appendSample(m, tenantId, time.Now())
 						require.NoError(t, err)
 					}
@@ -577,6 +583,8 @@ func TestLabelSetsOfTenantsWhenChangingLabels(t *testing.T) {
 }
 
 func TestAddingLabelsWhenTenantAppearsInMultipleHashrings(t *testing.T) {
+	t.Parallel()
+
 	initialConfig := []HashringConfig{
 		{
 			Endpoints: []Endpoint{{Address: "node1"}},
@@ -696,7 +704,7 @@ func TestAddingLabelsWhenTenantAppearsInMultipleHashrings(t *testing.T) {
 
 			for _, c := range initialConfig {
 				for _, tenantId := range c.Tenants {
-					if m.tenants[tenantId] == nil {
+					if m.testGetTenant(tenantId) == nil {
 						err = appendSample(m, tenantId, time.Now())
 						require.NoError(t, err)
 					}
@@ -745,6 +753,8 @@ func TestAddingLabelsWhenTenantAppearsInMultipleHashrings(t *testing.T) {
 }
 
 func TestReceiverLabelsNotOverwrittenByExternalLabels(t *testing.T) {
+	t.Parallel()
+
 	cfg := []HashringConfig{
 		{
 			Endpoints: []Endpoint{{Address: "node1"}},
@@ -768,7 +778,7 @@ func TestReceiverLabelsNotOverwrittenByExternalLabels(t *testing.T) {
 
 		for _, c := range cfg {
 			for _, tenantId := range c.Tenants {
-				if m.tenants[tenantId] == nil {
+				if m.testGetTenant(tenantId) == nil {
 					err = appendSample(m, tenantId, time.Now())
 					require.NoError(t, err)
 				}
