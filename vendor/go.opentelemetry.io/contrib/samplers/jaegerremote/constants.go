@@ -1,4 +1,6 @@
 // Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright (c) 2021 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
@@ -25,7 +27,5 @@ const (
 	defaultSamplingServerPort = 5778
 )
 
-var (
-	// defaultSamplingServerURL is the default url to fetch sampling config from, via http.
-	defaultSamplingServerURL = fmt.Sprintf("http://127.0.0.1:%d/sampling", defaultSamplingServerPort)
-)
+// defaultSamplingServerURL is the default url to fetch sampling config from, via http.
+var defaultSamplingServerURL = fmt.Sprintf("http://127.0.0.1:%d/sampling", defaultSamplingServerPort)
