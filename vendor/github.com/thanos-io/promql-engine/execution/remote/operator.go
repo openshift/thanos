@@ -39,7 +39,7 @@ func NewExecution(query promql.Query, pool *model.VectorPool, queryRangeStart ti
 		vectorSelector:  promstorage.NewVectorSelector(pool, storage, opts, 0, 0, false, 0, 1),
 	}
 
-	oper.OperatorTelemetry = model.NewTelemetry(oper, opts.EnableAnalysis)
+	oper.OperatorTelemetry = model.NewTelemetry(oper, opts)
 
 	return oper
 }
@@ -116,7 +116,9 @@ func (s *storageAdapter) GetSeries(ctx context.Context, _, _ int) ([]promstorage
 
 func (s *storageAdapter) executeQuery(ctx context.Context) {
 	result := s.query.Exec(ctx)
-	warnings.AddToContext(result.Warnings, ctx)
+	for _, w := range result.Warnings {
+		warnings.AddToContext(w, ctx)
+	}
 	if result.Err != nil {
 		s.err = result.Err
 		return

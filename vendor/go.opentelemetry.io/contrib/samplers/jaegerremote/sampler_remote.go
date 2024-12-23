@@ -1,4 +1,6 @@
 // Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
 // Copyright (c) 2021 The Jaeger Authors.
 // Copyright (c) 2017 Uber Technologies, Inc.
 //
@@ -17,7 +19,7 @@
 package jaegerremote // import "go.opentelemetry.io/contrib/samplers/jaegerremote"
 
 import (
-	"encoding/json"
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +27,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gogo/protobuf/jsonpb"
 
 	jaeger_api_v2 "go.opentelemetry.io/contrib/samplers/jaegerremote/internal/proto-gen/jaeger-idl/proto/api_v2"
 	"go.opentelemetry.io/otel/sdk/trace"
@@ -37,8 +41,8 @@ const (
 	defaultSamplingOperationNameLateBinding = true
 )
 
-// samplingStrategyFetcher is used to fetch sampling strategy updates from remote server.
-type samplingStrategyFetcher interface {
+// SamplingStrategyFetcher is used to fetch sampling strategy updates from remote server.
+type SamplingStrategyFetcher interface {
 	Fetch(service string) ([]byte, error)
 }
 
@@ -271,13 +275,10 @@ type httpSamplingStrategyFetcher struct {
 }
 
 func newHTTPSamplingStrategyFetcher(serverURL string) *httpSamplingStrategyFetcher {
-	customTransport := http.DefaultTransport.(*http.Transport).Clone()
-	customTransport.ResponseHeaderTimeout = defaultRemoteSamplingTimeout
-
 	return &httpSamplingStrategyFetcher{
 		serverURL: serverURL,
 		httpClient: http.Client{
-			Transport: customTransport,
+			Timeout: defaultRemoteSamplingTimeout,
 		},
 	}
 }
@@ -311,7 +312,11 @@ type samplingStrategyParserImpl struct{}
 
 func (p *samplingStrategyParserImpl) Parse(response []byte) (interface{}, error) {
 	strategy := new(jaeger_api_v2.SamplingStrategyResponse)
-	if err := json.Unmarshal(response, strategy); err != nil {
+	// Official Jaeger Remote Sampling protocol contains enums encoded as strings.
+	// Legacy protocol contains enums as numbers.
+	// Gogo's jsonpb module can parse either format.
+	// Cf. https://github.com/open-telemetry/opentelemetry-go-contrib/issues/3184
+	if err := jsonpb.Unmarshal(bytes.NewReader(response), strategy); err != nil {
 		return nil, err
 	}
 	return strategy, nil

@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/util/annotations"
 
+	"github.com/thanos-io/promql-engine/execution/parse"
 	"github.com/thanos-io/promql-engine/query"
 )
 
@@ -23,11 +24,13 @@ var (
 var DefaultOptimizers = []Optimizer{
 	SortMatchers{},
 	MergeSelectsOptimizer{},
+	DetectHistogramStatsOptimizer{},
 }
 
 type Plan interface {
 	Optimize([]Optimizer) (Plan, annotations.Annotations)
 	Root() Node
+	MinMaxTime(*query.Options) (int64, int64)
 }
 
 type Optimizer interface {
@@ -64,6 +67,13 @@ func NewFromAST(ast parser.Expr, queryOpts *query.Options, planOpts PlanOptions)
 	// the engine handles sorting at the presentation layer
 	expr = trimSorts(expr)
 
+	// best effort evaluate constant expressions
+	expr = reduceConstantExpressions(expr)
+
+	// some parameters are implicitly step invariant, i.e. topk(scalar(SERIES), X)
+	// morally that should be done by PreprocessExpr but we can also fix it here
+	expr = preprocessAggregationParameters(expr)
+
 	return &plan{
 		expr:     expr,
 		opts:     queryOpts,
@@ -86,6 +96,95 @@ func NewFromBytes(bytes []byte, queryOpts *query.Options, planOpts PlanOptions) 
 		opts:     queryOpts,
 		planOpts: planOpts,
 	}, nil
+}
+
+func getTimeRangesForSelector(qOpts *query.Options, n *parser.VectorSelector, parents []*Node, evalRange time.Duration) (int64, int64) {
+	start, end := qOpts.Start.UnixMilli(), qOpts.End.UnixMilli()
+	subqOffset, subqRange, subqTs := logicalSubqueryTimes(parents)
+
+	if subqTs != nil {
+		// The timestamp on the subquery overrides the eval statement time ranges.
+		start = *subqTs
+		end = *subqTs
+	}
+
+	if n.Timestamp != nil {
+		// The timestamp on the selector overrides everything.
+		start = *n.Timestamp
+		end = *n.Timestamp
+	} else {
+		offsetMilliseconds := subqOffset.Milliseconds()
+		start = start - offsetMilliseconds - subqRange.Milliseconds()
+		end -= offsetMilliseconds
+	}
+
+	if evalRange == 0 {
+		start -= qOpts.LookbackDelta.Milliseconds()
+	} else {
+		start -= evalRange.Milliseconds()
+	}
+
+	start -= n.OriginalOffset.Milliseconds()
+	end -= n.OriginalOffset.Milliseconds()
+
+	if parse.IsExtFunction(extractFuncFromPath(parents)) {
+		// Buffer more so that we could reasonably
+		// inject a zero if there is only one point.
+		start -= int64(qOpts.ExtLookbackDelta.Milliseconds())
+	}
+
+	return start, end
+}
+
+func extractFuncFromPath(p []*Node) string {
+	if len(p) == 0 {
+		return ""
+	}
+	switch n := (*(p[len(p)-1])).(type) {
+	case *Aggregation:
+		return n.Op.String()
+	case *FunctionCall:
+		return n.Func.Name
+	case *Binary:
+		// If we hit a binary expression we terminate since we only care about functions
+		// or aggregations over a single metric.
+		return ""
+	}
+	return extractFuncFromPath(p[:len(p)-1])
+}
+
+func (p *plan) MinMaxTime(qOpts *query.Options) (int64, int64) {
+	var minTimestamp, maxTimestamp int64 = math.MaxInt64, math.MinInt64
+	// Whenever a MatrixSelector is evaluated, evalRange is set to the corresponding range.
+	// The evaluation of the VectorSelector inside then evaluates the given range and unsets
+	// the variable.
+	var evalRange time.Duration
+
+	root := p.Root()
+
+	TraverseWithParents(nil, &root, func(parents []*Node, node *Node) {
+		switch n := (*node).(type) {
+		case *VectorSelector:
+			start, end := getTimeRangesForSelector(qOpts, n.VectorSelector, parents, evalRange)
+			if start < minTimestamp {
+				minTimestamp = start
+			}
+			if end > maxTimestamp {
+				maxTimestamp = end
+			}
+			evalRange = 0
+		case *MatrixSelector:
+			evalRange = n.Range
+		}
+	})
+
+	if maxTimestamp == math.MinInt64 {
+		// This happens when there was no selector. Hence no time range to select.
+		minTimestamp = 0
+		maxTimestamp = 0
+	}
+
+	return minTimestamp, maxTimestamp
 }
 
 func (p *plan) Optimize(optimizers []Optimizer) (Plan, annotations.Annotations) {
@@ -116,6 +215,14 @@ func Traverse(expr *Node, transform func(*Node)) {
 	transform(expr)
 	for _, c := range children {
 		Traverse(c, transform)
+	}
+}
+
+func TraverseWithParents(parents []*Node, current *Node, transform func(parents []*Node, node *Node)) {
+	children := (*current).Children()
+	transform(parents, current)
+	for _, c := range children {
+		TraverseWithParents(append(parents, current), c, transform)
 	}
 }
 
@@ -219,6 +326,18 @@ func replacePrometheusNodes(plan parser.Expr) Node {
 	panic("Unrecognized AST node")
 }
 
+func preprocessAggregationParameters(expr Node) Node {
+	Traverse(&expr, func(node *Node) {
+		switch t := (*node).(type) {
+		case *Aggregation:
+			if t.Param != nil {
+				t.Param = &StepInvariantExpr{Expr: t.Param}
+			}
+		}
+	})
+	return expr
+}
+
 func trimSorts(expr Node) Node {
 	canTrimSorts := true
 	// We cannot trim inner sort if its an argument to a timestamp function.
@@ -249,8 +368,62 @@ func trimSorts(expr Node) Node {
 		switch e := (*parent).(type) {
 		case *FunctionCall:
 			switch e.Func.Name {
-			case "sort", "sort_desc":
+			case "sort", "sort_desc", "sort_by_label", "sort_by_label_desc":
 				*parent = *current
+			}
+		}
+		return false
+	})
+	return expr
+}
+
+func reduceConstantExpressions(expr Node) Node {
+	TraverseBottomUp(nil, &expr, func(parent, current *Node) bool {
+		if current == nil || parent == nil {
+			return true
+		}
+		switch tparent := (*parent).(type) {
+		case *Parens:
+			num, err := UnwrapFloat(tparent.Expr)
+			if err != nil {
+				return false
+			}
+			*parent = &NumberLiteral{Val: num}
+		case *Unary:
+			num, err := UnwrapFloat(tparent.Expr)
+			if err != nil {
+				return false
+			}
+			switch tparent.Op {
+			case parser.ADD:
+				*parent = &NumberLiteral{Val: num}
+			case parser.SUB:
+				*parent = &NumberLiteral{Val: -num}
+			}
+		case *Binary:
+			lnum, err := UnwrapFloat(tparent.LHS)
+			if err != nil {
+				return false
+			}
+			rnum, err := UnwrapFloat(tparent.RHS)
+			if err != nil {
+				return false
+			}
+			switch tparent.Op {
+			case parser.ADD:
+				*parent = &NumberLiteral{Val: lnum + rnum}
+			case parser.SUB:
+				*parent = &NumberLiteral{Val: lnum - rnum}
+			case parser.MUL:
+				*parent = &NumberLiteral{Val: lnum * rnum}
+			case parser.DIV:
+				*parent = &NumberLiteral{Val: lnum / rnum}
+			case parser.POW:
+				*parent = &NumberLiteral{Val: math.Pow(lnum, rnum)}
+			case parser.MOD:
+				*parent = &NumberLiteral{Val: math.Mod(lnum, rnum)}
+			default:
+				return false
 			}
 		}
 		return false
@@ -288,6 +461,36 @@ func insertDuplicateLabelChecks(expr Node) Node {
 	return expr
 }
 
+// https://github.com/prometheus/prometheus/blob/dfae954dc1137568f33564e8cffda321f2867925/promql/engine.go#L754
+// subqueryTimes returns the sum of offsets and ranges of all subqueries in the path.
+// If the @ modifier is used, then the offset and range is w.r.t. that timestamp
+// (i.e. the sum is reset when we have @ modifier).
+// The returned *int64 is the closest timestamp that was seen. nil for no @ modifier.
+func subqueryTimes(path []parser.Node) (time.Duration, time.Duration, *int64) {
+	var (
+		subqOffset, subqRange time.Duration
+		ts                    int64 = math.MaxInt64
+	)
+	for _, node := range path {
+		if n, ok := node.(*parser.SubqueryExpr); ok {
+			subqOffset += n.OriginalOffset
+			subqRange += n.Range
+			if n.Timestamp != nil {
+				// The @ modifier on subquery invalidates all the offset and
+				// range till now. Hence resetting it here.
+				subqOffset = n.OriginalOffset
+				subqRange = n.Range
+				ts = *n.Timestamp
+			}
+		}
+	}
+	var tsp *int64
+	if ts != math.MaxInt64 {
+		tsp = &ts
+	}
+	return subqOffset, subqRange, tsp
+}
+
 // Copy from https://github.com/prometheus/prometheus/blob/v2.39.1/promql/engine.go#L2658.
 func setOffsetForAtModifier(evalTime int64, expr parser.Expr) {
 	getOffset := func(ts *int64, originalOffset time.Duration, path []parser.Node) time.Duration {
@@ -320,18 +523,18 @@ func setOffsetForAtModifier(evalTime int64, expr parser.Expr) {
 	})
 }
 
-// https://github.com/prometheus/prometheus/blob/dfae954dc1137568f33564e8cffda321f2867925/promql/engine.go#L754
-// subqueryTimes returns the sum of offsets and ranges of all subqueries in the path.
+// logicalSubqueryTimes returns the sum of offsets and ranges of all subqueries in the path.
 // If the @ modifier is used, then the offset and range is w.r.t. that timestamp
 // (i.e. the sum is reset when we have @ modifier).
 // The returned *int64 is the closest timestamp that was seen. nil for no @ modifier.
-func subqueryTimes(path []parser.Node) (time.Duration, time.Duration, *int64) {
+func logicalSubqueryTimes(path []*Node) (time.Duration, time.Duration, *int64) {
 	var (
 		subqOffset, subqRange time.Duration
 		ts                    int64 = math.MaxInt64
 	)
 	for _, node := range path {
-		if n, ok := node.(*parser.SubqueryExpr); ok {
+		switch n := (*node).(type) {
+		case *Subquery:
 			subqOffset += n.OriginalOffset
 			subqRange += n.Range
 			if n.Timestamp != nil {

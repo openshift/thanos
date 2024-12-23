@@ -56,6 +56,7 @@ import (
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
+	"github.com/thanos-io/thanos/pkg/strutil"
 	"github.com/thanos-io/thanos/pkg/targets"
 	"github.com/thanos-io/thanos/pkg/tenancy"
 	"github.com/thanos-io/thanos/pkg/tls"
@@ -122,8 +123,9 @@ func registerQuery(app *extkingpin.App) {
 		Default(string(query.ExternalLabels), string(query.StoreType)).
 		Enums(string(query.ExternalLabels), string(query.StoreType))
 
-	queryReplicaLabels := cmd.Flag("query.replica-label", "Labels to treat as a replica indicator along which data is deduplicated. Still you will be able to query without deduplication using 'dedup=false' parameter. Data includes time series, recording rules, and alerting rules.").
+	queryReplicaLabels := cmd.Flag("query.replica-label", "Labels to treat as a replica indicator along which data is deduplicated. Still you will be able to query without deduplication using 'dedup=false' parameter. Data includes time series, recording rules, and alerting rules. Flag may be specified multiple times as well as a comma separated list of labels.").
 		Strings()
+	queryPartitionLabels := cmd.Flag("query.partition-label", "Labels that partition the leaf queriers. This is used to scope down the labelsets of leaf queriers when using the distributed query mode. If set, these labels must form a partition of the leaf queriers. Partition labels must not intersect with replica labels. Every TSDB of a leaf querier must have these labels. This is useful when there are multiple external labels that are irrelevant for the partition as it allows the distributed engine to ignore them for some optimizations. If this is empty then all labels are used as partition labels.").Strings()
 
 	instantDefaultMaxSourceResolution := extkingpin.ModelDuration(cmd.Flag("query.instant.default.max_source_resolution", "default value for max_source_resolution for instant queries. If not set, defaults to 0s only taking raw resolution into account. 1h can be a good value if you use instant queries over time ranges that incorporate times outside of your raw-retention.").Default("0s").Hidden())
 
@@ -326,6 +328,7 @@ func registerQuery(app *extkingpin.App) {
 			time.Duration(*storeResponseTimeout),
 			*queryConnMetricLabels,
 			*queryReplicaLabels,
+			*queryPartitionLabels,
 			selectorLset,
 			getFlagsMap(cmd.Flags()),
 			*endpoints,
@@ -355,7 +358,6 @@ func registerQuery(app *extkingpin.App) {
 			*webDisableCORS,
 			*alertQueryURL,
 			*grpcProxyStrategy,
-			component.Query,
 			*queryTelemetryDurationQuantiles,
 			*queryTelemetrySamplesQuantiles,
 			*queryTelemetrySeriesQuantiles,
@@ -408,6 +410,7 @@ func runQuery(
 	storeResponseTimeout time.Duration,
 	queryConnMetricLabels []string,
 	queryReplicaLabels []string,
+	queryPartitionLabels []string,
 	selectorLset labels.Labels,
 	flagsMap map[string]string,
 	endpointAddrs []string,
@@ -437,7 +440,6 @@ func runQuery(
 	disableCORS bool,
 	alertQueryURL string,
 	grpcProxyStrategy string,
-	comp component.Component,
 	queryTelemetryDurationQuantiles []float64,
 	queryTelemetrySamplesQuantiles []float64,
 	queryTelemetrySeriesQuantiles []float64,
@@ -452,6 +454,7 @@ func runQuery(
 	enforceTenancy bool,
 	tenantLabel string,
 ) error {
+	comp := component.Query
 	if alertQueryURL == "" {
 		lastColon := strings.LastIndex(httpBindAddr, ":")
 		if lastColon != -1 {
@@ -492,6 +495,17 @@ func runQuery(
 		}
 	}
 
+	// Register resolver for the "thanos:///" scheme for endpoint-groups
+	dns.RegisterGRPCResolver(
+		dns.NewProvider(
+			logger,
+			extprom.WrapRegistererWithPrefix("thanos_query_endpoint_groups_", reg),
+			dns.ResolverType(dnsSDResolver),
+		),
+		dnsSDInterval,
+		logger,
+	)
+
 	dnsEndpointProvider := dns.NewProvider(
 		logger,
 		extprom.WrapRegistererWithPrefix("thanos_query_endpoints_", reg),
@@ -527,6 +541,9 @@ func runQuery(
 		store.WithProxyStoreDebugLogging(debugLogging),
 	}
 
+	// Parse and sanitize the provided replica labels flags.
+	queryReplicaLabels = strutil.ParseFlagLabels(queryReplicaLabels)
+
 	var (
 		endpoints = prepareEndpointSet(
 			g,
@@ -551,7 +568,8 @@ func runQuery(
 			queryConnMetricLabels...,
 		)
 
-		proxy            = store.NewProxyStore(logger, reg, endpoints.GetStoreClients, component.Query, selectorLset, storeResponseTimeout, store.RetrievalStrategy(grpcProxyStrategy), options...)
+		proxyStore       = store.NewProxyStore(logger, reg, endpoints.GetStoreClients, component.Query, selectorLset, storeResponseTimeout, store.RetrievalStrategy(grpcProxyStrategy), options...)
+		seriesProxy      = store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, proxyStore), reg, storeRateLimits)
 		rulesProxy       = rules.NewProxy(logger, endpoints.GetRulesClients)
 		targetsProxy     = targets.NewProxy(logger, endpoints.GetTargetsClients)
 		metadataProxy    = metadata.NewProxy(logger, endpoints.GetMetricMetadataClients)
@@ -559,7 +577,7 @@ func runQuery(
 		queryableCreator = query.NewQueryableCreator(
 			logger,
 			extprom.WrapRegistererWithPrefix("thanos_query_", reg),
-			proxy,
+			seriesProxy,
 			maxConcurrentSelects,
 			queryTimeout,
 		)
@@ -591,7 +609,7 @@ func runQuery(
 					fileSDCache.Update(update)
 					endpoints.Update(ctxUpdate)
 
-					if err := dnsStoreProvider.Resolve(ctxUpdate, append(fileSDCache.Addresses(), storeAddrs...)); err != nil {
+					if err := dnsStoreProvider.Resolve(ctxUpdate, append(fileSDCache.Addresses(), storeAddrs...), true); err != nil {
 						level.Error(logger).Log("msg", "failed to resolve addresses for storeAPIs", "err", err)
 					}
 
@@ -611,22 +629,22 @@ func runQuery(
 			return runutil.Repeat(dnsSDInterval, ctx.Done(), func() error {
 				resolveCtx, resolveCancel := context.WithTimeout(ctx, dnsSDInterval)
 				defer resolveCancel()
-				if err := dnsStoreProvider.Resolve(resolveCtx, append(fileSDCache.Addresses(), storeAddrs...)); err != nil {
+				if err := dnsStoreProvider.Resolve(resolveCtx, append(fileSDCache.Addresses(), storeAddrs...), true); err != nil {
 					level.Error(logger).Log("msg", "failed to resolve addresses for storeAPIs", "err", err)
 				}
-				if err := dnsRuleProvider.Resolve(resolveCtx, ruleAddrs); err != nil {
+				if err := dnsRuleProvider.Resolve(resolveCtx, ruleAddrs, true); err != nil {
 					level.Error(logger).Log("msg", "failed to resolve addresses for rulesAPIs", "err", err)
 				}
-				if err := dnsTargetProvider.Resolve(ctx, targetAddrs); err != nil {
+				if err := dnsTargetProvider.Resolve(ctx, targetAddrs, true); err != nil {
 					level.Error(logger).Log("msg", "failed to resolve addresses for targetsAPIs", "err", err)
 				}
-				if err := dnsMetadataProvider.Resolve(resolveCtx, metadataAddrs); err != nil {
+				if err := dnsMetadataProvider.Resolve(resolveCtx, metadataAddrs, true); err != nil {
 					level.Error(logger).Log("msg", "failed to resolve addresses for metadataAPIs", "err", err)
 				}
-				if err := dnsExemplarProvider.Resolve(resolveCtx, exemplarAddrs); err != nil {
+				if err := dnsExemplarProvider.Resolve(resolveCtx, exemplarAddrs, true); err != nil {
 					level.Error(logger).Log("msg", "failed to resolve addresses for exemplarsAPI", "err", err)
 				}
-				if err := dnsEndpointProvider.Resolve(resolveCtx, endpointAddrs); err != nil {
+				if err := dnsEndpointProvider.Resolve(resolveCtx, endpointAddrs, true); err != nil {
 					level.Error(logger).Log("msg", "failed to resolve addresses passed using endpoint flag", "err", err)
 
 				}
@@ -672,6 +690,7 @@ func runQuery(
 		remoteEngineEndpoints = query.NewRemoteEndpoints(logger, endpoints.GetQueryAPIClients, query.Opts{
 			AutoDownsample:        enableAutodownsampling,
 			ReplicaLabels:         queryReplicaLabels,
+			PartitionLabels:       queryPartitionLabels,
 			Timeout:               queryTimeout,
 			EnablePartialResponse: enableQueryPartialResponse,
 		})
@@ -775,23 +794,23 @@ func runQuery(
 	}
 	// Start query (proxy) gRPC StoreAPI.
 	{
-		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcServerConfig.tlsSrvCert, grpcServerConfig.tlsSrvKey, grpcServerConfig.tlsSrvClientCA)
+		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcServerConfig.tlsSrvCert, grpcServerConfig.tlsSrvKey, grpcServerConfig.tlsSrvClientCA, grpcServerConfig.tlsMinVersion)
 		if err != nil {
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
 		infoSrv := info.NewInfoServer(
 			component.Query.String(),
-			info.WithLabelSetFunc(func() []labelpb.ZLabelSet { return proxy.LabelSet() }),
+			info.WithLabelSetFunc(func() []labelpb.ZLabelSet { return proxyStore.LabelSet() }),
 			info.WithStoreInfoFunc(func() (*infopb.StoreInfo, error) {
 				if httpProbe.IsReady() {
-					mint, maxt := proxy.TimeRange()
+					mint, maxt := proxyStore.TimeRange()
 					return &infopb.StoreInfo{
 						MinTime:                      mint,
 						MaxTime:                      maxt,
 						SupportsSharding:             true,
 						SupportsWithoutReplicaLabels: true,
-						TsdbInfos:                    proxy.TSDBInfos(),
+						TsdbInfos:                    proxyStore.TSDBInfos(),
 					}, nil
 				}
 				return nil, errors.New("Not ready")
@@ -805,10 +824,9 @@ func runQuery(
 
 		defaultEngineType := querypb.EngineType(querypb.EngineType_value[defaultEngine])
 		grpcAPI := apiv1.NewGRPCAPI(time.Now, queryReplicaLabels, queryableCreator, engineFactory, defaultEngineType, lookbackDeltaCreator, instantDefaultMaxSourceResolution)
-		storeServer := store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, proxy), reg, storeRateLimits)
 		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, logFilterMethods, comp, grpcProbe,
 			grpcserver.WithServer(apiv1.RegisterQueryServer(grpcAPI)),
-			grpcserver.WithServer(store.RegisterStoreServer(storeServer, logger)),
+			grpcserver.WithServer(store.RegisterStoreServer(seriesProxy, logger)),
 			grpcserver.WithServer(rules.RegisterRulesServer(rulesProxy)),
 			grpcserver.WithServer(targets.RegisterTargetsServer(targetsProxy)),
 			grpcserver.WithServer(metadata.RegisterMetadataServer(metadataProxy)),
@@ -891,14 +909,12 @@ func prepareEndpointSet(
 			}
 
 			for _, eg := range endpointGroupAddrs {
-				addr := fmt.Sprintf("dns:///%s", eg)
-				spec := query.NewGRPCEndpointSpec(addr, false, extgrpc.EndpointGroupGRPCOpts()...)
+				spec := query.NewGRPCEndpointSpec(fmt.Sprintf("thanos:///%s", eg), false, extgrpc.EndpointGroupGRPCOpts()...)
 				specs = append(specs, spec)
 			}
 
 			for _, eg := range strictEndpointGroups {
-				addr := fmt.Sprintf("dns:///%s", eg)
-				spec := query.NewGRPCEndpointSpec(addr, true, extgrpc.EndpointGroupGRPCOpts()...)
+				spec := query.NewGRPCEndpointSpec(fmt.Sprintf("thanos:///%s", eg), true, extgrpc.EndpointGroupGRPCOpts()...)
 				specs = append(specs, spec)
 			}
 
