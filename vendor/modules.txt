@@ -967,7 +967,7 @@ github.com/prometheus/exporter-toolkit/web
 github.com/prometheus/procfs
 github.com/prometheus/procfs/internal/fs
 github.com/prometheus/procfs/internal/util
-# github.com/prometheus/prometheus v0.55.1-0.20241102120812-a6fd22b9d2c8
+# github.com/prometheus/prometheus v0.55.1-0.20241102120812-a6fd22b9d2c8 => github.com/machine424/prometheus v0.0.0-20250207111312-44b9e656cde8
 ## explicit; go 1.22.0
 github.com/prometheus/prometheus/config
 github.com/prometheus/prometheus/discovery
@@ -1711,6 +1711,7 @@ zenhack.net/go/util
 zenhack.net/go/util/deferred
 zenhack.net/go/util/sync/mutex
 # github.com/bradfitz/gomemcache => github.com/themihai/gomemcache v0.0.0-20180902122335-24332e2d58ab
+# github.com/prometheus/prometheus => github.com/machine424/prometheus v0.0.0-20250207111312-44b9e656cde8
 # github.com/sercand/kuberesolver/v4 => github.com/sercand/kuberesolver/v5 v5.1.1
 # github.com/vimeo/galaxycache => github.com/thanos-community/galaxycache v0.0.0-20211122094458-3a32041a1f1e
 # google.golang.org/grpc => google.golang.org/grpc v1.63.2
