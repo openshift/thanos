@@ -8,15 +8,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/prometheus/model/labels"
-
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/thanos-io/promql-engine/query"
+
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 type absentOperator struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	once     sync.Once
 	funcExpr *logicalplan.FunctionCall
@@ -36,7 +37,7 @@ func newAbsentOperator(
 		pool:     pool,
 		next:     next,
 	}
-	oper.OperatorTelemetry = model.NewTelemetry(oper, opts)
+	oper.OperatorTelemetry = telemetry.NewTelemetry(oper, opts)
 
 	return oper
 }

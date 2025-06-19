@@ -13,6 +13,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,7 +37,6 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/exp/slices"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -116,6 +116,8 @@ type Options struct {
 	Limiter                 *Limiter
 	AsyncForwardWorkerCount uint
 	ReplicationProtocol     ReplicationProtocol
+	OtlpEnableTargetInfo    bool
+	OtlpResourceAttributes  []string
 }
 
 // Handler serves a Prometheus remote write receiving HTTP endpoint.
@@ -270,6 +272,18 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 			readyf(
 				middleware.RequestID(
 					http.HandlerFunc(h.receiveHTTP),
+				),
+			),
+		),
+	)
+
+	h.router.Post(
+		"/api/v1/otlp",
+		instrf(
+			"otlp",
+			readyf(
+				middleware.RequestID(
+					http.HandlerFunc(h.receiveOTLPHTTP),
 				),
 			),
 		),
@@ -765,7 +779,10 @@ func (h *Handler) fanoutForward(ctx context.Context, params remoteWriteParams) (
 
 	// Prepare a buffered channel to receive the responses from the local and remote writes. Remote writes will all go
 	// asynchronously and with this capacity we will never block on writing to the channel.
-	maxBufferedResponses := len(localWrites)
+	var maxBufferedResponses int
+	for er := range localWrites {
+		maxBufferedResponses += len(localWrites[er])
+	}
 	for er := range remoteWrites {
 		maxBufferedResponses += len(remoteWrites[er])
 	}

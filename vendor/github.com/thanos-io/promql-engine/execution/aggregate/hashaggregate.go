@@ -10,22 +10,22 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/parse"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/execution/warnings"
+	"github.com/thanos-io/promql-engine/query"
+
 	"github.com/efficientgo/core/errors"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/util/annotations"
 	"golang.org/x/exp/slices"
-
-	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/promql/parser"
-
-	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/execution/parse"
-	"github.com/thanos-io/promql-engine/execution/warnings"
-	"github.com/thanos-io/promql-engine/query"
 )
 
 type aggregate struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	next    model.VectorOperator
 	paramOp model.VectorOperator
@@ -74,7 +74,7 @@ func NewHashAggregate(
 		stepsBatch:  opts.StepsBatch,
 	}
 
-	a.OperatorTelemetry = model.NewTelemetry(a, opts)
+	a.OperatorTelemetry = telemetry.NewTelemetry(a, opts)
 
 	return a, nil
 }
@@ -147,7 +147,7 @@ func (a *aggregate) Next(ctx context.Context) ([]model.StepVector, error) {
 		a.tables[i].reset(p)
 	}
 	if a.lastBatch != nil {
-		if err := a.aggregate(a.lastBatch); err != nil {
+		if err := a.aggregate(ctx, a.lastBatch); err != nil {
 			return nil, err
 		}
 		a.lastBatch = nil
@@ -163,7 +163,7 @@ func (a *aggregate) Next(ctx context.Context) ([]model.StepVector, error) {
 		// Keep aggregating samples as long as timestamps of batches are equal.
 		currentTs := a.tables[0].timestamp()
 		if currentTs == math.MinInt64 || next[0].T == currentTs {
-			if err := a.aggregate(next); err != nil {
+			if err := a.aggregate(ctx, next); err != nil {
 				return nil, err
 			}
 			continue
@@ -186,9 +186,9 @@ func (a *aggregate) Next(ctx context.Context) ([]model.StepVector, error) {
 	return result, nil
 }
 
-func (a *aggregate) aggregate(in []model.StepVector) error {
+func (a *aggregate) aggregate(ctx context.Context, in []model.StepVector) error {
 	for i, vector := range in {
-		if err := a.tables[i].aggregate(vector); err != nil {
+		if err := a.tables[i].aggregate(ctx, vector); err != nil {
 			return err
 		}
 		a.next.GetPool().PutStepVector(vector)
@@ -220,6 +220,10 @@ func (a *aggregate) initializeTables(ctx context.Context) error {
 }
 
 func (a *aggregate) initializeVectorizedTables(ctx context.Context) ([]aggregateTable, []labels.Labels, error) {
+	// perform initialization of the underlying operator even if we are aggregating the labels away
+	if _, err := a.next.Series(ctx); err != nil {
+		return nil, nil, err
+	}
 	tables, err := newVectorizedTables(a.stepsBatch, a.aggregation)
 	if errors.Is(err, parse.ErrNotSupportedExpr) {
 		return a.initializeScalarTables(ctx)

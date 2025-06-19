@@ -8,11 +8,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/query"
+
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"gonum.org/v1/gonum/floats"
-
-	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/query"
 )
 
 type unaryNegation struct {
@@ -20,14 +22,14 @@ type unaryNegation struct {
 	once sync.Once
 
 	series []labels.Labels
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 }
 
 func NewUnaryNegation(next model.VectorOperator, opts *query.Options) (model.VectorOperator, error) {
 	u := &unaryNegation{
 		next: next,
 	}
-	u.OperatorTelemetry = model.NewTelemetry(u, opts)
+	u.OperatorTelemetry = telemetry.NewTelemetry(u, opts)
 
 	return u, nil
 }
@@ -90,6 +92,13 @@ func (u *unaryNegation) Next(ctx context.Context) ([]model.StepVector, error) {
 	}
 	for i := range in {
 		floats.Scale(-1, in[i].Samples)
+		negateHistograms(in[i].Histograms)
 	}
 	return in, nil
+}
+
+func negateHistograms(hists []*histogram.FloatHistogram) {
+	for i := range hists {
+		hists[i] = hists[i].Copy().Mul(-1)
+	}
 }

@@ -163,6 +163,8 @@ Flags:
       --log.format=logfmt        Log format to use. Possible options: logfmt or
                                  json.
       --log.level=info           Log filtering level.
+      --matcher-cache-size=0     Max number of cached matchers items. Using 0
+                                 disables caching.
       --max-time=9999-12-31T23:59:59Z
                                  End of time range limit to serve. Thanos Store
                                  will serve only blocks, which happened earlier
@@ -250,6 +252,18 @@ Flags:
                                  The maximum series allowed for a single Series
                                  request. The Series call fails if this limit is
                                  exceeded. 0 means no limit.
+      --store.posting-group-max-key-series-ratio=100
+                                 Mark posting group as lazy if it fetches more
+                                 keys than R * max series the query should
+                                 fetch. With R set to 100, a posting group which
+                                 fetches 100K keys will be marked as lazy if
+                                 the current query only fetches 1000 series.
+                                 thanos_bucket_store_lazy_expanded_posting_groups_total
+                                 shows lazy expanded postings groups with
+                                 reasons and you can tune this config
+                                 accordingly. This config is only valid if lazy
+                                 expanded posting is enabled. 0 disables the
+                                 limit.
       --sync-block-duration=15m  Repeat interval for syncing the blocks between
                                  local and remote view.
       --tracing.config=<content>
@@ -467,10 +481,6 @@ Here is an example of what effect client-side caching could have:
 
 <img src="../img/rueidis-client-side.png" class="img-fluid" alt="Example of client-side in action - reduced network usage by a lot"/>
 
-- `pool_size`: maximum number of socket connections.
-- `min_idle_conns`: specifies the minimum number of idle connections which is useful when establishing new connection is slow.
-- `idle_timeout`: amount of time after which client closes idle connections. Should be less than server's timeout.
-- `max_conn_age`: connection age at which client retires (closes) the connection.
 - `max_get_multi_concurrency`: specifies the maximum number of concurrent GetMulti() operations.
 - `get_multi_batch_size`: specifies the maximum size per batch for mget.
 - `max_set_multi_concurrency`: specifies the maximum number of concurrent SetMulti() operations.
