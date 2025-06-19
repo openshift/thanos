@@ -7,14 +7,15 @@ import (
 	"context"
 	"time"
 
-	"github.com/prometheus/prometheus/model/labels"
-
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/logicalplan"
+
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 type noArgFunctionOperator struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	mint        int64
 	maxt        int64

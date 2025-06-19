@@ -12,18 +12,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/efficientgo/core/errors"
-	"golang.org/x/exp/slices"
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/execution/warnings"
+	"github.com/thanos-io/promql-engine/query"
 
+	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
-
-	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/query"
+	"github.com/prometheus/prometheus/promql/parser/posrange"
+	"github.com/prometheus/prometheus/util/annotations"
+	"golang.org/x/exp/slices"
 )
 
 type kAggregate struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	next    model.VectorOperator
 	paramOp model.VectorOperator
@@ -78,7 +81,7 @@ func NewKHashAggregate(
 		params:      make([]float64, opts.StepsBatch),
 	}
 
-	op.OperatorTelemetry = model.NewTelemetry(op, opts)
+	op.OperatorTelemetry = telemetry.NewTelemetry(op, opts)
 
 	return op, nil
 }
@@ -130,6 +133,10 @@ func (a *kAggregate) Next(ctx context.Context) ([]model.StepVector, error) {
 			result = append(result, a.GetPool().GetStepVector(vector.T))
 			continue
 		}
+		if len(vector.Histograms) > 0 {
+			warnings.AddToContext(annotations.NewHistogramIgnoredInAggregationInfo(a.aggregation.String(), posrange.PositionRange{}), ctx)
+		}
+
 		a.aggregate(vector.T, &result, int(a.params[i]), vector.SampleIDs, vector.Samples)
 		a.next.GetPool().PutStepVector(vector)
 	}
