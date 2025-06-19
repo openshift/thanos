@@ -331,7 +331,7 @@ Please see the metric `thanos_receive_forward_delay_seconds` to see if you need 
 
 The following formula is used for calculating quorum:
 
-```go mdox-exec="sed -n '1012,1022p' pkg/receive/handler.go"
+```go mdox-exec="sed -n '1029,1039p' pkg/receive/handler.go"
 // writeQuorum returns minimum number of replicas that has to confirm write success before claiming replication success.
 func (h *Handler) writeQuorum() int {
 	// NOTE(GiedriusS): this is here because otherwise RF=2 doesn't make sense as all writes
@@ -407,6 +407,8 @@ Flags:
       --log.format=logfmt        Log format to use. Possible options: logfmt or
                                  json.
       --log.level=info           Log filtering level.
+      --matcher-cache-size=0     Max number of cached matchers items. Using 0
+                                 disables caching.
       --objstore.config=<content>
                                  Alternative to 'objstore.config-file'
                                  flag (mutually exclusive). Content of
@@ -429,6 +431,10 @@ Flags:
                                  Compression algorithm to use for gRPC requests
                                  to other receivers. Must be one of: snappy,
                                  none
+      --receive.grpc-service-config=<content>
+                                 gRPC service configuration file
+                                 or content in JSON format. See
+                                 https://github.com/grpc/grpc/blob/master/doc/service_config.md
       --receive.hashrings=<content>
                                  Alternative to 'receive.hashrings-file' flag
                                  (lower priority). Content of file that contains
@@ -452,6 +458,13 @@ Flags:
                                  configuration. If it's empty AND hashring
                                  configuration was provided, it means that
                                  receive will run in RoutingOnly mode.
+      --receive.otlp-enable-target-info
+                                 Enables target information in OTLP metrics
+                                 ingested by Receive. If enabled, it converts
+                                 the resource to the target info metric
+      --receive.otlp-promote-resource-attributes= ...
+                                 (Repeatable) Resource attributes to include in
+                                 OTLP metrics ingested by Receive.
       --receive.relabel-config=<content>
                                  Alternative to 'receive.relabel-config-file'
                                  flag (mutually exclusive). Content of YAML file
@@ -552,6 +565,12 @@ Flags:
                                  Allow overlapping blocks, which in turn enables
                                  vertical compaction and vertical query merge.
                                  Does not do anything, enabled all the time.
+      --tsdb.block.expanded-postings-cache-size=0
+                                 [EXPERIMENTAL] If non-zero, enables expanded
+                                 postings cache for compacted blocks.
+      --tsdb.head.expanded-postings-cache-size=0
+                                 [EXPERIMENTAL] If non-zero, enables expanded
+                                 postings cache for the head block.
       --tsdb.max-exemplars=0     Enables support for ingesting exemplars and
                                  sets the maximum number of exemplars that will
                                  be stored per tenant. In case the exemplar
@@ -568,6 +587,18 @@ Flags:
       --tsdb.no-lockfile         Do not create lockfile in TSDB data directory.
                                  In any case, the lockfiles will be deleted on
                                  next startup.
+      --tsdb.out-of-order.cap-max=0
+                                 [EXPERIMENTAL] Configures the maximum capacity
+                                 for out-of-order chunks (in samples). If set to
+                                 <=0, default value 32 is assumed.
+      --tsdb.out-of-order.time-window=0s
+                                 [EXPERIMENTAL] Configures the allowed time
+                                 window for ingestion of out-of-order samples.
+                                 Disabled (0s) by defaultPlease note if you
+                                 enable this option and you use compactor, make
+                                 sure you have the --enable-vertical-compaction
+                                 flag enabled, otherwise you might risk
+                                 compactor halt.
       --tsdb.path="./data"       Data directory of TSDB.
       --tsdb.retention=15d       How long to retain raw samples on local
                                  storage. 0d - disables the retention
@@ -580,7 +611,7 @@ Flags:
       --tsdb.too-far-in-future.time-window=0s
                                  Configures the allowed time window for
                                  ingesting samples too far in the future.
-                                 Disabled (0s) by defaultPlease note enable
+                                 Disabled (0s) by default. Please note enable
                                  this flag will reject samples in the future of
                                  receive local NTP time + configured duration
                                  due to clock skew in remote write clients.
