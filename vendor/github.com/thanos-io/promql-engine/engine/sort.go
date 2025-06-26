@@ -80,6 +80,11 @@ func newResultSort(expr parser.Expr) resultSorter {
 				sortOrder:     sortOrderAsc,
 				groupBy:       !texpr.Without,
 			}
+		case parser.LIMITK, parser.LIMIT_RATIO:
+			return aggregateResultSort{
+				sortingLabels: texpr.Grouping,
+				groupBy:       !texpr.Without,
+			}
 		}
 	}
 	return noSortResultSort{}
@@ -123,7 +128,12 @@ func (s sortByLabelFuncResult) comparer(samples *promql.Vector) func(i, j int) b
 				return s.sortOrder == sortOrderDesc
 			}
 		}
-		return valueCompare(s.sortOrder, (*samples)[i].F, (*samples)[j].F)
+		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+		if lblsCmp := labels.Compare(iLb.Labels(), jLb.Labels()); lblsCmp < 0 {
+			return s.sortOrder == sortOrderAsc
+		} else {
+			return s.sortOrder == sortOrderDesc
+		}
 	}
 }
 

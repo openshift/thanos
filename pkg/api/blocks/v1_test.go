@@ -17,7 +17,8 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
@@ -104,7 +105,7 @@ func TestMarkBlockEndpoint(t *testing.T) {
 		labels.FromStrings("a", "3"),
 		labels.FromStrings("a", "4"),
 		labels.FromStrings("b", "1"),
-	}, 100, 0, 1000, labels.FromStrings("ext1", "val1"), 124, metadata.NoneFunc)
+	}, 100, 0, 1000, labels.FromStrings("ext1", "val1"), 124, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 
 	// upload block

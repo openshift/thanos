@@ -10,12 +10,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/promql/parser"
-
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/extlabels"
 	"github.com/thanos-io/promql-engine/query"
+
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 )
 
 type ScalarSide int
@@ -28,7 +29,7 @@ const (
 
 // scalarOperator evaluates expressions where one operand is a scalarOperator.
 type scalarOperator struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	seriesOnce sync.Once
 	series     []labels.Labels
@@ -84,7 +85,7 @@ func NewScalar(
 		bothScalars:   scalarSide == ScalarSideBoth,
 	}
 
-	oper.OperatorTelemetry = model.NewTelemetry(op, opts)
+	oper.OperatorTelemetry = telemetry.NewTelemetry(op, opts)
 
 	return oper, nil
 
@@ -162,7 +163,7 @@ func (o *scalarOperator) Next(ctx context.Context) ([]model.StepVector, error) {
 		}
 
 		for i := range vector.HistogramIDs {
-			val := o.histOp(vector.Histograms[i], scalarVal)
+			val := o.histOp(ctx, vector.Histograms[i], scalarVal)
 			if val != nil {
 				step.AppendHistogram(o.pool, vector.HistogramIDs[i], val)
 			}

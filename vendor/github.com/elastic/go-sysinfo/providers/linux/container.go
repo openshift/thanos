@@ -20,23 +20,21 @@ package linux
 import (
 	"bufio"
 	"bytes"
-	"io/ioutil"
+	"fmt"
 	"os"
-
-	"github.com/pkg/errors"
 )
 
 const procOneCgroup = "/proc/1/cgroup"
 
 // IsContainerized returns true if this process is containerized.
 func IsContainerized() (bool, error) {
-	data, err := ioutil.ReadFile(procOneCgroup)
+	data, err := os.ReadFile(procOneCgroup)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
 
-		return false, errors.Wrap(err, "failed to read process cgroups")
+		return false, fmt.Errorf("failed to read process cgroups: %w", err)
 	}
 
 	return isContainerizedCgroup(data)

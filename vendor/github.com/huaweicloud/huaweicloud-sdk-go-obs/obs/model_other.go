@@ -9,6 +9,7 @@
 // under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 // CONDITIONS OF ANY KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations under the License.
+
 package obs
 
 import (
@@ -20,6 +21,7 @@ type CreateSignedUrlInput struct {
 	Method      HttpMethodType
 	Bucket      string
 	Key         string
+	Policy      string
 	SubResource SubResourceType
 	Expires     int
 	Headers     map[string]string
@@ -32,12 +34,20 @@ type CreateSignedUrlOutput struct {
 	ActualSignedRequestHeaders http.Header
 }
 
+// ConditionRange the specifying ranges in the conditions
+type ConditionRange struct {
+	RangeName string
+	Lower     int64
+	Upper     int64
+}
+
 // CreateBrowserBasedSignatureInput is the input parameter of CreateBrowserBasedSignature function.
 type CreateBrowserBasedSignatureInput struct {
-	Bucket     string
-	Key        string
-	Expires    int
-	FormParams map[string]string
+	Bucket      string
+	Key         string
+	Expires     int
+	FormParams  map[string]string
+	RangeParams []ConditionRange
 }
 
 // CreateBrowserBasedSignatureOutput is the result of CreateBrowserBasedSignature function.

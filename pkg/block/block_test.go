@@ -18,7 +18,8 @@ import (
 	"github.com/thanos-io/thanos/pkg/extprom"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -92,7 +93,7 @@ func TestUpload(t *testing.T) {
 		labels.New(labels.Label{Name: "a", Value: "3"}),
 		labels.New(labels.Label{Name: "a", Value: "4"}),
 		labels.New(labels.Label{Name: "b", Value: "1"}),
-	}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc)
+	}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 	testutil.Ok(t, os.MkdirAll(path.Join(tmpDir, "test", b1.String()), os.ModePerm))
 
@@ -207,7 +208,7 @@ func TestUpload(t *testing.T) {
 			labels.New(labels.Label{Name: "a", Value: "3"}),
 			labels.New(labels.Label{Name: "a", Value: "4"}),
 			labels.New(labels.Label{Name: "b", Value: "1"}),
-		}, 100, 0, 1000, labels.EmptyLabels(), 124, metadata.NoneFunc)
+		}, 100, 0, 1000, labels.EmptyLabels(), 124, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		err = Upload(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, b2.String()), metadata.NoneFunc)
 		testutil.NotOk(t, err)
@@ -222,7 +223,7 @@ func TestUpload(t *testing.T) {
 			labels.New(labels.Label{Name: "a", Value: "3"}),
 			labels.New(labels.Label{Name: "a", Value: "4"}),
 			labels.New(labels.Label{Name: "b", Value: "1"}),
-		}, 100, 0, 1000, labels.EmptyLabels(), 124, metadata.NoneFunc)
+		}, 100, 0, 1000, labels.EmptyLabels(), 124, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		err = UploadPromBlock(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, b2.String()), metadata.NoneFunc)
 		testutil.Ok(t, err)
@@ -247,7 +248,7 @@ func TestDelete(t *testing.T) {
 			labels.New(labels.Label{Name: "a", Value: "3"}),
 			labels.New(labels.Label{Name: "a", Value: "4"}),
 			labels.New(labels.Label{Name: "b", Value: "1"}),
-		}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc)
+		}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, Upload(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, b1.String()), metadata.NoneFunc))
 		testutil.Equals(t, 3, len(bkt.Objects()))
@@ -266,7 +267,7 @@ func TestDelete(t *testing.T) {
 			labels.New(labels.Label{Name: "a", Value: "3"}),
 			labels.New(labels.Label{Name: "a", Value: "4"}),
 			labels.New(labels.Label{Name: "b", Value: "1"}),
-		}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc)
+		}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, Upload(ctx, log.NewNopLogger(), bkt, path.Join(tmpDir, b2.String()), metadata.NoneFunc))
 		testutil.Equals(t, 3, len(bkt.Objects()))
@@ -317,7 +318,7 @@ func TestMarkForDeletion(t *testing.T) {
 				labels.New(labels.Label{Name: "a", Value: "3"}),
 				labels.New(labels.Label{Name: "a", Value: "4"}),
 				labels.New(labels.Label{Name: "b", Value: "1"}),
-			}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc)
+			}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc, nil)
 			testutil.Ok(t, err)
 
 			tcase.preUpload(t, id, bkt)
@@ -371,7 +372,7 @@ func TestMarkForNoCompact(t *testing.T) {
 				labels.New(labels.Label{Name: "a", Value: "3"}),
 				labels.New(labels.Label{Name: "a", Value: "4"}),
 				labels.New(labels.Label{Name: "b", Value: "1"}),
-			}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc)
+			}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc, nil)
 			testutil.Ok(t, err)
 
 			tcase.preUpload(t, id, bkt)
@@ -426,7 +427,7 @@ func TestMarkForNoDownsample(t *testing.T) {
 				labels.New(labels.Label{Name: "a", Value: "3"}),
 				labels.New(labels.Label{Name: "a", Value: "4"}),
 				labels.New(labels.Label{Name: "b", Value: "1"}),
-			}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc)
+			}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc, nil)
 			testutil.Ok(t, err)
 
 			tcase.preUpload(t, id, bkt)
@@ -457,7 +458,7 @@ func TestHashDownload(t *testing.T) {
 
 	b1, err := e2eutil.CreateBlockWithTombstone(ctx, tmpDir, []labels.Labels{
 		labels.New(labels.Label{Name: "a", Value: "1"}),
-	}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 42, metadata.SHA256Func)
+	}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 42, metadata.SHA256Func, nil)
 	testutil.Ok(t, err)
 
 	testutil.Ok(t, Upload(ctx, log.NewNopLogger(), instrumentedBkt, path.Join(tmpDir, b1.String()), metadata.SHA256Func))
@@ -550,7 +551,7 @@ func TestUploadCleanup(t *testing.T) {
 		labels.New(labels.Label{Name: "a", Value: "3"}),
 		labels.New(labels.Label{Name: "a", Value: "4"}),
 		labels.New(labels.Label{Name: "b", Value: "1"}),
-	}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc)
+	}, 100, 0, 1000, labels.New(labels.Label{Name: "ext1", Value: "val1"}), 124, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 
 	{
@@ -635,7 +636,7 @@ func TestRemoveMarkForDeletion(t *testing.T) {
 				labels.New(labels.Label{Name: "cluster-eu1", Value: "service-3"}),
 				labels.New(labels.Label{Name: "cluster-us1", Value: "service-1"}),
 				labels.New(labels.Label{Name: "cluster-us1", Value: "service-2"}),
-			}, 100, 0, 1000, labels.New(labels.Label{Name: "region-1", Value: "eu-west"}), 124, metadata.NoneFunc)
+			}, 100, 0, 1000, labels.New(labels.Label{Name: "region-1", Value: "eu-west"}), 124, metadata.NoneFunc, nil)
 			testutil.Ok(t, err)
 			testcases.preDelete(t, id, bkt)
 			counter := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
@@ -682,7 +683,7 @@ func TestRemoveMarkForNoCompact(t *testing.T) {
 				labels.New(labels.Label{Name: "cluster-eu1", Value: "service-3"}),
 				labels.New(labels.Label{Name: "cluster-us1", Value: "service-1"}),
 				labels.New(labels.Label{Name: "cluster-us1", Value: "service-2"}),
-			}, 100, 0, 1000, labels.New(labels.Label{Name: "region-1", Value: "eu-west"}), 124, metadata.NoneFunc)
+			}, 100, 0, 1000, labels.New(labels.Label{Name: "region-1", Value: "eu-west"}), 124, metadata.NoneFunc, nil)
 			testutil.Ok(t, err)
 			testCases.preDelete(t, id, bkt)
 			counter := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
@@ -729,7 +730,7 @@ func TestRemoveMmarkForNoDownsample(t *testing.T) {
 				labels.New(labels.Label{Name: "cluster-eu1", Value: "service-3"}),
 				labels.New(labels.Label{Name: "cluster-us1", Value: "service-1"}),
 				labels.New(labels.Label{Name: "cluster-us1", Value: "service-2"}),
-			}, 100, 0, 1000, labels.New(labels.Label{Name: "region-1", Value: "eu-west"}), 124, metadata.NoneFunc)
+			}, 100, 0, 1000, labels.New(labels.Label{Name: "region-1", Value: "eu-west"}), 124, metadata.NoneFunc, nil)
 			testutil.Ok(t, err)
 			testCases.preDelete(t, id, bkt)
 			counter := promauto.With(nil).NewCounter(prometheus.CounterOpts{})

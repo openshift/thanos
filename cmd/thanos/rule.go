@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	texttemplate "text/template"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/rules"
+	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb"
@@ -63,6 +65,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/info"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/logging"
+	"github.com/thanos-io/thanos/pkg/logutil"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/query"
@@ -78,8 +81,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/tracing"
 	"github.com/thanos-io/thanos/pkg/ui"
 )
-
-const dnsSDResolver = "miekgdns"
 
 type ruleConfig struct {
 	http    httpConfig
@@ -100,6 +101,7 @@ type ruleConfig struct {
 
 	resendDelay        time.Duration
 	evalInterval       time.Duration
+	queryOffset        time.Duration
 	outageTolerance    time.Duration
 	forGracePeriod     time.Duration
 	ruleFiles          []string
@@ -111,6 +113,7 @@ type ruleConfig struct {
 	ruleConcurrentEval int64
 
 	extendedFunctionsEnabled bool
+	EnableFeatures           []string
 }
 
 type Expression struct {
@@ -151,6 +154,8 @@ func registerRule(app *extkingpin.App) {
 		Default("1m").DurationVar(&conf.resendDelay)
 	cmd.Flag("eval-interval", "The default evaluation interval to use.").
 		Default("1m").DurationVar(&conf.evalInterval)
+	cmd.Flag("rule-query-offset", "The default rule group query_offset duration to use.").
+		Default("0s").DurationVar(&conf.queryOffset)
 	cmd.Flag("for-outage-tolerance", "Max time to tolerate prometheus outage for restoring \"for\" state of alert.").
 		Default("1h").DurationVar(&conf.outageTolerance)
 	cmd.Flag("for-grace-period", "Minimum duration between alert and restored \"for\" state. This is maintained only for alerts with configured \"for\" time greater than grace period.").
@@ -163,6 +168,7 @@ func registerRule(app *extkingpin.App) {
 		PlaceHolder("<endpoint>").StringsVar(&conf.grpcQueryEndpoints)
 
 	cmd.Flag("query.enable-x-functions", "Whether to enable extended rate functions (xrate, xincrease and xdelta). Only has effect when used with Thanos engine.").Default("false").BoolVar(&conf.extendedFunctionsEnabled)
+	cmd.Flag("enable-feature", "Comma separated feature names to enable. Valid options for now: promql-experimental-functions (enables promql experimental functions for ruler)").Default("").StringsVar(&conf.EnableFeatures)
 
 	conf.rwConfig = extflag.RegisterPathOrContent(cmd, "remote-write.config", "YAML config for the remote-write configurations, that specify servers where samples should be sent to (see https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write). This automatically enables stateless mode for ruler and no series will be stored in the ruler's TSDB. If an empty config (or file) is provided, the flag is ignored and ruler is run with its own TSDB.", extflag.WithEnvSubstitution())
 
@@ -404,17 +410,6 @@ func runRule(
 	}
 
 	if len(grpcEndpoints) > 0 {
-		duplicatedGRPCEndpoints := promauto.With(reg).NewCounter(prometheus.CounterOpts{
-			Name: "thanos_rule_grpc_endpoints_duplicated_total",
-			Help: "The number of times a duplicated grpc endpoint is detected from the different configs in rule",
-		})
-
-		dnsEndpointProvider := dns.NewProvider(
-			logger,
-			extprom.WrapRegistererWithPrefix("thanos_rule_grpc_endpoints_", reg),
-			dnsSDResolver,
-		)
-
 		dialOpts, err := extgrpc.StoreClientGRPCOpts(
 			logger,
 			reg,
@@ -430,36 +425,27 @@ func runRule(
 			return err
 		}
 
-		grpcEndpointSet = prepareEndpointSet(
+		grpcEndpointSet, err = setupEndpointSet(
 			g,
-			logger,
+			comp,
 			reg,
-			[]*dns.Provider{dnsEndpointProvider},
-			duplicatedGRPCEndpoints,
+			logger,
+			nil,
+			1*time.Minute,
+			nil,
+			1*time.Minute,
+			grpcEndpoints,
 			nil,
 			nil,
 			nil,
-			nil,
-			dialOpts,
+			conf.query.dnsSDResolver,
+			conf.query.dnsSDInterval,
 			5*time.Minute,
 			5*time.Second,
+			dialOpts,
 		)
-
-		// Periodically update the GRPC addresses from query config by resolving them using DNS SD if necessary.
-		{
-			ctx, cancel := context.WithCancel(context.Background())
-			g.Add(func() error {
-				return runutil.Repeat(5*time.Second, ctx.Done(), func() error {
-					resolveCtx, resolveCancel := context.WithTimeout(ctx, 5*time.Second)
-					defer resolveCancel()
-					if err := dnsEndpointProvider.Resolve(resolveCtx, grpcEndpoints, true); err != nil {
-						level.Error(logger).Log("msg", "failed to resolve addresses passed using grpc query config", "err", err)
-					}
-					return nil
-				})
-			}, func(error) {
-				cancel()
-			})
+		if err != nil {
+			return err
 		}
 	}
 
@@ -483,10 +469,11 @@ func runRule(
 			return errors.Wrapf(err, "failed to parse remote write config %v", string(rwCfgYAML))
 		}
 
+		slogger := logutil.GoKitLogToSlog(logger)
 		// flushDeadline is set to 1m, but it is for metadata watcher only so not used here.
-		remoteStore := remote.NewStorage(logger, reg, func() (int64, error) {
+		remoteStore := remote.NewStorage(slogger, reg, func() (int64, error) {
 			return 0, nil
-		}, conf.dataDir, 1*time.Minute, nil, false)
+		}, conf.dataDir, 1*time.Minute, &readyScrapeManager{})
 		if err := remoteStore.ApplyConfig(&config.Config{
 			GlobalConfig: config.GlobalConfig{
 				ExternalLabels: labelsTSDBToProm(conf.lset),
@@ -496,18 +483,18 @@ func runRule(
 			return errors.Wrap(err, "applying config to remote storage")
 		}
 
-		agentDB, err = agent.Open(logger, reg, remoteStore, conf.dataDir, agentOpts)
+		agentDB, err = agent.Open(slogger, reg, remoteStore, conf.dataDir, agentOpts)
 		if err != nil {
 			return errors.Wrap(err, "start remote write agent db")
 		}
-		fanoutStore := storage.NewFanout(logger, agentDB, remoteStore)
+		fanoutStore := storage.NewFanout(slogger, agentDB, remoteStore)
 		appendable = fanoutStore
 		// Use a separate queryable to restore the ALERTS firing states.
 		// We cannot use remoteStore directly because it uses remote read for
 		// query. However, remote read is not implemented in Thanos Receiver.
 		queryable = thanosrules.NewPromClientsQueryable(logger, queryClients, promClients, conf.query.httpMethod, conf.query.step, conf.ignoredLabelNames)
 	} else {
-		tsdbDB, err = tsdb.Open(conf.dataDir, log.With(logger, "component", "tsdb"), reg, tsdbOpts, nil)
+		tsdbDB, err = tsdb.Open(conf.dataDir, logutil.GoKitLogToSlog(log.With(logger, "component", "tsdb")), reg, tsdbOpts, nil)
 		if err != nil {
 			return errors.Wrap(err, "open TSDB")
 		}
@@ -598,6 +585,15 @@ func runRule(
 			}
 		}
 
+		if len(conf.EnableFeatures) > 0 {
+			for _, feature := range conf.EnableFeatures {
+				if feature == promqlExperimentalFunctions {
+					parser.EnableExperimentalFunctions = true
+					level.Info(logger).Log("msg", "Experimental PromQL functions enabled.", "option", promqlExperimentalFunctions)
+				}
+			}
+		}
+
 		// Run rule evaluation and alert notifications.
 		notifyFunc := func(ctx context.Context, expr string, alerts ...*rules.Alert) {
 			res := make([]*notifier.Alert, 0, len(alerts))
@@ -627,14 +623,15 @@ func runRule(
 		}
 
 		managerOpts := rules.ManagerOptions{
-			NotifyFunc:      notifyFunc,
-			Logger:          logger,
-			Appendable:      appendable,
-			ExternalURL:     nil,
-			Queryable:       queryable,
-			ResendDelay:     conf.resendDelay,
-			OutageTolerance: conf.outageTolerance,
-			ForGracePeriod:  conf.forGracePeriod,
+			NotifyFunc:             notifyFunc,
+			Logger:                 logutil.GoKitLogToSlog(logger),
+			Appendable:             appendable,
+			ExternalURL:            nil,
+			Queryable:              queryable,
+			ResendDelay:            conf.resendDelay,
+			OutageTolerance:        conf.outageTolerance,
+			ForGracePeriod:         conf.forGracePeriod,
+			DefaultRuleQueryOffset: func() time.Duration { return conf.queryOffset },
 		}
 		if conf.ruleConcurrentEval > 1 {
 			managerOpts.MaxConcurrentEvals = conf.ruleConcurrentEval
@@ -855,7 +852,18 @@ func runRule(
 			}
 		}()
 
-		s := shipper.New(logger, reg, conf.dataDir, bkt, func() labels.Labels { return conf.lset }, metadata.RulerSource, nil, conf.shipper.allowOutOfOrderUpload, metadata.HashFunc(conf.shipper.hashFunc), conf.shipper.metaFileName)
+		s := shipper.New(
+			bkt,
+			conf.dataDir,
+			shipper.WithLogger(logger),
+			shipper.WithRegisterer(reg),
+			shipper.WithSource(metadata.RulerSource),
+			shipper.WithHashFunc(metadata.HashFunc(conf.shipper.hashFunc)),
+			shipper.WithMetaFileName(conf.shipper.metaFileName),
+			shipper.WithLabels(func() labels.Labels { return conf.lset }),
+			shipper.WithAllowOutOfOrderUploads(conf.shipper.allowOutOfOrderUpload),
+			shipper.WithSkipCorruptedBlocks(conf.shipper.skipCorruptedBlocks),
+		)
 
 		ctx, cancel := context.WithCancel(context.Background())
 
@@ -1100,3 +1108,32 @@ func filterOutPromQLWarnings(warns []string, logger log.Logger, query string) []
 	}
 	return storeWarnings
 }
+
+// ReadyScrapeManager allows a scrape manager to be retrieved. Even if it's set at a later point in time.
+type readyScrapeManager struct {
+	mtx sync.RWMutex
+	m   *scrape.Manager
+}
+
+// Set the scrape manager.
+func (rm *readyScrapeManager) Set(m *scrape.Manager) {
+	rm.mtx.Lock()
+	defer rm.mtx.Unlock()
+
+	rm.m = m
+}
+
+// Get the scrape manager. If is not ready, return an error.
+func (rm *readyScrapeManager) Get() (*scrape.Manager, error) {
+	rm.mtx.RLock()
+	defer rm.mtx.RUnlock()
+
+	if rm.m != nil {
+		return rm.m, nil
+	}
+
+	return nil, ErrNotReady
+}
+
+// ErrNotReady is returned if the underlying scrape manager is not ready yet.
+var ErrNotReady = errors.New("scrape manager not ready")

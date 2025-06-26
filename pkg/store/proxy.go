@@ -25,6 +25,7 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/strutil"
@@ -89,7 +90,10 @@ type ProxyStore struct {
 	retrievalStrategy RetrievalStrategy
 	debugLogging      bool
 	tsdbSelector      *TSDBSelector
+	matcherCache      storecache.MatchersCache
 	enableDedup       bool
+
+	lazyRetrievalMaxBufferedResponses int
 }
 
 type proxyStoreMetrics struct {
@@ -113,8 +117,14 @@ func RegisterStoreServer(storeSrv storepb.StoreServer, logger log.Logger) func(*
 	}
 }
 
-// BucketStoreOption are functions that configure BucketStore.
+// ProxyStoreOption are functions that configure the ProxyStore.
 type ProxyStoreOption func(s *ProxyStore)
+
+func WithLazyRetrievalMaxBufferedResponsesForProxy(bufferSize int) ProxyStoreOption {
+	return func(s *ProxyStore) {
+		s.lazyRetrievalMaxBufferedResponses = bufferSize
+	}
+}
 
 // WithProxyStoreDebugLogging toggles debug logging.
 func WithProxyStoreDebugLogging(enable bool) ProxyStoreOption {
@@ -134,6 +144,13 @@ func WithTSDBSelector(selector *TSDBSelector) ProxyStoreOption {
 func WithoutDedup() ProxyStoreOption {
 	return func(s *ProxyStore) {
 		s.enableDedup = false
+	}
+}
+
+// WithMatcherCache sets the matcher cache instance for the proxy.
+func WithMatcherCache(cache storecache.MatchersCache) ProxyStoreOption {
+	return func(s *ProxyStore) {
+		s.matcherCache = cache
 	}
 }
 
@@ -168,12 +185,12 @@ func NewProxyStore(
 		retrievalStrategy: retrievalStrategy,
 		tsdbSelector:      DefaultSelector,
 		enableDedup:       true,
+		matcherCache:      storecache.NoopMatchersCache,
 	}
 
 	for _, option := range options {
 		option(s)
 	}
-
 	return s
 }
 
@@ -248,7 +265,7 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, srv storepb.
 		reqLogger = log.With(reqLogger, "request", originalRequest.String())
 	}
 
-	match, matchers, err := matchesExternalLabels(originalRequest.Matchers, s.selectorLabels)
+	match, matchers, err := matchesExternalLabels(originalRequest.Matchers, s.selectorLabels, s.matcherCache)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -299,7 +316,7 @@ func (s *ProxyStore) Series(originalRequest *storepb.SeriesRequest, srv storepb.
 	for _, st := range stores {
 		st := st
 
-		respSet, err := newAsyncRespSet(ctx, st, r, s.responseTimeout, s.retrievalStrategy, &s.buffers, r.ShardInfo, reqLogger, s.metrics.emptyStreamResponses)
+		respSet, err := newAsyncRespSet(ctx, st, r, s.responseTimeout, s.retrievalStrategy, &s.buffers, r.ShardInfo, reqLogger, s.metrics.emptyStreamResponses, s.lazyRetrievalMaxBufferedResponses)
 		if err != nil {
 			level.Error(reqLogger).Log("err", err)
 
@@ -353,7 +370,7 @@ func (s *ProxyStore) LabelNames(ctx context.Context, originalRequest *storepb.La
 	if s.debugLogging {
 		reqLogger = log.With(reqLogger, "request", originalRequest.String())
 	}
-	match, matchers, err := matchesExternalLabels(originalRequest.Matchers, s.selectorLabels)
+	match, matchers, err := matchesExternalLabels(originalRequest.Matchers, s.selectorLabels, s.matcherCache)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -456,7 +473,7 @@ func (s *ProxyStore) LabelValues(ctx context.Context, originalRequest *storepb.L
 		return nil, status.Error(codes.InvalidArgument, "label name parameter cannot be empty")
 	}
 
-	match, matchers, err := matchesExternalLabels(originalRequest.Matchers, s.selectorLabels)
+	match, matchers, err := matchesExternalLabels(originalRequest.Matchers, s.selectorLabels, s.matcherCache)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}

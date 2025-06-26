@@ -24,9 +24,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/model/histogram"
@@ -35,88 +32,6 @@ import (
 	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/util/strutil"
 )
-
-var (
-	Logger          = log.NewNopLogger()
-	NarrowSelectors = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "prometheus_narrow_selectors_count",
-			Help: "Number of selectors that may unintentionally only match integers on 'quantile' and 'le' labels",
-		},
-		[]string{"component"},
-	)
-)
-
-// isInteger is a light strconv.Atoi that avoids allocations due to Atoi's returned error and doesn't
-// consider as integers invalid, big, or underscored integers.
-func isInteger(s string) (int, bool) {
-	sLen := len(s)
-	if strconv.IntSize == 32 && (0 < sLen && sLen < 10) ||
-		strconv.IntSize == 64 && (0 < sLen && sLen < 19) {
-		// Fast path for small integers that fit int type.
-		s0 := s
-		if s[0] == '-' || s[0] == '+' {
-			s = s[1:]
-			if len(s) < 1 {
-				return 0, false
-			}
-		}
-
-		n := 0
-		for _, ch := range []byte(s) {
-			ch -= '0'
-			if ch > 9 {
-				return 0, false
-			}
-			n = n*10 + int(ch)
-		}
-		if s0[0] == '-' {
-			n = -n
-		}
-		return n, true
-	}
-
-	// Slow path for invalid, big, or underscored integers.
-	i64, err := strconv.ParseInt(s, 10, 0)
-	return int(i64), err == nil
-}
-
-// checkLabelMatchers helps to detect unintentional misuses of matchers on "quantile" and "le" labels after normalization during scraping
-// introduced in Prometheus3. For more details, see https://prometheus.io/docs/prometheus/latest/migration/#le-and-quantile-label-values.
-// It specifically detects integers-only label matchers formatted as "integer" and "integer|integer|integer" (as they're the most likely to contain them).
-// Refer to Test_checkLabelMatchers for more details.
-func checkLabelMatchers(vs *VectorSelector) {
-Outer:
-	for _, lm := range vs.LabelMatchers {
-		if lm == nil {
-			continue
-		}
-		if lm.Name == model.QuantileLabel || (strings.HasSuffix(vs.Name, "_bucket") && lm.Name == model.BucketLabel) {
-			switch lm.Type {
-			case labels.MatchEqual, labels.MatchNotEqual:
-				if n, ok := isInteger(lm.Value); ok {
-					NarrowSelectors.WithLabelValues("prometheus-parser").Inc()
-					level.Debug(Logger).Log("msg", "selector set to explicitly match an integer, but values could be floats", "narrow_matcher_label", lm.Name, "integer", n, "matchers", fmt.Sprintf("%v", vs.LabelMatchers))
-				}
-				break Outer
-			case labels.MatchRegexp, labels.MatchNotRegexp:
-				if len(lm.Value) == 0 {
-					break Outer
-				}
-				vals := strings.Split(lm.Value, "|")
-				for _, val := range vals {
-					if _, ok := isInteger(val); !ok {
-						break Outer
-					}
-				}
-
-				NarrowSelectors.WithLabelValues("prometheus-parser").Inc()
-				level.Debug(Logger).Log("msg", "selector set to explicitly match integers only, but values could be floats", "narrow_matcher_label", lm.Name, "matchers", fmt.Sprintf("%v", vs.LabelMatchers))
-				break Outer
-			}
-		}
-	}
-}
 
 var parserPool = sync.Pool{
 	New: func() interface{} {
@@ -157,7 +72,7 @@ func WithFunctions(functions map[string]*Function) Opt {
 }
 
 // NewParser returns a new parser.
-func NewParser(input string, opts ...Opt) *parser { //nolint:revive // unexported-return.
+func NewParser(input string, opts ...Opt) *parser { //nolint:revive // unexported-return
 	p := parserPool.Get().(*parser)
 
 	p.functions = Functions
@@ -283,7 +198,6 @@ func ParseMetricSelector(input string) (m []*labels.Matcher, err error) {
 
 	parseResult := p.parseGenerated(START_METRIC_SELECTOR)
 	if parseResult != nil {
-		checkLabelMatchers(parseResult.(*VectorSelector))
 		m = parseResult.(*VectorSelector).LabelMatchers
 	}
 
@@ -330,7 +244,8 @@ type seriesDescription struct {
 	values []SequenceValue
 }
 
-// ParseSeriesDesc parses the description of a time series.
+// ParseSeriesDesc parses the description of a time series. It is only used in
+// the PromQL testing framework code.
 func ParseSeriesDesc(input string) (labels labels.Labels, values []SequenceValue, err error) {
 	p := NewParser(input)
 	p.lex.seriesDesc = true
@@ -533,8 +448,8 @@ func (p *parser) newAggregateExpr(op Item, modifier, args Node) (ret *AggregateE
 
 	desiredArgs := 1
 	if ret.Op.IsAggregatorWithParam() {
-		if !EnableExperimentalFunctions && (ret.Op == LIMITK || ret.Op == LIMIT_RATIO) {
-			p.addParseErrf(ret.PositionRange(), "limitk() and limit_ratio() are experimental and must be enabled with --enable-feature=promql-experimental-functions")
+		if !EnableExperimentalFunctions && ret.Op.IsExperimentalAggregator() {
+			p.addParseErrf(ret.PositionRange(), "%s() is experimental and must be enabled with --enable-feature=promql-experimental-functions", ret.Op)
 			return
 		}
 		desiredArgs = 2
@@ -924,8 +839,6 @@ func (p *parser) checkAST(node Node) (typ ValueType) {
 					p.addParseErrf(n.PositionRange(), "metric name must not be set twice: %q or %q", n.Name, m.Value)
 				}
 			}
-
-			checkLabelMatchers(n)
 
 			// Skip the check for non-empty matchers because an explicit
 			// metric name is a non-empty matcher.
