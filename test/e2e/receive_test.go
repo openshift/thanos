@@ -22,6 +22,8 @@ import (
 	logkit "github.com/go-kit/log"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
+
+	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/model/relabel"
@@ -32,7 +34,6 @@ import (
 
 	"github.com/efficientgo/core/testutil"
 
-	config_util "github.com/prometheus/common/config"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/receive"
 	"github.com/thanos-io/thanos/pkg/runutil"
@@ -80,7 +81,7 @@ func TestReceive(t *testing.T) {
 		t.Cleanup(e2ethanos.CleanScenario(t, e))
 
 		// Setup Router Ingestor.
-		i := e2ethanos.NewReceiveBuilder(e, "ingestor").WithIngestionEnabled().Init()
+		i := e2ethanos.NewReceiveBuilder(e, "ingestor").WithIngestionEnabled().WithExpandedPostingsCache().Init()
 		testutil.Ok(t, e2e.StartAndWaitReady(i))
 
 		// Setup Prometheus
@@ -105,6 +106,56 @@ func TestReceive(t *testing.T) {
 				"receive":    "receive-ingestor",
 				"replica":    "0",
 				"tenant_id":  "default-tenant",
+			},
+		})
+	})
+
+	t.Run("ingestor_otlp", func(t *testing.T) {
+		/*
+			The single_ingestor suite represents the simplest possible configuration of Thanos Receive.
+			 ┌──────────┐
+			 │  Prom    │
+			 └────┬─────┘
+			      │
+			 ┌────▼─────┐
+			 │ Ingestor │
+			 └────┬─────┘
+			      │
+			 ┌────▼─────┐
+			 │  Query   │
+			 └──────────┘
+			NB: Made with asciiflow.com - you can copy & paste the above there to modify.
+		*/
+
+		t.Parallel()
+		e, err := e2e.NewDockerEnvironment("ingestor-otlp")
+		testutil.Ok(t, err)
+		t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+		// Setup Router Ingestor.
+		i := e2ethanos.NewReceiveBuilder(e, "ingestor").WithIngestionEnabled().Init()
+		testutil.Ok(t, e2e.StartAndWaitReady(i))
+
+		// Setup Otel
+		otel := e2ethanos.NewOtel(e, "1", e2ethanos.DefaultOtelConfig(e2ethanos.OTLPEndpoint(i.InternalEndpoint("remote-write"))), e2ethanos.DefaultOtelImage())
+		testutil.Ok(t, e2e.StartAndWaitReady(otel))
+
+		q := e2ethanos.NewQuerierBuilder(e, "1", i.InternalEndpoint("grpc")).Init()
+		testutil.Ok(t, e2e.StartAndWaitReady(q))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		t.Cleanup(cancel)
+
+		testutil.Ok(t, q.WaitSumMetricsWithOptions(e2emon.Equals(1), []string{"thanos_store_nodes_grpc_connections"}, e2emon.WaitMissingMetrics()))
+
+		// We expect the data from each Prometheus instance to be replicated twice across our ingesting instances
+		queryAndAssertSeries(t, ctx, q.Endpoint("http"), e2ethanos.QueryUpWithoutInstance, time.Now, promclient.QueryOptions{
+			Deduplicate: false,
+		}, []model.Metric{
+			{
+				"job":       "otel-collector",
+				"receive":   "receive-ingestor",
+				"tenant_id": "default-tenant",
 			},
 		})
 	})
@@ -135,9 +186,9 @@ func TestReceive(t *testing.T) {
 		t.Cleanup(e2ethanos.CleanScenario(t, e))
 
 		// Setup Receives
-		r1 := e2ethanos.NewReceiveBuilder(e, "1").WithIngestionEnabled().Init()
-		r2 := e2ethanos.NewReceiveBuilder(e, "2").WithIngestionEnabled().Init()
-		r3 := e2ethanos.NewReceiveBuilder(e, "3").WithIngestionEnabled().Init()
+		r1 := e2ethanos.NewReceiveBuilder(e, "1").WithIngestionEnabled().WithExpandedPostingsCache().Init()
+		r2 := e2ethanos.NewReceiveBuilder(e, "2").WithIngestionEnabled().WithExpandedPostingsCache().Init()
+		r3 := e2ethanos.NewReceiveBuilder(e, "3").WithIngestionEnabled().WithExpandedPostingsCache().Init()
 
 		testutil.Ok(t, e2e.StartAndWaitReady(r1, r2, r3))
 
@@ -291,9 +342,9 @@ test_metric{a="2", b="2"} 1`)
 		t.Cleanup(e2ethanos.CleanScenario(t, e))
 
 		// Setup 3 ingestors.
-		i1 := e2ethanos.NewReceiveBuilder(e, "i1").WithIngestionEnabled().Init()
-		i2 := e2ethanos.NewReceiveBuilder(e, "i2").WithIngestionEnabled().Init()
-		i3 := e2ethanos.NewReceiveBuilder(e, "i3").WithIngestionEnabled().Init()
+		i1 := e2ethanos.NewReceiveBuilder(e, "i1").WithIngestionEnabled().WithExpandedPostingsCache().Init()
+		i2 := e2ethanos.NewReceiveBuilder(e, "i2").WithIngestionEnabled().WithExpandedPostingsCache().Init()
+		i3 := e2ethanos.NewReceiveBuilder(e, "i3").WithIngestionEnabled().WithExpandedPostingsCache().Init()
 
 		h := receive.HashringConfig{
 			Endpoints: []receive.Endpoint{

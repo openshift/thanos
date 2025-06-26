@@ -5,8 +5,11 @@ package storepb
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"iter"
+	"runtime/debug"
+	"sync"
 
 	"google.golang.org/grpc"
 )
@@ -38,6 +41,7 @@ type inProcessClient struct {
 	ctx  context.Context
 	next func() (*SeriesResponse, error, bool)
 	stop func()
+	mu   sync.Mutex // protects next and stop
 }
 
 func newInProcessClient(ctx context.Context, next func() (*SeriesResponse, error, bool), stop func()) *inProcessClient {
@@ -45,10 +49,13 @@ func newInProcessClient(ctx context.Context, next func() (*SeriesResponse, error
 		ctx:  ctx,
 		next: next,
 		stop: stop,
+		mu:   sync.Mutex{},
 	}
 }
 
 func (c *inProcessClient) Recv() (*SeriesResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	resp, err, ok := c.next()
 	if err != nil {
 		c.stop()
@@ -68,6 +75,8 @@ func (c *inProcessClient) Context() context.Context {
 }
 
 func (c *inProcessClient) CloseSend() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.stop()
 	return nil
 }
@@ -92,6 +101,12 @@ func (s serverAsClient) LabelValues(ctx context.Context, in *LabelValuesRequest,
 
 func (s serverAsClient) Series(ctx context.Context, in *SeriesRequest, _ ...grpc.CallOption) (Store_SeriesClient, error) {
 	var srvIter iter.Seq2[*SeriesResponse, error] = func(yield func(*SeriesResponse, error) bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				st := debug.Stack()
+				panic(fmt.Sprintf("panic %v in server iterator: %s", r, st))
+			}
+		}()
 		srv := newInProcessServer(ctx, yield)
 		err := s.srv.Series(in, srv)
 		if err != nil {

@@ -13,6 +13,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,7 +37,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/exp/slices"
+	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -116,6 +117,8 @@ type Options struct {
 	Limiter                 *Limiter
 	AsyncForwardWorkerCount uint
 	ReplicationProtocol     ReplicationProtocol
+	OtlpEnableTargetInfo    bool
+	OtlpResourceAttributes  []string
 }
 
 // Handler serves a Prometheus remote write receiving HTTP endpoint.
@@ -138,6 +141,9 @@ type Handler struct {
 
 	writeSamplesTotal    *prometheus.HistogramVec
 	writeTimeseriesTotal *prometheus.HistogramVec
+
+	pendingWriteRequests        prometheus.Gauge
+	pendingWriteRequestsCounter atomic.Int32
 
 	Limiter *Limiter
 }
@@ -220,6 +226,12 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 				Buckets:   []float64{10, 50, 100, 500, 1000, 5000, 10000},
 			}, []string{"code", "tenant"},
 		),
+		pendingWriteRequests: promauto.With(registerer).NewGauge(
+			prometheus.GaugeOpts{
+				Name: "thanos_receive_pending_write_requests",
+				Help: "The number of pending write requests.",
+			},
+		),
 	}
 
 	h.forwardRequests.WithLabelValues(labelSuccess)
@@ -275,6 +287,18 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 		),
 	)
 
+	h.router.Post(
+		"/api/v1/otlp",
+		instrf(
+			"otlp",
+			readyf(
+				middleware.RequestID(
+					http.HandlerFunc(h.receiveOTLPHTTP),
+				),
+			),
+		),
+	)
+
 	statusAPI := statusapi.New(statusapi.Options{
 		GetStats: h.getStats,
 		Registry: h.options.Registry,
@@ -310,6 +334,8 @@ func (h *Handler) Hashring(hashring Hashring) {
 				level.Error(h.logger).Log("msg", "closing gRPC connection failed, we might have leaked a file descriptor", "addr", node, "err", err.Error())
 			}
 		}
+
+		h.hashring.Close()
 	}
 
 	h.hashring = hashring
@@ -765,7 +791,10 @@ func (h *Handler) fanoutForward(ctx context.Context, params remoteWriteParams) (
 
 	// Prepare a buffered channel to receive the responses from the local and remote writes. Remote writes will all go
 	// asynchronously and with this capacity we will never block on writing to the channel.
-	maxBufferedResponses := len(localWrites)
+	var maxBufferedResponses int
+	for er := range localWrites {
+		maxBufferedResponses += len(localWrites[er])
+	}
 	for er := range remoteWrites {
 		maxBufferedResponses += len(remoteWrites[er])
 	}
@@ -998,6 +1027,11 @@ func (h *Handler) sendRemoteWrite(
 			}
 			h.peers.markPeerAvailable(endpoint)
 		} else {
+			h.forwardRequests.WithLabelValues(labelError).Inc()
+			if !alreadyReplicated {
+				h.replications.WithLabelValues(labelError).Inc()
+			}
+
 			// Check if peer connection is unavailable, update the peer state to avoid spamming that peer.
 			if st, ok := status.FromError(err); ok {
 				if st.Code() == codes.Unavailable {
@@ -1035,6 +1069,9 @@ func quorumReached(successes []int, successThreshold int) bool {
 func (h *Handler) RemoteWrite(ctx context.Context, r *storepb.WriteRequest) (*storepb.WriteResponse, error) {
 	span, ctx := tracing.StartSpan(ctx, "receive_grpc")
 	defer span.Finish()
+
+	h.pendingWriteRequests.Set(float64(h.pendingWriteRequestsCounter.Add(1)))
+	defer h.pendingWriteRequestsCounter.Add(-1)
 
 	_, err := h.handleRequest(ctx, uint64(r.Replica), r.Tenant, &prompb.WriteRequest{Timeseries: r.Timeseries})
 	if err != nil {
