@@ -19,10 +19,9 @@ package linux
 
 import (
 	"bytes"
-	"io/ioutil"
+	"fmt"
 	"os"
-
-	"github.com/pkg/errors"
+	"path/filepath"
 
 	"github.com/elastic/go-sysinfo/types"
 )
@@ -31,12 +30,12 @@ import (
 // These will be searched in order.
 var machineIDFiles = []string{"/etc/machine-id", "/var/lib/dbus/machine-id", "/var/db/dbus/machine-id"}
 
-func MachineID() (string, error) {
+func machineID(hostfs string) (string, error) {
 	var contents []byte
 	var err error
 
 	for _, file := range machineIDFiles {
-		contents, err = ioutil.ReadFile(file)
+		contents, err = os.ReadFile(filepath.Join(hostfs, file))
 		if err != nil {
 			if os.IsNotExist(err) {
 				// Try next location
@@ -44,7 +43,7 @@ func MachineID() (string, error) {
 			}
 
 			// Return with error on any other error
-			return "", errors.Wrapf(err, "failed to read %v", file)
+			return "", fmt.Errorf("failed to read %v: %w", file, err)
 		}
 
 		// Found it
@@ -58,4 +57,12 @@ func MachineID() (string, error) {
 
 	contents = bytes.TrimSpace(contents)
 	return string(contents), nil
+}
+
+func MachineIDHostfs(hostfs string) (string, error) {
+	return machineID(hostfs)
+}
+
+func MachineID() (string, error) {
+	return machineID("")
 }

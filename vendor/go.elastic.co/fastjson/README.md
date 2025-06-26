@@ -1,4 +1,4 @@
-[![Travis-CI](https://travis-ci.org/elastic/go-fastjson.svg)](https://travis-ci.org/elastic/go-fastjson)
+[![Build Status](https://github.com/elastic/go-fastjson/actions/workflows/ci.yml/badge.svg)](https://github.com/elastic/go-fastjson/actions/workflows/ci.yml)
 
 # fastjson: fast JSON encoder for Go
 
@@ -9,7 +9,7 @@ methods for all exported types within a specified package.
 
 ## Requirements
 
-Go 1.8+
+Go 1.19+
 
 ## License
 

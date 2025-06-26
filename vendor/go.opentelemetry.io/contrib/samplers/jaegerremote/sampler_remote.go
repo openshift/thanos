@@ -29,8 +29,8 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/jsonpb"
+	jaeger_api_v2 "github.com/jaegertracing/jaeger-idl/proto-gen/api_v2"
 
-	jaeger_api_v2 "go.opentelemetry.io/contrib/samplers/jaegerremote/internal/proto-gen/jaeger-idl/proto/api_v2"
 	"go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -288,7 +288,7 @@ func (f *httpSamplingStrategyFetcher) Fetch(serviceName string) ([]byte, error) 
 	v.Set("service", serviceName)
 	uri := f.serverURL + "?" + v.Encode()
 
-	resp, err := f.httpClient.Get(uri)
+	resp, err := f.httpClient.Get(uri) // nolint:bodyclose  // False-positive.
 	if err != nil {
 		return nil, err
 	}

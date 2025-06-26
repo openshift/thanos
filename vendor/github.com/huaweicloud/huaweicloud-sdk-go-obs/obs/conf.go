@@ -21,10 +21,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/net/http/httpproxy"
 )
 
 type urlHolder struct {
@@ -34,39 +38,47 @@ type urlHolder struct {
 }
 
 type config struct {
-	securityProviders []securityProvider
-	urlHolder         *urlHolder
-	pathStyle         bool
-	cname             bool
-	sslVerify         bool
-	endpoint          string
-	signature         SignatureType
-	region            string
-	connectTimeout    int
-	socketTimeout     int
-	headerTimeout     int
-	idleConnTimeout   int
-	finalTimeout      int
-	maxRetryCount     int
-	proxyURL          string
-	maxConnsPerHost   int
-	pemCerts          []byte
-	transport         *http.Transport
-	roundTripper      http.RoundTripper
-	httpClient        *http.Client
-	ctx               context.Context
-	maxRedirectCount  int
-	userAgent         string
-	enableCompression bool
+	securityProviders    []securityProvider
+	urlHolder            *urlHolder
+	pathStyle            bool
+	cname                bool
+	sslVerify            bool
+	disableKeepAlive     bool
+	endpoint             string
+	signature            SignatureType
+	region               string
+	connectTimeout       int
+	socketTimeout        int
+	headerTimeout        int
+	idleConnTimeout      int
+	finalTimeout         int
+	maxRetryCount        int
+	proxyURL             string
+	noProxyURL           string
+	proxyFromEnv         bool
+	maxConnsPerHost      int
+	pemCerts             []byte
+	transport            *http.Transport
+	roundTripper         http.RoundTripper
+	httpClient           *http.Client
+	ctx                  context.Context
+	maxRedirectCount     int
+	userAgent            string
+	enableCompression    bool
+	progressListener     ProgressListener
+	customProxyOnce      sync.Once
+	customProxyFuncValue func(*url.URL) (*url.URL, error)
 }
 
 func (conf config) String() string {
-	return fmt.Sprintf("[endpoint:%s, signature:%s, pathStyle:%v, region:%s"+
-		"\nconnectTimeout:%d, socketTimeout:%dheaderTimeout:%d, idleConnTimeout:%d"+
-		"\nmaxRetryCount:%d, maxConnsPerHost:%d, sslVerify:%v, maxRedirectCount:%d]",
+	return fmt.Sprintf("[endpoint:%s, signature:%s, pathStyle:%v, region:%s,"+
+		"\nconnectTimeout:%d, socketTimeout:%d, headerTimeout:%d, idleConnTimeout:%d,"+
+		"\nmaxRetryCount:%d, maxConnsPerHost:%d, sslVerify:%v, maxRedirectCount:%d,"+
+		"\ncname:%v, userAgent:%s, disableKeepAlive:%v, proxyFromEnv:%v]",
 		conf.endpoint, conf.signature, conf.pathStyle, conf.region,
 		conf.connectTimeout, conf.socketTimeout, conf.headerTimeout, conf.idleConnTimeout,
 		conf.maxRetryCount, conf.maxConnsPerHost, conf.sslVerify, conf.maxRedirectCount,
+		conf.cname, conf.userAgent, conf.disableKeepAlive, conf.proxyFromEnv,
 	)
 }
 
@@ -106,6 +118,20 @@ func WithHeaderTimeout(headerTimeout int) configurer {
 func WithProxyUrl(proxyURL string) configurer {
 	return func(conf *config) {
 		conf.proxyURL = proxyURL
+	}
+}
+
+// WithNoProxyUrl is a configurer for ObsClient to set HTTP no_proxy.
+func WithNoProxyUrl(noProxyURL string) configurer {
+	return func(conf *config) {
+		conf.noProxyURL = noProxyURL
+	}
+}
+
+// WithProxyFromEnv is a configurer for ObsClient to get proxy from evironment.
+func WithProxyFromEnv(proxyFromEnv bool) configurer {
+	return func(conf *config) {
+		conf.proxyFromEnv = proxyFromEnv
 	}
 }
 
@@ -205,6 +231,13 @@ func WithRequestContext(ctx context.Context) configurer {
 func WithCustomDomainName(cname bool) configurer {
 	return func(conf *config) {
 		conf.cname = cname
+	}
+}
+
+// WithDisableKeepAlive is a configurer for ObsClient to disable the keep-alive for http.
+func WithDisableKeepAlive(disableKeepAlive bool) configurer {
+	return func(conf *config) {
+		conf.disableKeepAlive = disableKeepAlive
 	}
 }
 
@@ -341,14 +374,12 @@ func (conf *config) getTransport() error {
 			MaxIdleConnsPerHost:   conf.maxConnsPerHost,
 			ResponseHeaderTimeout: time.Second * time.Duration(conf.headerTimeout),
 			IdleConnTimeout:       time.Second * time.Duration(conf.idleConnTimeout),
+			DisableKeepAlives:     conf.disableKeepAlive,
 		}
-
 		if conf.proxyURL != "" {
-			proxyURL, err := url.Parse(conf.proxyURL)
-			if err != nil {
-				return err
-			}
-			conf.transport.Proxy = http.ProxyURL(proxyURL)
+			conf.transport.Proxy = conf.customProxyFromEnvironment
+		} else if conf.proxyFromEnv {
+			conf.transport.Proxy = http.ProxyFromEnvironment
 		}
 
 		tlsConfig := &tls.Config{InsecureSkipVerify: !conf.sslVerify}
@@ -363,6 +394,24 @@ func (conf *config) getTransport() error {
 	}
 
 	return nil
+}
+
+func (conf *config) customProxyFromEnvironment(req *http.Request) (*url.URL, error) {
+	url, err := conf.customProxyFunc()(req.URL)
+	return url, err
+}
+
+func (conf *config) customProxyFunc() func(*url.URL) (*url.URL, error) {
+	conf.customProxyOnce.Do(func() {
+		customhttpproxy := &httpproxy.Config{
+			HTTPProxy:  conf.proxyURL,
+			HTTPSProxy: conf.proxyURL,
+			NoProxy:    conf.noProxyURL,
+			CGI:        os.Getenv("REQUEST_METHOD") != "",
+		}
+		conf.customProxyFuncValue = customhttpproxy.ProxyFunc()
+	})
+	return conf.customProxyFuncValue
 }
 
 func checkRedirectFunc(req *http.Request, via []*http.Request) error {
@@ -502,4 +551,13 @@ func getQueryURL(key, value string) string {
 	queryURL += key
 	queryURL += value
 	return queryURL
+}
+
+func (obsClient ObsClient) getProgressListener(extensions []extensionOptions) ProgressListener {
+	for _, extension := range extensions {
+		if configure, ok := extension.(extensionProgressListener); ok {
+			return configure()
+		}
+	}
+	return nil
 }

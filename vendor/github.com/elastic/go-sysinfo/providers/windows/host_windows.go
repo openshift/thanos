@@ -18,12 +18,17 @@
 package windows
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
+	"strings"
+	"syscall"
 	"time"
 
+	stdwindows "golang.org/x/sys/windows"
+
 	windows "github.com/elastic/go-windows"
-	"github.com/joeshaw/multierror"
-	"github.com/pkg/errors"
 
 	"github.com/elastic/go-sysinfo/internal/registry"
 	"github.com/elastic/go-sysinfo/providers/shared"
@@ -78,10 +83,24 @@ func (h *host) Memory() (*types.HostMemoryInfo, error) {
 	}, nil
 }
 
+func (h *host) FQDNWithContext(_ context.Context) (string, error) {
+	fqdn, err := getComputerNameEx(stdwindows.ComputerNamePhysicalDnsFullyQualified)
+	if err != nil {
+		return "", fmt.Errorf("could not get windows FQDN: %s", err)
+	}
+
+	return strings.TrimSuffix(fqdn, "."), nil
+}
+
+func (h *host) FQDN() (string, error) {
+	return h.FQDNWithContext(context.Background())
+}
+
 func newHost() (*host, error) {
 	h := &host{}
 	r := &reader{}
 	r.architecture(h)
+	r.nativeArchitecture(h)
 	r.bootTime(h)
 	r.hostname(h)
 	r.network(h)
@@ -98,7 +117,7 @@ type reader struct {
 
 func (r *reader) addErr(err error) bool {
 	if err != nil {
-		if errors.Cause(err) != types.ErrNotImplemented {
+		if !errors.Is(err, types.ErrNotImplemented) {
 			r.errs = append(r.errs, err)
 		}
 		return true
@@ -108,7 +127,7 @@ func (r *reader) addErr(err error) bool {
 
 func (r *reader) Err() error {
 	if len(r.errs) > 0 {
-		return &multierror.MultiError{Errors: r.errs}
+		return errors.Join(r.errs...)
 	}
 	return nil
 }
@@ -119,6 +138,14 @@ func (r *reader) architecture(h *host) {
 		return
 	}
 	h.info.Architecture = v
+}
+
+func (r *reader) nativeArchitecture(h *host) {
+	v, err := NativeArchitecture()
+	if r.addErr(err) {
+		return
+	}
+	h.info.NativeArchitecture = v
 }
 
 func (r *reader) bootTime(h *host) {
@@ -135,6 +162,37 @@ func (r *reader) hostname(h *host) {
 		return
 	}
 	h.info.Hostname = v
+}
+
+func getComputerNameEx(name uint32) (string, error) {
+	size := uint32(64)
+
+	for {
+		buff := make([]uint16, size)
+		err := stdwindows.GetComputerNameEx(
+			name, &buff[0], &size)
+		if err == nil {
+			return syscall.UTF16ToString(buff[:size]), nil
+		}
+
+		// ERROR_MORE_DATA means buff is too small and size is set to the
+		// number of bytes needed to store the FQDN. For details, see
+		// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getcomputernameexw#return-value
+		if errors.Is(err, syscall.ERROR_MORE_DATA) {
+			// Safeguard to avoid an infinite loop.
+			if size <= uint32(len(buff)) {
+				return "", fmt.Errorf(
+					"windows.GetComputerNameEx returned ERROR_MORE_DATA, " +
+						"but data size should fit into buffer")
+			} else {
+				// Grow the buffer and try again.
+				buff = make([]uint16, size)
+				continue
+			}
+		}
+
+		return "", fmt.Errorf("could not get windows FQDN: could not get windows.ComputerNamePhysicalDnsFullyQualified: %w", err)
+	}
 }
 
 func (r *reader) network(h *host) {

@@ -46,6 +46,32 @@ func (obsClient ObsClient) ListObjects(input *ListObjectsInput, extensions ...ex
 	return
 }
 
+// ListPosixObjects lists objects in a posix.
+//
+// You can use this API to list objects in a posix. By default, a maximum of 1000 objects are listed.
+func (obsClient ObsClient) ListPosixObjects(input *ListPosixObjectsInput, extensions ...extensionOptions) (output *ListPosixObjectsOutput, err error) {
+	if input == nil {
+		return nil, errors.New("ListPosixObjects is nil")
+	}
+	output = &ListPosixObjectsOutput{}
+	err = obsClient.doActionWithBucket("ListPosixObjects", HTTP_GET, input.Bucket, input, output, extensions)
+	if err != nil {
+		output = nil
+	} else {
+		if location, ok := output.ResponseHeaders[HEADER_BUCKET_REGION]; ok {
+			output.Location = location[0]
+		}
+		if output.EncodingType == "url" {
+			err = decodeListPosixObjectsOutput(output)
+			if err != nil {
+				doLog(LEVEL_ERROR, "Failed to get ListPosixObjectsOutput with error: %v.", err)
+				output = nil
+			}
+		}
+	}
+	return
+}
+
 // ListVersions lists versioning objects in a bucket.
 //
 // You can use this API to list versioning objects in a bucket. By default, a maximum of 1000 versioning objects are listed.
@@ -223,12 +249,32 @@ func (obsClient ObsClient) GetObject(input *GetObjectInput, extensions ...extens
 		return nil, errors.New("GetObjectInput is nil")
 	}
 	output = &GetObjectOutput{}
-	err = obsClient.doActionWithBucketAndKey("GetObject", HTTP_GET, input.Bucket, input.Key, input, output, extensions)
+	err = obsClient.doActionWithBucketAndKeyWithProgress(GET_OBJECT, HTTP_GET, input.Bucket, input.Key, input, output, extensions, nil)
 	if err != nil {
 		output = nil
-	} else {
-		ParseGetObjectOutput(output)
+		return
 	}
+
+	ParseGetObjectOutput(output)
+	listener := obsClient.getProgressListener(extensions)
+	if listener != nil {
+		output.Body = TeeReader(output.Body, output.ContentLength, listener, nil)
+	}
+	return
+}
+
+func (obsClient ObsClient) GetObjectWithoutProgress(input *GetObjectInput, extensions ...extensionOptions) (output *GetObjectOutput, err error) {
+	if input == nil {
+		return nil, errors.New("GetObjectInput is nil")
+	}
+	output = &GetObjectOutput{}
+	err = obsClient.doActionWithBucketAndKeyWithProgress(GET_OBJECT, HTTP_GET, input.Bucket, input.Key, input, output, extensions, nil)
+	if err != nil {
+		output = nil
+		return
+	}
+
+	ParseGetObjectOutput(output)
 	return
 }
 
@@ -239,7 +285,7 @@ func (obsClient ObsClient) PutObject(input *PutObjectInput, extensions ...extens
 	}
 
 	if input.ContentType == "" && input.Key != "" {
-		if contentType, ok := mimeTypes[strings.ToLower(input.Key[strings.LastIndex(input.Key, ".")+1:])]; ok {
+		if contentType, ok := GetContentType(input.Key); ok {
 			input.ContentType = contentType
 		}
 	}
@@ -253,24 +299,27 @@ func (obsClient ObsClient) PutObject(input *PutObjectInput, extensions ...extens
 			input.Body = &readerWrapper{reader: input.Body, totalCount: input.ContentLength}
 		}
 	}
+
+	listener := obsClient.getProgressListener(extensions)
 	if repeatable {
-		err = obsClient.doActionWithBucketAndKey("PutObject", HTTP_PUT, input.Bucket, input.Key, input, output, extensions)
+		err = obsClient.doActionWithBucketAndKeyWithProgress(PUT_OBJECT, HTTP_PUT, input.Bucket, input.Key, input, output, extensions, listener)
 	} else {
-		err = obsClient.doActionWithBucketAndKeyUnRepeatable("PutObject", HTTP_PUT, input.Bucket, input.Key, input, output, extensions)
+		err = obsClient.doActionWithBucketAndKeyUnRepeatableWithProgress(PUT_OBJECT, HTTP_PUT, input.Bucket, input.Key, input, output, extensions, listener)
 	}
 	if err != nil {
 		output = nil
-	} else {
-		ParsePutObjectOutput(output)
+		return
 	}
+	ParsePutObjectOutput(output)
+	output.ObjectUrl = fmt.Sprintf("%s/%s/%s", obsClient.conf.endpoint, input.Bucket, input.Key)
 	return
 }
 
 func (obsClient ObsClient) getContentType(input *PutObjectInput, sourceFile string) (contentType string) {
-	if contentType, ok := mimeTypes[strings.ToLower(input.Key[strings.LastIndex(input.Key, ".")+1:])]; ok {
+	if contentType, ok := GetContentType(input.Key); ok {
 		return contentType
 	}
-	if contentType, ok := mimeTypes[strings.ToLower(sourceFile[strings.LastIndex(sourceFile, ".")+1:])]; ok {
+	if contentType, ok := GetContentType(sourceFile); ok {
 		return contentType
 	}
 	return
@@ -349,14 +398,17 @@ func (obsClient ObsClient) PutFile(input *PutFileInput, extensions ...extensionO
 	if obsClient.isGetContentType(_input) {
 		_input.ContentType = obsClient.getContentType(_input, sourceFile)
 	}
-
+	listener := obsClient.getProgressListener(extensions)
 	output = &PutObjectOutput{}
-	err = obsClient.doActionWithBucketAndKey("PutFile", HTTP_PUT, _input.Bucket, _input.Key, _input, output, extensions)
+	err = obsClient.doActionWithBucketAndKeyWithProgress(PUT_FILE, HTTP_PUT, _input.Bucket, _input.Key, _input, output, extensions, listener)
+
 	if err != nil {
 		output = nil
-	} else {
-		ParsePutObjectOutput(output)
+		return
 	}
+
+	ParsePutObjectOutput(output)
+	output.ObjectUrl = fmt.Sprintf("%s/%s/%s", obsClient.conf.endpoint, input.Bucket, input.Key)
 	return
 }
 
@@ -405,17 +457,16 @@ func (obsClient ObsClient) AppendObject(input *AppendObjectInput, extensions ...
 			input.Body = &readerWrapper{reader: input.Body, totalCount: input.ContentLength}
 		}
 	}
+	listener := obsClient.getProgressListener(extensions)
+
 	if repeatable {
-		err = obsClient.doActionWithBucketAndKey("AppendObject", HTTP_POST, input.Bucket, input.Key, input, output, extensions)
+		err = obsClient.doActionWithBucketAndKeyWithProgress(APPEND_OBJECT, HTTP_POST, input.Bucket, input.Key, input, output, extensions, listener)
 	} else {
-		err = obsClient.doActionWithBucketAndKeyUnRepeatable("AppendObject", HTTP_POST, input.Bucket, input.Key, input, output, extensions)
+		err = obsClient.doActionWithBucketAndKeyUnRepeatableWithProgress(APPEND_OBJECT, HTTP_POST, input.Bucket, input.Key, input, output, extensions, listener)
 	}
-	if err != nil {
+
+	if err != nil || ParseAppendObjectOutput(output) != nil {
 		output = nil
-	} else {
-		if err = ParseAppendObjectOutput(output); err != nil {
-			output = nil
-		}
 	}
 	return
 }
@@ -474,6 +525,42 @@ func (obsClient ObsClient) RenameFolder(input *RenameFolderInput, extensions ...
 	}
 	output = &RenameFolderOutput{}
 	err = obsClient.doActionWithBucketAndKey("RenameFolder", HTTP_POST, input.Bucket, input.Key, input, output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+func (obsClient ObsClient) SetDirAccesslabel(input *SetDirAccesslabelInput, extensions ...extensionOptions) (output *BaseModel, err error) {
+	if input == nil {
+		return nil, errors.New("SetDirAccesslabelInput is nil")
+	}
+	output = &BaseModel{}
+	err = obsClient.doActionWithBucketAndKeyV2("SetDirAccesslabel", HTTP_PUT, input.Bucket, input.Key, input, output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+func (obsClient ObsClient) GetDirAccesslabel(input *GetDirAccesslabelInput, extensions ...extensionOptions) (output *GetDirAccesslabelOutput, err error) {
+	if input == nil {
+		return nil, errors.New("GetDirAccesslabelInput is nil")
+	}
+	output = &GetDirAccesslabelOutput{}
+	err = obsClient.doActionWithBucketAndKeyV2("GetDirAccesslabel", HTTP_GET, input.Bucket, input.Key, input, output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+func (obsClient ObsClient) DeleteDirAccesslabel(input *DeleteDirAccesslabelInput, extensions ...extensionOptions) (output *BaseModel, err error) {
+	if input == nil {
+		return nil, errors.New("DeleteDirAccesslabelInput is nil")
+	}
+	output = &BaseModel{}
+	err = obsClient.doActionWithBucketAndKeyV2("DeleteDirAccesslabel", HTTP_DELETE, input.Bucket, input.Key, input, output, extensions)
 	if err != nil {
 		output = nil
 	}

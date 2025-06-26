@@ -1,14 +1,14 @@
-export VERSION := v0.3.0
-export GO111MODULE ?= on
+export VERSION := v0.4.0
+export GOBIN = $(shell pwd)/bin
 OWNER ?= elastic
 REPO ?= go-licenser
 TEST_UNIT_FLAGS ?= -timeout 10s -p 4 -race -cover
 TEST_UNIT_PACKAGE ?= ./...
-GOLINT_PRESENT := $(shell command -v golint 2> /dev/null)
-GOIMPORTS_PRESENT := $(shell command -v goimports 2> /dev/null)
-GORELEASER_PRESENT := $(shell command -v goreleaser 2> /dev/null)
 RELEASED = $(shell git tag -l $(VERSION))
 DEFAULT_LDFLAGS ?= -X main.version=$(VERSION)-dev -X main.commit=$(shell git rev-parse HEAD)
+VERSION_STATICCHECK = 2023.1.3
+VERSION_GOIMPORT = v0.1.12
+VERSION_GORELEASER:=v0.184.0
 
 define HELP
 /////////////////////////////////////////
@@ -22,7 +22,6 @@ define HELP
 
 ## Development targets
 
-- deps:                   It will install the dependencies required to run developemtn targets.
 - unit:                   Runs the unit tests.
 - lint:                   Runs the linters.
 - format:                 Formats the source files according to gofmt, goimports and go-licenser.
@@ -41,23 +40,6 @@ export HELP
 help:
 	@ echo "$$HELP"
 
-.PHONY: deps
-deps:
-ifndef GOLINT_PRESENT
-	@ go get -u golang.org/x/lint/golint
-endif
-ifndef GOIMPORTS_PRESENT
-	@ go get -u golang.org/x/tools/cmd/goimports
-endif
-
-.PHONY: release_deps
-release_deps:
-ifndef GORELEASER_PRESENT
-	@ echo "-> goreleaser not found in path, please install it following the instructions:"
-	@ echo "-> https://goreleaser.com/introduction"
-	@ exit 1
-endif
-
 .PHONY: update-golden-files
 update-golden-files:
 	$(eval GOLDEN_FILE_PACKAGES := "github.com/$(OWNER)/$(REPO)")
@@ -68,39 +50,39 @@ unit:
 	@ go test $(TEST_UNIT_FLAGS) $(TEST_UNIT_PACKAGE)
 
 .PHONY: build
-build: deps
+build:
 	@ go build -o bin/$(REPO) -ldflags="$(DEFAULT_LDFLAGS)"
 
 .PHONY: install
-install: deps
+install:
 	@ go install
 
 .PHONY: lint
 lint: build
-	@ golint -set_exit_status $(shell go list ./...)
+	@ go run honnef.co/go/tools/cmd/staticcheck@$(VERSION_STATICCHECK)
 	@ gofmt -d -e -s .
-	@ ./bin/go-licenser -d -exclude golden
+	@ $(GOBIN)/go-licenser -d -exclude golden
 
 .PHONY: format
-format: deps build
+format: build
 	@ gofmt -e -w -s .
-	@ goimports -w .
-	@ ./bin/go-licenser -exclude golden
+	@ go run golang.org/x/tools/cmd/goimports@$(VERSION_GOIMPORT) -w .
+	@ $(GOBIN)/go-licenser -exclude golden
 
 .PHONY: release
-release: deps release_deps
+release:
 	@ echo "-> Releasing $(REPO) $(VERSION)..."
 	@ git fetch upstream
 ifeq ($(strip $(RELEASED)),)
 	@ echo "-> Creating and pushing a new tag $(VERSION)..."
 	@ git tag $(VERSION)
 	@ git push upstream $(VERSION)
-	@ goreleaser release --rm-dist
+	@ go run github.com/goreleaser/goreleaser@$(VERSION_GORELEASER) release --skip-validate --rm-dist
 else
 	@ echo "-> git tag $(VERSION) already present, skipping release..."
 endif
 
 .PHONY: snapshot
-snapshot: deps release_deps
+snapshot:
 	@ echo "-> Snapshotting $(REPO) $(VERSION)..."
-	@ goreleaser release --snapshot --rm-dist
+	@ go run github.com/goreleaser/goreleaser@$(VERSION_GORELEASER) release --snapshot --rm-dist

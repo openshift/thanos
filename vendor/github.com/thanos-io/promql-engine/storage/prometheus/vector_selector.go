@@ -9,16 +9,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/efficientgo/core/errors"
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/query"
 
+	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-
-	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/query"
 )
 
 type vectorScanner struct {
@@ -28,7 +28,7 @@ type vectorScanner struct {
 }
 
 type vectorSelector struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	storage  SeriesSelector
 	scanners []vectorScanner
@@ -82,7 +82,7 @@ func NewVectorSelector(
 
 		selectTimestamp: selectTimestamp,
 	}
-	o.OperatorTelemetry = model.NewTelemetry(o, queryOpts)
+	o.OperatorTelemetry = telemetry.NewTelemetry(o, queryOpts)
 
 	// For instant queries, set the step to a positive value
 	// so that the operator can terminate.
@@ -235,13 +235,12 @@ func selectPoint(it *storage.MemoizedSeriesIterator, ts, lookbackDelta, offset i
 	if valueType == chunkenc.ValNone || t > refTime {
 		var ok bool
 		t, v, fh, ok = it.PeekPrev()
-		if !ok || t < refTime-lookbackDelta {
+		if !ok || t <= refTime-lookbackDelta {
 			return 0, 0, nil, false, nil
 		}
 	}
 	if value.IsStaleNaN(v) || (fh != nil && value.IsStaleNaN(fh.Sum)) {
 		return 0, 0, nil, false, nil
 	}
-
 	return t, v, fh, true, nil
 }
