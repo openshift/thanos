@@ -109,15 +109,6 @@ func (w *Writer) String(s string) {
 
 const chars = "0123456789abcdef"
 
-func isNotEscapedSingleChar(c byte, escapeHTML bool) bool {
-	// Note: might make sense to use a table if there are more chars to escape. With 4 chars
-	// it benchmarks the same.
-	if escapeHTML {
-		return c != '<' && c != '>' && c != '&' && c != '\\' && c != '"' && c >= 0x20 && c < utf8.RuneSelf
-	}
-	return c != '\\' && c != '"' && c >= 0x20 && c < utf8.RuneSelf
-}
-
 // StringContents is the same as String, but without the surrounding quotes.
 func (w *Writer) StringContents(s string) {
 	// Portions of the string that contain no escapes are appended as byte slices.
@@ -125,26 +116,30 @@ func (w *Writer) StringContents(s string) {
 	p := 0 // last non-escape symbol
 
 	for i := 0; i < len(s); {
-		c := s[i]
 
-		if isNotEscapedSingleChar(c, true) {
-			// single-width character, no escaping is required
-			i++
-			continue
-		} else if c < utf8.RuneSelf {
+		if c := s[i]; c < utf8.RuneSelf {
+			if htmlSafeSet[c] {
+				i++
+				continue
+			}
+
 			// single-with character, need to escape
 			w.RawString(s[p:i])
 			switch c {
-			case '\t':
-				w.RawString(`\t`)
-			case '\r':
-				w.RawString(`\r`)
-			case '\n':
-				w.RawString(`\n`)
 			case '\\':
 				w.RawString(`\\`)
 			case '"':
 				w.RawString(`\"`)
+			case '\b':
+				w.RawString(`\b`)
+			case '\f':
+				w.RawString(`\f`)
+			case '\n':
+				w.RawString(`\n`)
+			case '\r':
+				w.RawString(`\r`)
+			case '\t':
+				w.RawString(`\t`)
 			default:
 				w.RawString(`\u00`)
 				w.RawByte(chars[c>>4])

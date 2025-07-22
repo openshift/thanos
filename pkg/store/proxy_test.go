@@ -6,22 +6,20 @@ package store
 import (
 	"context"
 	"fmt"
-	"strings"
-
-	"github.com/pkg/errors"
-
 	"math"
 	"math/rand"
-	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
@@ -29,11 +27,10 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"google.golang.org/grpc"
 
-	"github.com/efficientgo/core/testutil"
-
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
@@ -810,11 +807,6 @@ func TestProxyStore_Series(t *testing.T) {
 func TestProxyStore_SeriesSlowStores(t *testing.T) {
 	t.Parallel()
 
-	enable := os.Getenv("THANOS_ENABLE_STORE_READ_TIMEOUT_TESTS")
-	if enable == "" {
-		t.Skip("enable THANOS_ENABLE_STORE_READ_TIMEOUT_TESTS to run store-read-timeout tests")
-	}
-
 	for _, tc := range []struct {
 		title          string
 		storeAPIs      []Client
@@ -915,7 +907,7 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 				PartialResponseDisabled: true,
 				PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
 			},
-			expectedErr: errors.New("rpc error: code = Aborted desc = failed to receive any data in 4s from test: context canceled"),
+			expectedErr: errors.New("rpc error: code = Aborted desc = warning"),
 		},
 		{
 			title: "partial response disabled; 1st store is fast, 2nd store is slow;",
@@ -937,7 +929,7 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 							storepb.NewWarnSeriesResponse(errors.New("warning")),
 							storeSeriesResponse(t, labels.FromStrings("a", "b"), []sample{{1, 1}, {2, 2}, {3, 3}}),
 						},
-						RespDuration: 10 * time.Second,
+						RespDuration: 2 * time.Second,
 					},
 					ExtLset: []labels.Labels{labels.FromStrings("ext", "1")},
 					MinTime: 1,
@@ -1209,21 +1201,13 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 				},
 			},
 			req: &storepb.SeriesRequest{
-				MinTime:  1,
-				MaxTime:  300,
-				Matchers: []storepb.LabelMatcher{{Name: "ext", Value: "1", Type: storepb.LabelMatcher_EQ}},
+				MinTime:                 1,
+				MaxTime:                 300,
+				Matchers:                []storepb.LabelMatcher{{Name: "ext", Value: "1", Type: storepb.LabelMatcher_EQ}},
+				PartialResponseDisabled: true,
+				PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
 			},
-			expectedSeries: []rawSeries{
-				{
-					lset:   labels.FromStrings("a", "b"),
-					chunks: [][]sample{{{1, 1}, {2, 2}, {3, 3}}},
-				},
-				{
-					lset:   labels.FromStrings("b", "c"),
-					chunks: [][]sample{{{1, 1}, {2, 2}, {3, 3}}},
-				},
-			},
-			expectedWarningsLen: 3,
+			expectedErr: errors.New("rpc error: code = Aborted desc = warning"),
 		},
 		{
 			title: "partial response disabled; all stores respond 3s",
@@ -1255,7 +1239,7 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 					chunks: [][]sample{{{1, 1}, {2, 2}, {3, 3}}},
 				},
 			},
-			expectedErr: errors.New("rpc error: code = Aborted desc = receive series from test: context deadline exceeded"),
+			expectedErr: errors.New("rpc error: code = Aborted desc = receive series from : context deadline exceeded"),
 		},
 		{
 			title: "partial response enabled; all stores respond 3s",
@@ -1294,17 +1278,25 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 			},
 			expectedSeries: []rawSeries{
 				{
-					lset:   labels.FromStrings("a", "b"),
-					chunks: [][]sample{{{1, 1}, {2, 2}, {3, 3}}},
+					lset: labels.FromStrings("a", "b"),
+					chunks: [][]sample{
+						{{1, 1}, {2, 2}, {3, 3}},
+					},
 				},
 				{
-					lset:   labels.FromStrings("b", "c"),
-					chunks: [][]sample{{{1, 1}, {2, 2}, {3, 3}}},
+					lset: labels.FromStrings("b", "c"),
+					chunks: [][]sample{
+						{{1, 1}, {2, 2}, {3, 3}},
+					},
 				},
 			},
 			expectedWarningsLen: 2,
 		},
 	} {
+
+		options := []ProxyStoreOption{
+			WithLazyRetrievalMaxBufferedResponsesForProxy(1),
+		}
 		if ok := t.Run(tc.title, func(t *testing.T) {
 			for _, strategy := range []RetrievalStrategy{EagerRetrieval, LazyRetrieval} {
 				if ok := t.Run(string(strategy), func(t *testing.T) {
@@ -1314,6 +1306,7 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 						component.Query,
 						tc.selectorLabels,
 						4*time.Second, strategy,
+						options...,
 					)
 
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2086,6 +2079,47 @@ func BenchmarkProxySeries(b *testing.B) {
 	})
 }
 
+func BenchmarkProxySeriesRegex(b *testing.B) {
+	tb := testutil.NewTB(b)
+
+	cache, err := storecache.NewMatchersCache(storecache.WithSize(200))
+	testutil.Ok(b, err)
+
+	q := NewProxyStore(nil,
+		nil,
+		func() []Client { return nil },
+		component.Query,
+		labels.EmptyLabels(), 0*time.Second, EagerRetrieval,
+		WithMatcherCache(cache),
+	)
+
+	words := []string{"foo", "bar", "baz", "qux", "quux", "corge", "grault", "garply", "waldo", "fred", "plugh", "xyzzy", "thud"}
+	bigRegex := strings.Builder{}
+	for i := 0; i < 200; i++ {
+		bigRegex.WriteString(words[rand.Intn(len(words))])
+		bigRegex.WriteString("|")
+	}
+
+	matchers := []storepb.LabelMatcher{
+		{Type: storepb.LabelMatcher_RE, Name: "foo", Value: ".*"},
+		{Type: storepb.LabelMatcher_RE, Name: "bar", Value: bigRegex.String()},
+	}
+
+	// Create a regex that matches all series.
+	req := &storepb.SeriesRequest{
+		MinTime:  0,
+		MaxTime:  math.MaxInt64,
+		Matchers: matchers,
+	}
+	s := newStoreSeriesServer(context.Background())
+
+	tb.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		testutil.Ok(b, q.Series(req, s))
+	}
+}
+
 func benchProxySeries(t testutil.TB, totalSamples, totalSeries int) {
 	tmpDir := t.TempDir()
 
@@ -2136,6 +2170,7 @@ func benchProxySeries(t testutil.TB, totalSamples, totalSeries int) {
 		responseTimeout:   5 * time.Second,
 		retrievalStrategy: EagerRetrieval,
 		tsdbSelector:      DefaultSelector,
+		matcherCache:      storecache.NoopMatchersCache,
 	}
 
 	var allResps []*storepb.SeriesResponse
@@ -2272,6 +2307,7 @@ func TestProxyStore_NotLeakingOnPrematureFinish(t *testing.T) {
 					responseTimeout:   50 * time.Millisecond,
 					retrievalStrategy: respStrategy,
 					tsdbSelector:      DefaultSelector,
+					matcherCache:      storecache.NoopMatchersCache,
 				}
 
 				ctx, cancel := context.WithCancel(context.Background())
@@ -2309,6 +2345,7 @@ func TestProxyStore_NotLeakingOnPrematureFinish(t *testing.T) {
 					responseTimeout:   50 * time.Millisecond,
 					retrievalStrategy: respStrategy,
 					tsdbSelector:      DefaultSelector,
+					matcherCache:      storecache.NoopMatchersCache,
 				}
 
 				ctx := context.Background()
@@ -2469,5 +2506,4 @@ func TestDedupRespHeap_Deduplication(t *testing.T) {
 			tcase.testFn(tcase.responses, h)
 		})
 	}
-
 }

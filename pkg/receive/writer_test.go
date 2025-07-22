@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thanos-io/thanos/pkg/receive/writecapnp"
-
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/pkg/errors"
@@ -24,6 +22,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/receive/writecapnp"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
@@ -327,6 +326,31 @@ func TestWriter(t *testing.T) {
 				},
 			},
 		},
+		"should succeed on series with utf-8 labels": {
+			reqs: []*prompb.WriteRequest{
+				{
+					Timeseries: []prompb.TimeSeries{
+						{
+							Labels: append(lbls,
+								labelpb.ZLabel{Name: "label:name", Value: "label:value"},   // UTF-8 instance name
+								labelpb.ZLabel{Name: "region:name", Value: "region:value"}, // UTF-8 region name
+							),
+							Samples: []prompb.Sample{{Value: 1, Timestamp: 10}},
+						},
+					},
+				},
+			},
+			expectedErr: nil,
+			expectedIngested: []prompb.TimeSeries{
+				{
+					Labels: append(lbls,
+						labelpb.ZLabel{Name: "label:name", Value: "label:value"},
+						labelpb.ZLabel{Name: "region:name", Value: "region:value"},
+					),
+					Samples: []prompb.Sample{{Value: 1, Timestamp: 10}},
+				},
+			},
+		},
 	}
 
 	for testName, testData := range tests {
@@ -415,6 +439,7 @@ func setupMultitsdb(t *testing.T, maxExemplars int64) (log.Logger, *MultiTSDB, A
 		"tenant_id",
 		nil,
 		false,
+		false,
 		metadata.NoneFunc,
 	)
 	t.Cleanup(func() { testutil.Ok(t, m.Close()) })
@@ -479,6 +504,7 @@ func benchmarkWriter(b *testing.B, labelsNum int, seriesNum int, generateHistogr
 		labels.FromStrings("replica", "01"),
 		"tenant_id",
 		nil,
+		false,
 		false,
 		metadata.NoneFunc,
 	)

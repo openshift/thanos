@@ -29,11 +29,11 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 
-	timestamppb "github.com/golang/protobuf/ptypes/timestamp"
-	wrapperspb "github.com/golang/protobuf/ptypes/wrappers"
-	tracepb "google.golang.org/genproto/googleapis/devtools/cloudtrace/v2"
+	"cloud.google.com/go/trace/apiv2/tracepb"
 	codepb "google.golang.org/genproto/googleapis/rpc/code"
 	statuspb "google.golang.org/genproto/googleapis/rpc/status"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping"
 )
@@ -41,7 +41,7 @@ import (
 const (
 	maxAnnotationEventsPerSpan = 32
 	// TODO(ymotongpoo): uncomment this after gRPC trace get supported.
-	// maxMessageEventsPerSpan    = 128
+	// maxMessageEventsPerSpan    = 128.
 	maxAttributeStringValue = 256
 	maxNumLinks             = 128
 	agentLabel              = "g.co/agent"
@@ -61,9 +61,6 @@ const (
 	labelHTTPStatusCode = `/http/status_code`
 	labelHTTPPath       = `/http/path`
 	labelHTTPUserAgent  = `/http/user_agent`
-	// This is prefixed for google app engine, but translates to the service
-	// in the trace UI
-	labelService = `g.co/gae/app/module`
 
 	instrumentationScopeNameAttribute    = "otel.scope.name"
 	instrumentationScopeVersionAttribute = "otel.scope.version"
@@ -71,7 +68,7 @@ const (
 
 var userAgent = fmt.Sprintf("opentelemetry-go %s; google-cloud-trace-exporter %s", otel.Version(), Version())
 
-// Adapters for using resourcemapping library
+// Adapters for using resourcemapping library.
 type attrs struct {
 	Attrs []attribute.KeyValue
 }
@@ -108,17 +105,17 @@ func attributeWithLabelsFromResources(sd sdktrace.ReadOnlySpan) []attribute.KeyV
 	// Instrumentation Scope attributes come next.
 	if !uniqueAttrs[instrumentationScopeNameAttribute] {
 		uniqueAttrs[instrumentationScopeNameAttribute] = true
-		scopeNameAttrs := attribute.String(instrumentationScopeNameAttribute, sd.InstrumentationLibrary().Name)
+		scopeNameAttrs := attribute.String(instrumentationScopeNameAttribute, sd.InstrumentationScope().Name)
 		attributes = append(attributes, scopeNameAttrs)
 	}
-	if !uniqueAttrs[instrumentationScopeVersionAttribute] && strings.Compare("", sd.InstrumentationLibrary().Version) != 0 {
+	if !uniqueAttrs[instrumentationScopeVersionAttribute] && strings.Compare("", sd.InstrumentationScope().Version) != 0 {
 		uniqueAttrs[instrumentationScopeVersionAttribute] = true
-		scopeVersionAttrs := attribute.String(instrumentationScopeVersionAttribute, sd.InstrumentationLibrary().Version)
+		scopeVersionAttrs := attribute.String(instrumentationScopeVersionAttribute, sd.InstrumentationScope().Version)
 		attributes = append(attributes, scopeVersionAttrs)
 	}
 
 	// Monitored resource attributes (`g.co/r/{resource_type}/{resource_label}`) come next.
-	gceResource := resourcemapping.ResourceAttributesToMonitoredResource(&attrs{
+	gceResource := resourcemapping.ResourceAttributesToMonitoringMonitoredResource(&attrs{
 		Attrs: sd.Resource().Attributes(),
 	})
 	for key, value := range gceResource.Labels {
@@ -157,13 +154,14 @@ func (e *traceExporter) protoFromReadOnlySpan(s sdktrace.ReadOnlySpan) (*tracepb
 	if s.Parent().SpanID() != s.SpanContext().SpanID() && s.Parent().SpanID().IsValid() {
 		sp.ParentSpanId = s.Parent().SpanID().String()
 	}
-	if s.Status().Code == codes.Ok {
+	switch s.Status().Code {
+	case codes.Ok:
 		sp.Status = &statuspb.Status{Code: int32(codepb.Code_OK)}
-	} else if s.Status().Code == codes.Unset {
+	case codes.Unset:
 		// Don't set status code.
-	} else if s.Status().Code == codes.Error {
+	case codes.Error:
 		sp.Status = &statuspb.Status{Code: int32(codepb.Code_UNKNOWN), Message: s.Status().Description}
-	} else {
+	default:
 		sp.Status = &statuspb.Status{Code: int32(codepb.Code_UNKNOWN)}
 	}
 
@@ -305,8 +303,6 @@ func defaultAttributeMapping(k attribute.Key) attribute.Key {
 		return labelHTTPUserAgent
 	case statusCodeAttribute:
 		return labelHTTPStatusCode
-	case serviceAttribute:
-		return labelService
 	}
 	return k
 }
@@ -343,11 +339,10 @@ func trunc(s string, limit int) *tracepb.TruncatableString {
 		b := []byte(s[:limit])
 		for {
 			r, size := utf8.DecodeLastRune(b)
-			if r == utf8.RuneError && size == 1 {
-				b = b[:len(b)-1]
-			} else {
+			if r != utf8.RuneError || size != 1 {
 				break
 			}
+			b = b[:len(b)-1]
 		}
 		return &tracepb.TruncatableString{
 			Value:              string(b),
