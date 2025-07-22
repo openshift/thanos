@@ -16,16 +16,14 @@
 // under the License.
 
 //go:build aix && ppc64 && cgo
-// +build aix,ppc64,cgo
 
 package aix
 
 import (
-	"io/ioutil"
+	"fmt"
+	"os"
 	"strconv"
 	"strings"
-
-	"github.com/pkg/errors"
 
 	"github.com/elastic/go-sysinfo/types"
 )
@@ -42,9 +40,9 @@ func getOSInfo() (*types.OSInfo, error) {
 	}
 
 	// Retrieve build version from "/proc/version".
-	procVersion, err := ioutil.ReadFile("/proc/version")
+	procVersion, err := os.ReadFile("/proc/version")
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get OS info: cannot open /proc/version")
+		return nil, fmt.Errorf("failed to get OS info: cannot open /proc/version: %w", err)
 	}
 	build := strings.SplitN(string(procVersion), "\n", 4)[2]
 

@@ -1,5 +1,5 @@
 run:
-  deadline: 5m
+  timeout: 5m
 
 linters:
   disable-all: true
@@ -8,15 +8,15 @@ linters:
     - goconst
     - gocyclo
     - gofmt
-    - golint
+    - revive
     - govet
     - ineffassign
     - lll
     - misspell
     - nakedret
-    - structcheck
+    # Replaces structcheck and varcheck.
+    - unused
     - unparam
-    - varcheck
 
 linters-settings:
   dupl:
@@ -24,6 +24,6 @@ linters-settings:
   lll:
     line-length: 170
   gocyclo:
-    min-complexity: 20
+    min-complexity: 25
   golint:
     min-confidence: 0.85

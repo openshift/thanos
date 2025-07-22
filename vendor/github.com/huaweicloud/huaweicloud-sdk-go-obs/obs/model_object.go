@@ -9,6 +9,7 @@
 // under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 // CONDITIONS OF ANY KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations under the License.
+
 package obs
 
 import (
@@ -34,6 +35,10 @@ type ListObjectsInput struct {
 	Marker string
 }
 
+type ListPosixObjectsInput struct {
+	ListObjectsInput
+}
+
 // ListObjectsOutput is the result of ListObjects function
 type ListObjectsOutput struct {
 	BaseModel
@@ -49,6 +54,20 @@ type ListObjectsOutput struct {
 	CommonPrefixes []string  `xml:"CommonPrefixes>Prefix"`
 	Location       string    `xml:"-"`
 	EncodingType   string    `xml:"EncodingType,omitempty"`
+}
+
+type ListPosixObjectsOutput struct {
+	ListObjectsOutput
+	CommonPrefixes []CommonPrefix `xml:"CommonPrefixes"`
+}
+
+type CommonPrefix struct {
+	XMLName      xml.Name  `xml:"CommonPrefixes"`
+	Prefix       string    `xml:"Prefix"`
+	MTime        string    `xml:"MTime"`
+	Mode         string    `xml:"Mode"`
+	InodeNo      string    `xml:"InodeNo"`
+	LastModified time.Time `xml:"LastModified"`
 }
 
 // ListVersionsInput is the input parameter of ListVersions function
@@ -157,6 +176,7 @@ type GetObjectMetadataInput struct {
 // GetObjectMetadataOutput is the result of GetObjectMetadata function
 type GetObjectMetadataOutput struct {
 	BaseModel
+	HttpHeader
 	VersionId               string
 	WebsiteRedirectLocation string
 	Expiration              string
@@ -165,7 +185,6 @@ type GetObjectMetadataOutput struct {
 	NextAppendPosition      string
 	StorageClass            StorageClassType
 	ContentLength           int64
-	ContentType             string
 	ETag                    string
 	AllowOrigin             string
 	AllowHeader             string
@@ -192,6 +211,7 @@ type GetObjectInput struct {
 	GetObjectMetadataInput
 	IfMatch                    string
 	IfNoneMatch                string
+	AcceptEncoding             string
 	IfUnmodifiedSince          time.Time
 	IfModifiedSince            time.Time
 	RangeStart                 int64
@@ -208,13 +228,9 @@ type GetObjectInput struct {
 // GetObjectOutput is the result of GetObject function
 type GetObjectOutput struct {
 	GetObjectMetadataOutput
-	DeleteMarker       bool
-	CacheControl       string
-	ContentDisposition string
-	ContentEncoding    string
-	ContentLanguage    string
-	Expires            string
-	Body               io.ReadCloser
+	DeleteMarker bool
+	Expires      string
+	Body         io.ReadCloser
 }
 
 // ObjectOperationInput defines the object operation properties
@@ -236,10 +252,10 @@ type ObjectOperationInput struct {
 // PutObjectBasicInput defines the basic object operation properties
 type PutObjectBasicInput struct {
 	ObjectOperationInput
-	ContentType     string
-	ContentMD5      string
-	ContentLength   int64
-	ContentEncoding string
+	HttpHeader
+	ContentMD5    string
+	ContentSHA256 string
+	ContentLength int64
 }
 
 // PutObjectInput is the input parameter of PutObject function
@@ -285,14 +301,10 @@ type CopyObjectInput struct {
 	CopySourceIfUnmodifiedSince time.Time
 	CopySourceIfModifiedSince   time.Time
 	SourceSseHeader             ISseHeader
-	CacheControl                string
-	ContentDisposition          string
-	ContentEncoding             string
-	ContentLanguage             string
-	ContentType                 string
 	Expires                     string
 	MetadataDirective           MetadataDirectiveType
 	SuccessActionRedirect       string
+	HttpHeader
 }
 
 // CopyObjectOutput is the result of CopyObject function
@@ -309,13 +321,13 @@ type CopyObjectOutput struct {
 // UploadFileInput is the input parameter of UploadFile function
 type UploadFileInput struct {
 	ObjectOperationInput
-	ContentType      string
 	UploadFile       string
 	PartSize         int64
 	TaskNum          int
 	EnableCheckpoint bool
 	CheckpointFile   string
 	EncodingType     string
+	HttpHeader
 }
 
 // DownloadFileInput is the input parameter of DownloadFile function
@@ -386,4 +398,35 @@ type RenameFolderInput struct {
 
 type RenameFolderOutput struct {
 	BaseModel
+}
+
+// SetObjectMetadataInput is the input parameter of SetObjectMetadata function
+type SetObjectMetadataInput struct {
+	Bucket                  string
+	Key                     string
+	VersionId               string
+	MetadataDirective       MetadataDirectiveType
+	Expires                 string
+	WebsiteRedirectLocation string
+	StorageClass            StorageClassType
+	Metadata                map[string]string
+	HttpHeader
+}
+
+// SetObjectMetadataOutput is the result of SetObjectMetadata function
+type SetObjectMetadataOutput struct {
+	BaseModel
+	MetadataDirective MetadataDirectiveType
+	HttpHeader
+	Expires                 string
+	WebsiteRedirectLocation string
+	StorageClass            StorageClassType
+	Metadata                map[string]string
+}
+
+type CallbackInput struct {
+	CallbackUrl      string `json:"callbackUrl"`
+	CallbackHost     string `json:"callbackHost,omitempty"`
+	CallbackBody     string `json:"callbackBody"`
+	CallbackBodyType string `json:"callbackBodyType,omitempty"`
 }

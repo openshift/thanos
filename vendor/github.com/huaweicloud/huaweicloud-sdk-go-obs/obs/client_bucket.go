@@ -18,6 +18,69 @@ import (
 	"strings"
 )
 
+func (obsClient ObsClient) DeleteBucketCustomDomain(input *DeleteBucketCustomDomainInput, extensions ...extensionOptions) (output *BaseModel, err error) {
+	if input == nil {
+		return nil, errors.New("DeleteBucketCustomDomainInput is nil")
+	}
+
+	output = &BaseModel{}
+	err = obsClient.doActionWithBucket("DeleteBucketCustomDomain", HTTP_DELETE, input.Bucket, newSubResourceSerialV2(SubResourceCustomDomain, input.CustomDomain), output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+func (obsClient ObsClient) SetBucketCustomDomain(input *SetBucketCustomDomainInput, extensions ...extensionOptions) (output *BaseModel, err error) {
+	if input == nil {
+		return nil, errors.New("SetBucketCustomDomainInput is nil")
+	}
+
+	output = &BaseModel{}
+	err = obsClient.doActionWithBucket("SetBucketCustomDomain", HTTP_PUT, input.Bucket, input, output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+func (obsClient ObsClient) GetBucketCustomDomain(bucketName string, extensions ...extensionOptions) (output *GetBucketCustomDomainOutput, err error) {
+	output = &GetBucketCustomDomainOutput{}
+	err = obsClient.doActionWithBucket("GetBucketCustomDomain", HTTP_GET, bucketName, newSubResourceSerial(SubResourceCustomDomain), output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+func (obsClient ObsClient) SetBucketMirrorBackToSource(input *SetBucketMirrorBackToSourceInput, extensions ...extensionOptions) (output *BaseModel, err error) {
+
+	output = &BaseModel{}
+	err = obsClient.doActionWithBucket("SetBucketMirrorBackToSource", HTTP_PUT, input.Bucket, input, output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+func (obsClient ObsClient) DeleteBucketMirrorBackToSource(bucketName string, extensions ...extensionOptions) (output *BaseModel, err error) {
+	output = &BaseModel{}
+	err = obsClient.doActionWithBucketV2("DeleteBucketMirrorBackToSource", HTTP_DELETE, bucketName, newSubResourceSerial(SubResourceMirrorBackToSource), output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+func (obsClient ObsClient) GetBucketMirrorBackToSource(bucketName string, extensions ...extensionOptions) (output *GetBucketMirrorBackToSourceOutput, err error) {
+	output = &GetBucketMirrorBackToSourceOutput{}
+	err = obsClient.doActionWithBucketV2("GetBucketMirrorBackToSource", HTTP_GET, bucketName, newSubResourceSerial(SubResourceMirrorBackToSource), output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
 // ListBuckets lists buckets.
 //
 // You can use this API to obtain the bucket list. In the list, bucket names are displayed in lexicographical order.
@@ -260,8 +323,9 @@ func (obsClient ObsClient) getBucketACLObs(bucketName string, extensions []exten
 			tempOutput.Grantee.DisplayName = valGrant.Grantee.DisplayName
 			tempOutput.Grantee.ID = valGrant.Grantee.ID
 			tempOutput.Grantee.Type = valGrant.Grantee.Type
-			tempOutput.Grantee.URI = GroupAllUsers
-
+			if valGrant.Grantee.Canned == "Everyone" {
+				tempOutput.Grantee.URI = GroupAllUsers
+			}
 			output.Grants = append(output.Grants, tempOutput)
 		}
 	}
@@ -735,6 +799,69 @@ func (obsClient ObsClient) GetBucketFetchJob(input *GetBucketFetchJobInput, exte
 	}
 	output = &GetBucketFetchJobOutput{}
 	err = obsClient.doActionWithBucketAndKeyV2("GetBucketFetchJob", HTTP_GET, input.Bucket, string(objectKeyAsyncFetchJob)+"/"+input.JobID, input, output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+// PutBucketPublicAccessBlock sets the bucket Block Public Access.
+//
+// You can use this API to set a bucket Block Public Access.
+func (obsClient ObsClient) PutBucketPublicAccessBlock(input *PutBucketPublicAccessBlockInput, extensions ...extensionOptions) (output *BaseModel, err error) {
+	if input == nil {
+		return nil, errors.New("PutBucketPublicAccessBlockInput is nil")
+	}
+	output = &BaseModel{}
+	err = obsClient.doActionWithBucket("PutBucketPublicAccessBlock", HTTP_PUT, input.Bucket, input, output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+// GetBucketPublicAccessBlock gets the bucket Block Public Access.
+//
+// You can use this API to get a bucket Block Public Access.
+func (obsClient ObsClient) GetBucketPublicAccessBlock(bucketName string, extensions ...extensionOptions) (output *GetBucketPublicAccessBlockOutput, err error) {
+	output = &GetBucketPublicAccessBlockOutput{}
+	err = obsClient.doActionWithBucket("GetBucketPublicAccessBlock", HTTP_GET, bucketName, newSubResourceSerial(SubResourcePublicAccessBlock), output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+// DeleteBucketPublicAccessBlock deletes the bucket Block Public Access.
+//
+// You can use this API to delete the Block Public Access of a bucket.
+func (obsClient ObsClient) DeleteBucketPublicAccessBlock(bucketName string, extensions ...extensionOptions) (output *BaseModel, err error) {
+	output = &BaseModel{}
+	err = obsClient.doActionWithBucket("DeleteBucketPublicAccessBlock", HTTP_DELETE, bucketName, newSubResourceSerial(SubResourcePublicAccessBlock), output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+// GetBucketPolicyPublicStatus get the bucket Policy status.
+//
+// You can use this API to get a bucket Policy status.
+func (obsClient ObsClient) GetBucketPolicyPublicStatus(bucketName string, extensions ...extensionOptions) (output *GetBucketPolicyPublicStatusOutput, err error) {
+	output = &GetBucketPolicyPublicStatusOutput{}
+	err = obsClient.doActionWithBucket("GetBucketPolicyPublicStatus", HTTP_GET, bucketName, newSubResourceSerial(SubResourceBucketPolicyPublicStatus), output, extensions)
+	if err != nil {
+		output = nil
+	}
+	return
+}
+
+// GetBucketPublicStatus get the bucket public status.
+//
+// You can use this API to get a bucket public status.
+func (obsClient ObsClient) GetBucketPublicStatus(bucketName string, extensions ...extensionOptions) (output *GetBucketPublicStatusOutput, err error) {
+	output = &GetBucketPublicStatusOutput{}
+	err = obsClient.doActionWithBucket("GetBucketPublicStatus", HTTP_GET, bucketName, newSubResourceSerial(SubResourceBucketPublicStatus), output, extensions)
 	if err != nil {
 		output = nil
 	}

@@ -20,30 +20,38 @@ package linux
 import (
 	"bufio"
 	"bytes"
-	"io/ioutil"
+	"errors"
+	"fmt"
+	"os"
 	"strconv"
-
-	"github.com/pkg/errors"
 )
 
-func parseKeyValue(content []byte, separator string, callback func(key, value []byte) error) error {
-	sc := bufio.NewScanner(bytes.NewReader(content))
-	for sc.Scan() {
-		parts := bytes.SplitN(sc.Bytes(), []byte(separator), 2)
-		if len(parts) != 2 {
+// parseKeyValue parses key/val pairs separated by the provided separator from
+// each line in content and invokes the callback. White-space is trimmed from
+// val. Empty lines are ignored. All non-empty lines must contain the separator
+// otherwise an error is returned.
+func parseKeyValue(content []byte, separator byte, callback func(key, value []byte) error) error {
+	var line []byte
+
+	for len(content) > 0 {
+		line, content, _ = bytes.Cut(content, []byte{'\n'})
+		if len(line) == 0 {
 			continue
 		}
 
-		if err := callback(parts[0], bytes.TrimSpace(parts[1])); err != nil {
-			return err
+		key, value, ok := bytes.Cut(line, []byte{separator})
+		if !ok {
+			return fmt.Errorf("separator %q not found", separator)
 		}
+
+		callback(key, bytes.TrimSpace(value))
 	}
 
-	return sc.Err()
+	return nil
 }
 
 func findValue(filename, separator, key string) (string, error) {
-	content, err := ioutil.ReadFile(filename)
+	content, err := os.ReadFile(filename)
 	if err != nil {
 		return "", err
 	}
@@ -57,12 +65,12 @@ func findValue(filename, separator, key string) (string, error) {
 		}
 	}
 	if len(line) == 0 {
-		return "", errors.Errorf("%v not found", key)
+		return "", fmt.Errorf("%v not found", key)
 	}
 
 	parts := bytes.SplitN(line, []byte(separator), 2)
 	if len(parts) != 2 {
-		return "", errors.Errorf("unexpected line format for '%v'", string(line))
+		return "", fmt.Errorf("unexpected line format for '%v'", string(line))
 	}
 
 	return string(bytes.TrimSpace(parts[1])), nil
@@ -85,6 +93,7 @@ func decodeBitMap(s string, lookupName func(int) string) ([]string, error) {
 	return names, nil
 }
 
+// parses a meminfo field, returning either a raw numerical value, or the kB value converted to bytes
 func parseBytesOrNumber(data []byte) (uint64, error) {
 	parts := bytes.Fields(data)
 
@@ -94,7 +103,7 @@ func parseBytesOrNumber(data []byte) (uint64, error) {
 
 	num, err := strconv.ParseUint(string(parts[0]), 10, 64)
 	if err != nil {
-		return 0, errors.Wrap(err, "failed to parse value")
+		return 0, fmt.Errorf("failed to parse value: %w", err)
 	}
 
 	var multiplier uint64 = 1
@@ -103,7 +112,7 @@ func parseBytesOrNumber(data []byte) (uint64, error) {
 		case "kB":
 			multiplier = 1024
 		default:
-			return 0, errors.Errorf("unhandled unit %v", string(parts[1]))
+			return 0, fmt.Errorf("unhandled unit %v", string(parts[1]))
 		}
 	}
 

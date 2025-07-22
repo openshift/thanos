@@ -22,34 +22,69 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 var (
-	startPrefixes = []string{"// Copyright", "// copyright", "// Licensed", "// licensed"}
-	endPrefixes   = []string{"package ", "// Package ", "// +build ", "// Code generated", "// code generated"}
+	startPrefixes = []string{"// Copyright", "// copyright", "// Licensed", "// licensed", "// ELASTICSEARCH CONFIDENTIAL"}
+	endPrefixes   = []string{"package ", "// Package ", "// +build ", "// Code generated", "// code generated", "//go:"}
 
 	errHeaderIsTooShort = errors.New("header is too short")
+
+	defaulBufSize int
+	bufPool       = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, defaulBufSize)
+			return buf
+		},
+	}
 )
+
+func init() {
+	// Iterate over the supported licenses to make sure everything fit
+	// without any additional allocation.
+	for _, v := range Headers {
+		var l int
+		for _, v2 := range v {
+			l += len(v2)
+		}
+
+		if l > defaulBufSize {
+			defaulBufSize = l
+		}
+	}
+}
 
 // ContainsHeader reads the first N lines of a file and checks if the header
 // matches the one that is expected
 func ContainsHeader(r io.Reader, headerLines []string) bool {
-	var found []string
 	var scanner = bufio.NewScanner(r)
+	var i int
 
-	for scanner.Scan() {
-		found = append(found, scanner.Text())
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+	scanner.Buffer(buf, defaulBufSize)
+
+	for i = 0; scanner.Scan(); i++ {
+		line := scanner.Bytes()
+
+		// end of license, break out of the loop
+		if i == len(headerLines) {
+			break
+		}
+
+		// compare line by line without storing the whole file
+		// in memory
+		if !bytes.Equal(line, []byte(headerLines[i])) {
+			return false
+		}
 	}
 
-	if len(found) < len(headerLines) {
-		return false
-	}
-
-	if !reflect.DeepEqual(found[:len(headerLines)], headerLines) {
+	// file is shorter than license
+	if i < len(headerLines) {
 		return false
 	}
 
@@ -67,13 +102,13 @@ func RewriteFileWithHeader(path string, header []byte) error {
 		return err
 	}
 
-	origin, err := ioutil.ReadFile(path)
+	origin, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 
 	data := RewriteWithHeader(origin, header)
-	return ioutil.WriteFile(path, data, info.Mode())
+	return os.WriteFile(path, data, info.Mode())
 }
 
 // RewriteWithHeader rewrites the src byte buffers header with the new header.

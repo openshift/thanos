@@ -11,14 +11,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/prometheus/model/labels"
-
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/query"
+
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 type countValuesOperator struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	pool  *model.VectorPool
 	next  model.VectorOperator
@@ -50,7 +51,7 @@ func NewCountValues(pool *model.VectorPool, next model.VectorOperator, param str
 		by:         by,
 		grouping:   grouping,
 	}
-	op.OperatorTelemetry = model.NewTelemetry(op, opts)
+	op.OperatorTelemetry = telemetry.NewTelemetry(op, opts)
 
 	return op
 }
@@ -160,13 +161,25 @@ func (c *countValuesOperator) initSeriesOnce(ctx context.Context) error {
 		}
 		for i := range in {
 			ts = append(ts, in[i].T)
-			countPerHashbucket := make(map[uint64]map[float64]int, len(inputIdToHashBucket))
+			countPerHashbucket := make(map[uint64]map[string]int, len(inputIdToHashBucket))
 			for j := range in[i].Samples {
 				hash := inputIdToHashBucket[int(in[i].SampleIDs[j])]
 				if _, ok := countPerHashbucket[hash]; !ok {
-					countPerHashbucket[hash] = make(map[float64]int)
+					countPerHashbucket[hash] = make(map[string]int)
 				}
-				countPerHashbucket[hash][in[i].Samples[j]]++
+				// Using string as the key to the map so that -0 and 0 are treated as separate values.
+				fStr := strconv.FormatFloat(in[i].Samples[j], 'f', -1, 64)
+				countPerHashbucket[hash][fStr]++
+			}
+
+			for j := range in[i].Histograms {
+				hash := inputIdToHashBucket[int(in[i].HistogramIDs[j])]
+				if _, ok := countPerHashbucket[hash]; !ok {
+					countPerHashbucket[hash] = make(map[string]int)
+				}
+				// Using string as the key to the map so that -0 and 0 are treated as separate values.
+				fStr := in[i].Histograms[j].String()
+				countPerHashbucket[hash][fStr]++
 			}
 
 			countsPerOutputId := make(map[int]int)
@@ -174,7 +187,7 @@ func (c *countValuesOperator) initSeriesOnce(ctx context.Context) error {
 				b.Reset(hashToBucketLabels[hash])
 				for f, count := range counts {
 					// TODO: Probably we should issue a warning if we override a label here
-					lbls := b.Set(c.param, strconv.FormatFloat(f, 'f', -1, 64)).Labels()
+					lbls := b.Set(c.param, f).Labels()
 					hash := lbls.Hash()
 					outputId, ok := hashToOutputId[hash]
 					if !ok {

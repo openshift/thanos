@@ -1,6 +1,6 @@
 # go-sysinfo
 
-[![Build Status](https://beats-ci.elastic.co/job/Library/job/go-sysinfo-mbp/job/main/badge/icon)](https://beats-ci.elastic.co/job/Library/job/go-sysinfo-mbp/job/main/)
+[![go](https://github.com/elastic/go-sysinfo/actions/workflows/go.yml/badge.svg)](https://github.com/elastic/go-sysinfo/actions/workflows/go.yml)
 [![Go Documentation](http://img.shields.io/badge/go-documentation-blue.svg?style=flat-square)][godocs]
 
 [godocs]: http://godoc.org/github.com/elastic/go-sysinfo
@@ -35,6 +35,7 @@ that are implemented.
 | `Info()`         | x      | x     | x       | x   |
 | `Memory()`       | x      | x     | x       | x   |
 | `CPUTimer`       | x      | x     | x       | x   |
+| `LoadAverage`    | x      | x     |         |     |
 | `VMStat`         |        | x     |         |     |
 | `NetworkCounters`|        | x     |         |     |
 
@@ -59,8 +60,8 @@ This table lists the OS and architectures for which a "provider" is implemented.
 | GOOS / GOARCH  | Requires CGO | Tested |
 |----------------|--------------|--------|
 | aix/ppc64      | x            |        |
-| darwin/amd64   | x            | x      |
-| darwin/arm64   | x            | x      |
+| darwin/amd64   | optional *   | x      |
+| darwin/arm64   | optional *   | x      |
 | linux/386      |              |        |
 | linux/amd64    |              | x      |
 | linux/arm      |              |        |
@@ -76,3 +77,11 @@ This table lists the OS and architectures for which a "provider" is implemented.
 | windows/amd64  |              | x      |
 | windows/arm64  |              |        |
 | windows/arm    |              |        |
+
+* On darwin (macOS) host information like machineid and process information like memory, cpu, user and starttime require cgo.
+
+### Supported Go versions
+
+go-sysinfo supports the [two most recent Go releases][ci_go_versions].
+
+[ci_go_versions]: https://github.com/elastic/go-sysinfo/blob/main/.github/workflows/go.yml#L40-L41
