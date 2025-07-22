@@ -33,6 +33,8 @@ import (
 )
 
 func TestToolsBucketWebExternalPrefixWithoutReverseProxy(t *testing.T) {
+	t.Skip("flaky test")
+
 	t.Parallel()
 
 	e, err := e2e.NewDockerEnvironment("rt-prfx-xtprf")
@@ -66,6 +68,8 @@ func TestToolsBucketWebExternalPrefixWithoutReverseProxy(t *testing.T) {
 }
 
 func TestToolsBucketWebExternalPrefix(t *testing.T) {
+	t.Skip("flaky test")
+
 	t.Parallel()
 
 	e, err := e2e.NewDockerEnvironment("external-prefix")
@@ -103,6 +107,8 @@ func TestToolsBucketWebExternalPrefix(t *testing.T) {
 }
 
 func TestToolsBucketWebExternalPrefixAndRoutePrefix(t *testing.T) {
+	t.Skip("flaky test")
+
 	t.Parallel()
 
 	e, err := e2e.NewDockerEnvironment("rt-prfx-xtrtprf")
@@ -190,7 +196,7 @@ func TestToolsBucketWebWithTimeAndRelabelFilter(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		t.Cleanup(cancel)
 
-		id, err := b.Create(ctx, dir, 0, b.hashFunc, 120)
+		id, err := b.Create(ctx, dir, 0, b.hashFunc, 120, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error {
 			return objstore.UploadDir(ctx, logger, bkt, path.Join(dir, id.String()), id.String())

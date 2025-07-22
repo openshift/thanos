@@ -16,14 +16,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/cespare/xxhash"
+	"github.com/cespare/xxhash/v2"
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/gogo/protobuf/proto"
@@ -31,7 +31,8 @@ import (
 	"github.com/leanovate/gopter"
 	"github.com/leanovate/gopter/gen"
 	"github.com/leanovate/gopter/prop"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
@@ -44,7 +45,6 @@ import (
 	"github.com/prometheus/prometheus/tsdb/encoding"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"go.uber.org/atomic"
-	"golang.org/x/exp/slices"
 
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
@@ -56,6 +56,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
+	"github.com/thanos-io/thanos/pkg/logutil"
 	"github.com/thanos-io/thanos/pkg/pool"
 	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/hintspb"
@@ -685,7 +686,7 @@ func TestBucketStore_TSDBInfo(t *testing.T) {
 		{mint: 0, maxt: 1000, extLabels: labels.FromStrings("a", "d")},
 		{mint: 2000, maxt: 3000, extLabels: labels.FromStrings("a", "d")},
 	} {
-		id1, err := e2eutil.CreateBlock(ctx, dir, series, 10, tt.mint, tt.maxt, tt.extLabels, 0, metadata.NoneFunc)
+		id1, err := e2eutil.CreateBlock(ctx, dir, series, 10, tt.mint, tt.maxt, tt.extLabels, 0, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id1.String()), metadata.NoneFunc))
 	}
@@ -788,19 +789,19 @@ func TestBucketStore_Sharding(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
 	series := []labels.Labels{labels.FromStrings("a", "1", "b", "1")}
 
-	id1, err := e2eutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.FromStrings("cluster", "a", "region", "r1"), 0, metadata.NoneFunc)
+	id1, err := e2eutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.FromStrings("cluster", "a", "region", "r1"), 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 	testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id1.String()), metadata.NoneFunc))
 
-	id2, err := e2eutil.CreateBlock(ctx, dir, series, 10, 1000, 2000, labels.FromStrings("cluster", "a", "region", "r1"), 0, metadata.NoneFunc)
+	id2, err := e2eutil.CreateBlock(ctx, dir, series, 10, 1000, 2000, labels.FromStrings("cluster", "a", "region", "r1"), 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 	testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id2.String()), metadata.NoneFunc))
 
-	id3, err := e2eutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.FromStrings("cluster", "b", "region", "r1"), 0, metadata.NoneFunc)
+	id3, err := e2eutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.FromStrings("cluster", "b", "region", "r1"), 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 	testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id3.String()), metadata.NoneFunc))
 
-	id4, err := e2eutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.FromStrings("cluster", "a", "region", "r2"), 0, metadata.NoneFunc)
+	id4, err := e2eutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.FromStrings("cluster", "a", "region", "r2"), 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 	testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id4.String()), metadata.NoneFunc))
 
@@ -996,8 +997,8 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
 			for id := range bucketStore.blocks {
 				ids = append(ids, id)
 			}
-			sort.Slice(ids, func(i, j int) bool {
-				return ids[i].Compare(ids[j]) < 0
+			slices.SortFunc(ids, func(i, j ulid.ULID) int {
+				return i.Compare(j)
 			})
 			testutil.Equals(t, sc.expectedIDs, ids)
 
@@ -1005,7 +1006,7 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
 			// Regression test: https://github.com/thanos-io/thanos/issues/1664
 
 			// Sort records. We load blocks concurrently so operations might be not ordered.
-			sort.Strings(rec.getRangeTouched)
+			slices.Sort(rec.getRangeTouched)
 
 			// With binary header nothing should be downloaded fully.
 			testutil.Equals(t, []string(nil), rec.getTouched)
@@ -1052,7 +1053,7 @@ func expectedTouchedBlockOps(all, expected, cached []ulid.ULID) []string {
 			)
 		}
 	}
-	sort.Strings(ops)
+	slices.Sort(ops)
 	return ops
 }
 
@@ -1288,7 +1289,9 @@ func benchmarkExpandedPostings(
 		{`uniq=~"9|random-shuffled-values|1"`, []*labels.Matcher{iRegexBigValueSet}, bigValueSetSize},
 	}
 
-	dummyCounter := promauto.NewCounter(prometheus.CounterOpts{Name: "test"})
+	reg := prometheus.NewRegistry()
+	dummyCounter := promauto.With(reg).NewCounter(prometheus.CounterOpts{Name: "test"})
+	dummyCounterVec := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{Name: "test_counter_vec"}, []string{"reason"})
 	for _, c := range cases {
 		t.Run(c.name, func(t testutil.TB) {
 			b := &bucketBlock{
@@ -1304,7 +1307,7 @@ func benchmarkExpandedPostings(
 
 			t.ResetTimer()
 			for i := 0; i < t.N(); i++ {
-				p, err := indexr.ExpandedPostings(context.Background(), newSortedMatchers(c.matchers), NewBytesLimiterFactory(0)(nil), false, dummyCounter, tenancy.DefaultTenant)
+				p, err := indexr.ExpandedPostings(context.Background(), newSortedMatchers(c.matchers), NewBytesLimiterFactory(0)(nil), false, 0.5, 0, dummyCounter, dummyCounterVec, tenancy.DefaultTenant)
 				testutil.Ok(t, err)
 				testutil.Equals(t, c.expectedLen, len(p.postings))
 			}
@@ -1340,8 +1343,10 @@ func TestExpandedPostingsEmptyPostings(t *testing.T) {
 	// Match nothing.
 	matcher2 := labels.MustNewMatcher(labels.MatchRegexp, "i", "500.*")
 	ctx := context.Background()
-	dummyCounter := promauto.With(prometheus.NewRegistry()).NewCounter(prometheus.CounterOpts{Name: "test"})
-	ps, err := indexr.ExpandedPostings(ctx, newSortedMatchers([]*labels.Matcher{matcher1, matcher2}), NewBytesLimiterFactory(0)(nil), false, dummyCounter, tenancy.DefaultTenant)
+	reg := prometheus.NewRegistry()
+	dummyCounter := promauto.With(reg).NewCounter(prometheus.CounterOpts{Name: "test"})
+	dummyCounterVec := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{Name: "test_counter_vec"}, []string{"reason"})
+	ps, err := indexr.ExpandedPostings(ctx, newSortedMatchers([]*labels.Matcher{matcher1, matcher2}), NewBytesLimiterFactory(0)(nil), false, 0.5, 0, dummyCounter, dummyCounterVec, tenancy.DefaultTenant)
 	testutil.Ok(t, err)
 	testutil.Equals(t, ps, (*lazyExpandedPostings)(nil))
 	// Make sure even if a matcher doesn't match any postings, we still cache empty expanded postings.
@@ -1378,8 +1383,10 @@ func TestLazyExpandedPostingsEmptyPostings(t *testing.T) {
 	matcher2 := labels.MustNewMatcher(labels.MatchRegexp, "n", "1_.*")
 	matcher3 := labels.MustNewMatcher(labels.MatchRegexp, "i", ".+")
 	ctx := context.Background()
-	dummyCounter := promauto.With(prometheus.NewRegistry()).NewCounter(prometheus.CounterOpts{Name: "test"})
-	ps, err := indexr.ExpandedPostings(ctx, newSortedMatchers([]*labels.Matcher{matcher1, matcher2, matcher3}), NewBytesLimiterFactory(0)(nil), true, dummyCounter, tenancy.DefaultTenant)
+	reg := prometheus.NewRegistry()
+	dummyCounter := promauto.With(reg).NewCounter(prometheus.CounterOpts{Name: "test"})
+	dummyCounterVec := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{Name: "test_counter_vec"}, []string{"reason"})
+	ps, err := indexr.ExpandedPostings(ctx, newSortedMatchers([]*labels.Matcher{matcher1, matcher2, matcher3}), NewBytesLimiterFactory(0)(nil), true, 0.5, 0, dummyCounter, dummyCounterVec, tenancy.DefaultTenant)
 	testutil.Ok(t, err)
 	// We expect emptyLazyPostings rather than lazy postings with 0 length but with matchers.
 	testutil.Equals(t, ps, emptyLazyPostings)
@@ -1507,7 +1514,7 @@ func benchBucketSeries(t testutil.TB, sampleType chunkenc.ValueType, skipChunk, 
 		// Histogram chunks are represented differently in memory and on disk. In order to
 		// have a precise comparison, we need to use the on-disk representation as the expected value
 		// instead of the in-memory one.
-		diskBlock, err := tsdb.OpenBlock(logger, blockIDDir, nil)
+		diskBlock, err := tsdb.OpenBlock(logutil.GoKitLogToSlog(logger), blockIDDir, nil, nil)
 		testutil.Ok(t, err)
 		series = append(series, storetestutil.ReadSeriesFromBlock(t, diskBlock, extLset, skipChunk)...)
 
@@ -1677,6 +1684,8 @@ func TestBucketSeries_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 		MaxSize: 8889,
 	})
 	testutil.Ok(t, err)
+	matcherCache, err := storecache.NewMatchersCache(storecache.WithSize(10000))
+	testutil.Ok(t, err)
 
 	var b1 *bucketBlock
 
@@ -1770,6 +1779,7 @@ func TestBucketSeries_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 	store := &BucketStore{
 		bkt:             objstore.WithNoopInstr(bkt),
 		logger:          logger,
+		matcherCache:    matcherCache,
 		indexCache:      indexCache,
 		indexReaderPool: indexheader.NewReaderPool(log.NewNopLogger(), false, 0, indexheader.NewReaderPoolMetrics(nil), indexheader.AlwaysEagerDownloadIndexHeader),
 		metrics:         newBucketStoreMetrics(nil),
@@ -1780,12 +1790,13 @@ func TestBucketSeries_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 			b1.meta.ULID: b1,
 			b2.meta.ULID: b2,
 		},
-		queryGate:            gate.NewNoop(),
-		chunksLimiterFactory: NewChunksLimiterFactory(0),
-		seriesLimiterFactory: NewSeriesLimiterFactory(0),
-		bytesLimiterFactory:  NewBytesLimiterFactory(0),
-		seriesBatchSize:      SeriesBatchSize,
-		requestLoggerFunc:    NoopRequestLoggerFunc,
+		queryGate:                         gate.NewNoop(),
+		chunksLimiterFactory:              NewChunksLimiterFactory(0),
+		seriesLimiterFactory:              NewSeriesLimiterFactory(0),
+		bytesLimiterFactory:               NewBytesLimiterFactory(0),
+		seriesBatchSize:                   SeriesBatchSize,
+		requestLoggerFunc:                 NoopRequestLoggerFunc,
+		lazyRetrievalMaxBufferedResponses: 1,
 	}
 
 	t.Run("invoke series for one block. Fill the cache on the way.", func(t *testing.T) {
@@ -2075,6 +2086,9 @@ func TestSeries_BlockWithMultipleChunks(t *testing.T) {
 	indexCache, err := storecache.NewInMemoryIndexCacheWithConfig(logger, nil, nil, storecache.InMemoryIndexCacheConfig{})
 	testutil.Ok(tb, err)
 
+	matcherCache, err := storecache.NewMatchersCache(storecache.WithSize(1024))
+	testutil.Ok(tb, err)
+
 	store, err := NewBucketStore(
 		instrBkt,
 		fetcher,
@@ -2091,6 +2105,7 @@ func TestSeries_BlockWithMultipleChunks(t *testing.T) {
 		0,
 		WithLogger(logger),
 		WithIndexCache(indexCache),
+		WithMatchersCache(matcherCache),
 	)
 	testutil.Ok(tb, err)
 	testutil.Ok(tb, store.SyncBlocks(context.Background()))
@@ -2575,8 +2590,8 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 			var namesHints hintspb.LabelNamesResponseHints
 			testutil.Ok(t, types.UnmarshalAny(namesResp.Hints, &namesHints))
 			// The order is not determinate, so we are sorting them.
-			sort.Slice(namesHints.QueriedBlocks, func(i, j int) bool {
-				return namesHints.QueriedBlocks[i].Id < namesHints.QueriedBlocks[j].Id
+			slices.SortFunc(namesHints.QueriedBlocks, func(i, j hintspb.Block) int {
+				return strings.Compare(i.Id, j.Id)
 			})
 			testutil.Equals(t, tc.expectedNamesHints, namesHints)
 
@@ -2587,8 +2602,8 @@ func TestLabelNamesAndValuesHints(t *testing.T) {
 			var valuesHints hintspb.LabelValuesResponseHints
 			testutil.Ok(t, types.UnmarshalAny(valuesResp.Hints, &valuesHints))
 			// The order is not determinate, so we are sorting them.
-			sort.Slice(valuesHints.QueriedBlocks, func(i, j int) bool {
-				return valuesHints.QueriedBlocks[i].Id < valuesHints.QueriedBlocks[j].Id
+			slices.SortFunc(valuesHints.QueriedBlocks, func(i, j hintspb.Block) int {
+				return strings.Compare(i.Id, j.Id)
 			})
 			testutil.Equals(t, tc.expectedValuesHints, valuesHints)
 		})
@@ -2724,7 +2739,7 @@ func labelNamesFromSeriesSet(series []*storepb.Series) []string {
 		labels = append(labels, k)
 	}
 
-	sort.Strings(labels)
+	slices.Sort(labels)
 	return labels
 }
 
@@ -2872,7 +2887,9 @@ func benchmarkBlockSeriesWithConcurrency(b *testing.B, concurrency int, blockMet
 	wg := sync.WaitGroup{}
 	wg.Add(concurrency)
 
-	dummyCounter := promauto.NewCounter(prometheus.CounterOpts{Name: "test"})
+	reg := prometheus.NewRegistry()
+	dummyCounter := promauto.With(reg).NewCounter(prometheus.CounterOpts{Name: "test"})
+	dummyCounterVec := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{Name: "test_counter_vec"}, []string{"reason"})
 	for w := 0; w < concurrency; w++ {
 		go func() {
 			defer wg.Done()
@@ -2917,7 +2934,10 @@ func benchmarkBlockSeriesWithConcurrency(b *testing.B, concurrency int, blockMet
 					dummyHistogram,
 					nil,
 					false,
+					0.5,
+					0,
 					dummyCounter,
+					dummyCounterVec,
 					dummyCounter,
 					dummyCounter,
 					tenancy.DefaultTenant,
@@ -2970,7 +2990,7 @@ func TestExpandPostingsWithContextCancel(t *testing.T) {
 	res, err := ExpandPostingsWithContext(ctx, p)
 	testutil.NotOk(t, err)
 	testutil.Equals(t, context.Canceled, err)
-	testutil.Equals(t, []storage.SeriesRef(nil), res)
+	testutil.Equals(t, true, cap(res) == 1024)
 }
 
 func samePostingGroup(a, b *postingGroup) bool {
@@ -3335,7 +3355,7 @@ func TestMatchersToPostingGroup(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			actual, err := matchersToPostingGroups(ctx, func(name string) ([]string, error) {
-				sort.Strings(tc.labelValues[name])
+				slices.Sort(tc.labelValues[name])
 				return tc.labelValues[name], nil
 			}, tc.matchers)
 			testutil.Ok(t, err)
@@ -3474,6 +3494,62 @@ func TestPostingGroupMerge(t *testing.T) {
 	}
 }
 
+func TestToPostingGroup(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name                  string
+		vals                  []string
+		matcher               *labels.Matcher
+		addAll                bool
+		addKeys               []string
+		removeKeys            []string
+		numberLabelValueCalls int
+	}{
+		{
+			name:                  "regexp .*",
+			matcher:               labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, ".*"),
+			addAll:                true,
+			numberLabelValueCalls: 0,
+		},
+		{
+			name:                  "not regexp .*",
+			matcher:               labels.MustNewMatcher(labels.MatchNotRegexp, labels.MetricName, ".*"),
+			addAll:                false,
+			numberLabelValueCalls: 0,
+		},
+		{
+			name:                  "regexp .+",
+			matcher:               labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, ".+"),
+			addAll:                false,
+			addKeys:               []string{"foo"},
+			vals:                  []string{"foo"},
+			numberLabelValueCalls: 1,
+		},
+		{
+			name:                  "not regexp .+",
+			matcher:               labels.MustNewMatcher(labels.MatchNotRegexp, labels.MetricName, ".+"),
+			addAll:                true,
+			removeKeys:            []string{"foo"},
+			vals:                  []string{"foo"},
+			numberLabelValueCalls: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			lvalsFn := func(name string) ([]string, error) {
+				calls++
+				return tc.vals, nil
+			}
+			pg, _, err := toPostingGroup(ctx, lvalsFn, tc.matcher)
+			testutil.Ok(t, err)
+			testutil.Equals(t, tc.addAll, pg.addAll)
+			testutil.Equals(t, tc.addKeys, pg.addKeys)
+			testutil.Equals(t, tc.removeKeys, pg.removeKeys)
+			testutil.Equals(t, tc.numberLabelValueCalls, calls)
+		})
+	}
+}
+
 // TestExpandedPostings is a test whether there is a race between multiple ExpandPostings() calls.
 func TestExpandedPostingsRace(t *testing.T) {
 	t.Parallel()
@@ -3551,7 +3627,9 @@ func TestExpandedPostingsRace(t *testing.T) {
 
 	l := sync.Mutex{}
 	previousRefs := make(map[int][]storage.SeriesRef)
-	dummyCounter := promauto.With(prometheus.NewRegistry()).NewCounter(prometheus.CounterOpts{Name: "test"})
+	reg := prometheus.NewRegistry()
+	dummyCounter := promauto.With(reg).NewCounter(prometheus.CounterOpts{Name: "test"})
+	dummyCounterVec := promauto.With(reg).NewCounterVec(prometheus.CounterOpts{Name: "test_counter_vec"}, []string{"reason"})
 
 	for {
 		if tm.Err() != nil {
@@ -3573,7 +3651,7 @@ func TestExpandedPostingsRace(t *testing.T) {
 			wg.Add(1)
 
 			go func(i int, bb *bucketBlock) {
-				refs, err := bb.indexReader(logger).ExpandedPostings(context.Background(), m, NewBytesLimiterFactory(0)(nil), false, dummyCounter, tenancy.DefaultTenant)
+				refs, err := bb.indexReader(logger).ExpandedPostings(context.Background(), m, NewBytesLimiterFactory(0)(nil), false, 0.5, 0, dummyCounter, dummyCounterVec, tenancy.DefaultTenant)
 				testutil.Ok(t, err)
 				defer wg.Done()
 
@@ -4103,4 +4181,69 @@ func TestBucketStoreMetadataLimit(t *testing.T) {
 			testutil.Equals(t, testData.expectedResults, resp.Values)
 		})
 	}
+}
+
+func TestBucketStoreBlockLifecycleCallback(t *testing.T) {
+	t.Parallel()
+
+	tb := testutil.NewTB(t)
+
+	tmpDir := t.TempDir()
+
+	bkt, err := filesystem.NewBucket(filepath.Join(tmpDir, "bkt"))
+	testutil.Ok(tb, err)
+	defer func() { testutil.Ok(tb, bkt.Close()) }()
+
+	blockID1 := uploadTestBlock(tb, tmpDir, bkt, 300)
+	blockID2 := uploadTestBlock(tb, tmpDir, bkt, 300)
+
+	instrBkt := objstore.WithNoopInstr(bkt)
+	logger := log.NewNopLogger()
+
+	// Instance a real bucket store we'll use to query the series.
+	baseBlockIDsFetcher := block.NewConcurrentLister(logger, instrBkt)
+	fetcher, err := block.NewMetaFetcher(logger, 10, instrBkt, baseBlockIDsFetcher, tmpDir, nil, nil)
+	testutil.Ok(tb, err)
+
+	indexCache, err := storecache.NewInMemoryIndexCacheWithConfig(logger, nil, nil, storecache.InMemoryIndexCacheConfig{})
+	testutil.Ok(tb, err)
+
+	store, err := NewBucketStore(
+		instrBkt,
+		fetcher,
+		tmpDir,
+		NewChunksLimiterFactory(0),
+		NewSeriesLimiterFactory(0),
+		NewBytesLimiterFactory(0),
+		NewGapBasedPartitioner(PartitionerMaxGapSize),
+		10,
+		false,
+		DefaultPostingOffsetInMemorySampling,
+		true,
+		false,
+		0,
+		WithLogger(logger),
+		WithIndexCache(indexCache),
+		WithBlockLifecycleCallback(&mockBlockLifecycleCallback{allowed: []ulid.ULID{blockID2}}),
+	)
+	testutil.Ok(tb, err)
+	testutil.Ok(tb, store.SyncBlocks(context.Background()))
+
+	_, ok := store.blocks[blockID2]
+	testutil.Equals(t, true, ok)
+
+	_, ok = store.blocks[blockID1]
+	testutil.Equals(t, false, ok)
+}
+
+type mockBlockLifecycleCallback struct {
+	allowed []ulid.ULID
+}
+
+func (c *mockBlockLifecycleCallback) PreAdd(meta metadata.Meta) error {
+	contains := slices.Contains(c.allowed, meta.ULID)
+	if !contains {
+		return fmt.Errorf("don't add")
+	}
+	return nil
 }

@@ -14,17 +14,19 @@ import (
 	"math"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/alecthomas/units"
-	"github.com/cespare/xxhash"
+	"github.com/cespare/xxhash/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gogo/protobuf/types"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -34,8 +36,8 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/encoding"
 	"github.com/prometheus/prometheus/tsdb/index"
+	"github.com/prometheus/prometheus/util/zeropool"
 	"github.com/weaveworks/common/httpgrpc"
-	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -125,7 +127,21 @@ const (
 var (
 	errBlockSyncConcurrencyNotValid = errors.New("the block sync concurrency must be equal or greater than 1.")
 	hashPool                        = sync.Pool{New: func() interface{} { return xxhash.New() }}
+	postingsPool                    zeropool.Pool[[]storage.SeriesRef]
 )
+
+func getPostingsSlice() []storage.SeriesRef {
+	if p := postingsPool.Get(); p != nil {
+		return p
+	}
+
+	// Pre-allocate slice with initial capacity.
+	return make([]storage.SeriesRef, 0, 1024)
+}
+
+func putPostingsSlice(p []storage.SeriesRef) {
+	postingsPool.Put(p[:0])
+}
 
 type bucketStoreMetrics struct {
 	blocksLoaded          prometheus.Gauge
@@ -151,6 +167,7 @@ type bucketStoreMetrics struct {
 	emptyPostingCount     *prometheus.CounterVec
 
 	lazyExpandedPostingsCount                     prometheus.Counter
+	lazyExpandedPostingGroupsByReason             *prometheus.CounterVec
 	lazyExpandedPostingSizeBytes                  prometheus.Counter
 	lazyExpandedPostingSeriesOverfetchedSizeBytes prometheus.Counter
 
@@ -345,6 +362,11 @@ func newBucketStoreMetrics(reg prometheus.Registerer) *bucketStoreMetrics {
 		Help: "Total number of times when lazy expanded posting optimization applies.",
 	})
 
+	m.lazyExpandedPostingGroupsByReason = promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+		Name: "thanos_bucket_store_lazy_expanded_posting_groups_total",
+		Help: "Total number of posting groups that are marked as lazy and corresponding reason",
+	}, []string{"reason"})
+
 	m.lazyExpandedPostingSizeBytes = promauto.With(reg).NewCounter(prometheus.CounterOpts{
 		Name: "thanos_bucket_store_lazy_expanded_posting_size_bytes_total",
 		Help: "Total number of lazy posting group size in bytes.",
@@ -379,6 +401,7 @@ type BucketStore struct {
 	fetcher         block.MetadataFetcher
 	dir             string
 	indexCache      storecache.IndexCache
+	matcherCache    storecache.MatchersCache
 	indexReaderPool *indexheader.ReaderPool
 	buffers         sync.Pool
 	chunkPool       pool.Pool[byte]
@@ -419,9 +442,13 @@ type BucketStore struct {
 
 	enableChunkHashCalculation bool
 
-	enabledLazyExpandedPostings bool
+	enabledLazyExpandedPostings   bool
+	seriesMatchRatio              float64
+	postingGroupMaxKeySeriesRatio float64
 
 	sortingStrategy sortingStrategy
+	// This flag limits memory usage when lazy retrieval strategy, newLazyRespSet(), is used.
+	lazyRetrievalMaxBufferedResponses int
 
 	blockEstimatedMaxSeriesFunc BlockEstimator
 	blockEstimatedMaxChunkFunc  BlockEstimator
@@ -429,6 +456,8 @@ type BucketStore struct {
 	indexHeaderLazyDownloadStrategy indexheader.LazyDownloadIndexHeaderFunc
 
 	requestLoggerFunc RequestLoggerFunc
+
+	blockLifecycleCallback BlockLifecycleCallback
 }
 
 func (s *BucketStore) validate() error {
@@ -493,6 +522,13 @@ func WithIndexCache(cache storecache.IndexCache) BucketStoreOption {
 	}
 }
 
+// WithMatchersCache sets a matchers cache to use instead of a noopCache.
+func WithMatchersCache(cache storecache.MatchersCache) BucketStoreOption {
+	return func(s *BucketStore) {
+		s.matcherCache = cache
+	}
+}
+
 // WithQueryGate sets a queryGate to use instead of a noopGate.
 func WithQueryGate(queryGate gate.Gate) BucketStoreOption {
 	return func(s *BucketStore) {
@@ -552,12 +588,32 @@ func WithLazyExpandedPostings(enabled bool) BucketStoreOption {
 	}
 }
 
+// WithPostingGroupMaxKeySeriesRatio configures a threshold to mark a posting group as lazy if it has more add keys or remove keys.
+func WithPostingGroupMaxKeySeriesRatio(postingGroupMaxKeySeriesRatio float64) BucketStoreOption {
+	return func(s *BucketStore) {
+		s.postingGroupMaxKeySeriesRatio = postingGroupMaxKeySeriesRatio
+	}
+}
+
+// WithSeriesMatchRatio configures how many series would match when intersecting posting groups.
+// This is used for lazy posting optimization strategy. Ratio should be within (0, 1).
+// The closer to 1, it means matchers have bad selectivity.
+func WithSeriesMatchRatio(seriesMatchRatio float64) BucketStoreOption {
+	return func(s *BucketStore) {
+		s.seriesMatchRatio = seriesMatchRatio
+	}
+}
+
 // WithDontResort disables series resorting in Store Gateway.
 func WithDontResort(true bool) BucketStoreOption {
 	return func(s *BucketStore) {
-		if true {
-			s.sortingStrategy = sortingStrategyNone
-		}
+		s.sortingStrategy = sortingStrategyNone
+	}
+}
+
+func WithLazyRetrievalMaxBufferedResponsesForBucket(n int) BucketStoreOption {
+	return func(s *BucketStore) {
+		s.lazyRetrievalMaxBufferedResponses = n
 	}
 }
 
@@ -566,6 +622,24 @@ func WithDontResort(true bool) BucketStoreOption {
 func WithIndexHeaderLazyDownloadStrategy(strategy indexheader.LazyDownloadIndexHeaderFunc) BucketStoreOption {
 	return func(s *BucketStore) {
 		s.indexHeaderLazyDownloadStrategy = strategy
+	}
+}
+
+// BlockLifecycleCallback specifies callbacks that will be called during the lifecycle of a block.
+type BlockLifecycleCallback interface {
+	// PreAdd is called before adding a block to indicate if the block needs to be added.
+	// A non nil error means the block should not be added.
+	PreAdd(meta metadata.Meta) error
+}
+
+type noopBlockLifecycleCallback struct{}
+
+func (c noopBlockLifecycleCallback) PreAdd(meta metadata.Meta) error { return nil }
+
+// WithBlockLifecycleCallback allows customizing callbacks of block lifecycle.
+func WithBlockLifecycleCallback(c BlockLifecycleCallback) BucketStoreOption {
+	return func(s *BucketStore) {
+		s.blockLifecycleCallback = c
 	}
 }
 
@@ -588,11 +662,12 @@ func NewBucketStore(
 	options ...BucketStoreOption,
 ) (*BucketStore, error) {
 	s := &BucketStore{
-		logger:     log.NewNopLogger(),
-		bkt:        bkt,
-		fetcher:    fetcher,
-		dir:        dir,
-		indexCache: noopCache{},
+		logger:       log.NewNopLogger(),
+		bkt:          bkt,
+		fetcher:      fetcher,
+		dir:          dir,
+		indexCache:   noopCache{},
+		matcherCache: storecache.NoopMatchersCache,
 		buffers: sync.Pool{New: func() interface{} {
 			b := make([]byte, 0, initialBufSize)
 			return &b
@@ -614,6 +689,9 @@ func NewBucketStore(
 		sortingStrategy:                 sortingStrategyStore,
 		indexHeaderLazyDownloadStrategy: indexheader.AlwaysEagerDownloadIndexHeader,
 		requestLoggerFunc:               NoopRequestLoggerFunc,
+		blockLifecycleCallback:          &noopBlockLifecycleCallback{},
+
+		lazyRetrievalMaxBufferedResponses: 20,
 	}
 
 	for _, option := range options {
@@ -669,6 +747,9 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			for meta := range blockc {
+				if preAddErr := s.blockLifecycleCallback.PreAdd(*meta); preAddErr != nil {
+					continue
+				}
 				if err := s.addBlock(ctx, meta); err != nil {
 					continue
 				}
@@ -694,8 +775,15 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 		return metaFetchErr
 	}
 
+	s.mtx.RLock()
+	keys := make([]ulid.ULID, 0, len(s.blocks))
+	for k := range s.blocks {
+		keys = append(keys, k)
+	}
+	s.mtx.RUnlock()
+
 	// Drop all blocks that are no longer present in the bucket.
-	for id := range s.blocks {
+	for _, id := range keys {
 		if _, ok := metas[id]; ok {
 			continue
 		}
@@ -1002,8 +1090,12 @@ type blockSeriesClient struct {
 	chunksLimiter ChunksLimiter
 	bytesLimiter  BytesLimiter
 
-	lazyExpandedPostingEnabled                    bool
+	lazyExpandedPostingEnabled bool
+	seriesMatchRatio           float64
+	// Mark posting group as lazy if it adds or removes too many keys. 0 to disable.
+	postingGroupMaxKeySeriesRatio                 float64
 	lazyExpandedPostingsCount                     prometheus.Counter
+	lazyExpandedPostingGroupByReason              *prometheus.CounterVec
 	lazyExpandedPostingSizeBytes                  prometheus.Counter
 	lazyExpandedPostingSeriesOverfetchedSizeBytes prometheus.Counter
 
@@ -1046,7 +1138,10 @@ func newBlockSeriesClient(
 	chunkFetchDurationSum *prometheus.HistogramVec,
 	extLsetToRemove map[string]struct{},
 	lazyExpandedPostingEnabled bool,
+	seriesMatchRatio float64,
+	postingGroupMaxKeySeriesRatio float64,
 	lazyExpandedPostingsCount prometheus.Counter,
+	lazyExpandedPostingByReason *prometheus.CounterVec,
 	lazyExpandedPostingSizeBytes prometheus.Counter,
 	lazyExpandedPostingSeriesOverfetchedSizeBytes prometheus.Counter,
 	tenant string,
@@ -1081,7 +1176,10 @@ func newBlockSeriesClient(
 		chunkFetchDurationSum:  chunkFetchDurationSum,
 
 		lazyExpandedPostingEnabled:                    lazyExpandedPostingEnabled,
+		seriesMatchRatio:                              seriesMatchRatio,
+		postingGroupMaxKeySeriesRatio:                 postingGroupMaxKeySeriesRatio,
 		lazyExpandedPostingsCount:                     lazyExpandedPostingsCount,
+		lazyExpandedPostingGroupByReason:              lazyExpandedPostingByReason,
 		lazyExpandedPostingSizeBytes:                  lazyExpandedPostingSizeBytes,
 		lazyExpandedPostingSeriesOverfetchedSizeBytes: lazyExpandedPostingSeriesOverfetchedSizeBytes,
 
@@ -1133,7 +1231,7 @@ func (b *blockSeriesClient) ExpandPostings(
 	matchers sortedMatchers,
 	seriesLimiter SeriesLimiter,
 ) error {
-	ps, err := b.indexr.ExpandedPostings(b.ctx, matchers, b.bytesLimiter, b.lazyExpandedPostingEnabled, b.lazyExpandedPostingSizeBytes, b.tenant)
+	ps, err := b.indexr.ExpandedPostings(b.ctx, matchers, b.bytesLimiter, b.lazyExpandedPostingEnabled, b.seriesMatchRatio, b.postingGroupMaxKeySeriesRatio, b.lazyExpandedPostingSizeBytes, b.lazyExpandedPostingGroupByReason, b.tenant)
 	if err != nil {
 		return errors.Wrap(err, "expanded matching posting")
 	}
@@ -1345,7 +1443,7 @@ func populateChunk(out *storepb.AggrChunk, in chunkenc.Chunk, aggrs []storepb.Ag
 		}
 		out.Raw = &storepb.Chunk{
 			Data: b,
-			Type: storepb.Chunk_Encoding(in.Encoding() - 1),
+			Type: chunkToStoreEncoding(in.Encoding()),
 			Hash: hashChunk(hasher, b, calculateChecksum),
 		}
 		return nil
@@ -1368,7 +1466,7 @@ func populateChunk(out *storepb.AggrChunk, in chunkenc.Chunk, aggrs []storepb.Ag
 			if err != nil {
 				return err
 			}
-			out.Count = &storepb.Chunk{Type: storepb.Chunk_XOR, Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
+			out.Count = &storepb.Chunk{Type: chunkToStoreEncoding(x.Encoding()), Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
 		case storepb.Aggr_SUM:
 			x, err := ac.Get(downsample.AggrSum)
 			if err != nil {
@@ -1378,7 +1476,7 @@ func populateChunk(out *storepb.AggrChunk, in chunkenc.Chunk, aggrs []storepb.Ag
 			if err != nil {
 				return err
 			}
-			out.Sum = &storepb.Chunk{Type: storepb.Chunk_XOR, Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
+			out.Sum = &storepb.Chunk{Type: chunkToStoreEncoding(x.Encoding()), Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
 		case storepb.Aggr_MIN:
 			x, err := ac.Get(downsample.AggrMin)
 			if err != nil {
@@ -1388,7 +1486,7 @@ func populateChunk(out *storepb.AggrChunk, in chunkenc.Chunk, aggrs []storepb.Ag
 			if err != nil {
 				return err
 			}
-			out.Min = &storepb.Chunk{Type: storepb.Chunk_XOR, Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
+			out.Min = &storepb.Chunk{Type: chunkToStoreEncoding(x.Encoding()), Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
 		case storepb.Aggr_MAX:
 			x, err := ac.Get(downsample.AggrMax)
 			if err != nil {
@@ -1398,7 +1496,7 @@ func populateChunk(out *storepb.AggrChunk, in chunkenc.Chunk, aggrs []storepb.Ag
 			if err != nil {
 				return err
 			}
-			out.Max = &storepb.Chunk{Type: storepb.Chunk_XOR, Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
+			out.Max = &storepb.Chunk{Type: chunkToStoreEncoding(x.Encoding()), Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
 		case storepb.Aggr_COUNTER:
 			x, err := ac.Get(downsample.AggrCounter)
 			if err != nil {
@@ -1408,10 +1506,23 @@ func populateChunk(out *storepb.AggrChunk, in chunkenc.Chunk, aggrs []storepb.Ag
 			if err != nil {
 				return err
 			}
-			out.Counter = &storepb.Chunk{Type: storepb.Chunk_XOR, Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
+			out.Counter = &storepb.Chunk{Type: chunkToStoreEncoding(x.Encoding()), Data: b, Hash: hashChunk(hasher, b, calculateChecksum)}
 		}
 	}
 	return nil
+}
+
+func chunkToStoreEncoding(in chunkenc.Encoding) storepb.Chunk_Encoding {
+	switch in {
+	case chunkenc.EncXOR:
+		return storepb.Chunk_XOR
+	case chunkenc.EncHistogram:
+		return storepb.Chunk_HISTOGRAM
+	case chunkenc.EncFloatHistogram:
+		return storepb.Chunk_FLOAT_HISTOGRAM
+	default:
+		panic("unknown chunk encoding")
+	}
 }
 
 func hashChunk(hasher hash.Hash64, b []byte, doHash bool) uint64 {
@@ -1476,7 +1587,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 
 	tenant, _ := tenancy.GetTenantFromGRPCMetadata(srv.Context())
 
-	matchers, err := storepb.MatchersToPromMatchers(req.Matchers...)
+	matchers, err := storecache.MatchersToPromMatchersCached(s.matcherCache, req.Matchers...)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -1566,7 +1677,10 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 				s.metrics.chunkFetchDurationSum,
 				extLsetToRemove,
 				s.enabledLazyExpandedPostings,
+				s.seriesMatchRatio,
+				s.postingGroupMaxKeySeriesRatio,
 				s.metrics.lazyExpandedPostingsCount,
+				s.metrics.lazyExpandedPostingGroupsByReason,
 				s.metrics.lazyExpandedPostingSizeBytes,
 				s.metrics.lazyExpandedPostingSeriesOverfetchedSizeBytes,
 				tenant,
@@ -1623,6 +1737,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 						shardMatcher,
 						false,
 						s.metrics.emptyPostingCount.WithLabelValues(tenant),
+						max(s.lazyRetrievalMaxBufferedResponses, 1),
 					)
 				}
 
@@ -1880,7 +1995,10 @@ func (s *BucketStore) LabelNames(ctx context.Context, req *storepb.LabelNamesReq
 					nil,
 					extLsetToRemove,
 					s.enabledLazyExpandedPostings,
+					s.seriesMatchRatio,
+					s.postingGroupMaxKeySeriesRatio,
 					s.metrics.lazyExpandedPostingsCount,
+					s.metrics.lazyExpandedPostingGroupsByReason,
 					s.metrics.lazyExpandedPostingSizeBytes,
 					s.metrics.lazyExpandedPostingSeriesOverfetchedSizeBytes,
 					tenant,
@@ -2106,7 +2224,10 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 					nil,
 					nil,
 					s.enabledLazyExpandedPostings,
+					s.seriesMatchRatio,
+					s.postingGroupMaxKeySeriesRatio,
 					s.metrics.lazyExpandedPostingsCount,
+					s.metrics.lazyExpandedPostingGroupsByReason,
 					s.metrics.lazyExpandedPostingSizeBytes,
 					s.metrics.lazyExpandedPostingSeriesOverfetchedSizeBytes,
 					tenant,
@@ -2522,6 +2643,10 @@ type bucketIndexReader struct {
 
 	indexVersion int
 	logger       log.Logger
+
+	// Posting slice to return to the postings pool on close.
+	// A single bucketIndexReader should have at most 1 postings slice to return.
+	postings []storage.SeriesRef
 }
 
 func newBucketIndexReader(block *bucketBlock, logger log.Logger) *bucketIndexReader {
@@ -2563,7 +2688,17 @@ func (r *bucketIndexReader) reset(size int) {
 // Reminder: A posting is a reference (represented as a uint64) to a series reference, which in turn points to the first
 // chunk where the series contains the matching label-value pair for a given block of data. Postings can be fetched by
 // single label name=value.
-func (r *bucketIndexReader) ExpandedPostings(ctx context.Context, ms sortedMatchers, bytesLimiter BytesLimiter, lazyExpandedPostingEnabled bool, lazyExpandedPostingSizeBytes prometheus.Counter, tenant string) (*lazyExpandedPostings, error) {
+func (r *bucketIndexReader) ExpandedPostings(
+	ctx context.Context,
+	ms sortedMatchers,
+	bytesLimiter BytesLimiter,
+	lazyExpandedPostingEnabled bool,
+	seriesMatchRatio float64,
+	postingGroupMaxKeySeriesRatio float64,
+	lazyExpandedPostingSizeBytes prometheus.Counter,
+	lazyExpandedPostingGroupsByReason *prometheus.CounterVec,
+	tenant string,
+) (*lazyExpandedPostings, error) {
 	// Shortcut the case of `len(postingGroups) == 0`. It will only happen when no
 	// matchers specified, and we don't need to fetch expanded postings from cache.
 	if len(ms) == 0 {
@@ -2615,7 +2750,7 @@ func (r *bucketIndexReader) ExpandedPostings(ctx context.Context, ms sortedMatch
 		postingGroups = append(postingGroups, newPostingGroup(true, name, []string{value}, nil))
 	}
 
-	ps, err := fetchLazyExpandedPostings(ctx, postingGroups, r, bytesLimiter, addAllPostings, lazyExpandedPostingEnabled, lazyExpandedPostingSizeBytes, tenant)
+	ps, err := fetchLazyExpandedPostings(ctx, postingGroups, r, bytesLimiter, addAllPostings, lazyExpandedPostingEnabled, seriesMatchRatio, postingGroupMaxKeySeriesRatio, lazyExpandedPostingSizeBytes, lazyExpandedPostingGroupsByReason, tenant)
 	if err != nil {
 		return nil, errors.Wrap(err, "fetch and expand postings")
 	}
@@ -2642,13 +2777,13 @@ func (r *bucketIndexReader) ExpandedPostings(ctx context.Context, ms sortedMatch
 
 // ExpandPostingsWithContext returns the postings expanded as a slice and considers context.
 func ExpandPostingsWithContext(ctx context.Context, p index.Postings) ([]storage.SeriesRef, error) {
-	res := make([]storage.SeriesRef, 0, 1024) // Pre-allocate slice with initial capacity
+	res := getPostingsSlice()
 	i := 0
 	for p.Next() {
 		i++
 		if i%checkContextEveryNIterations == 0 {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return res, err
 			}
 		}
 		res = append(res, p.At())
@@ -2661,13 +2796,14 @@ func ExpandPostingsWithContext(ctx context.Context, p index.Postings) ([]storage
 // If addAll is not set: Merge of postings for "addKeys" labels minus postings for removeKeys labels
 // This computation happens in ExpandedPostings.
 type postingGroup struct {
-	addAll      bool
-	name        string
-	matchers    []*labels.Matcher
-	addKeys     []string
-	removeKeys  []string
-	cardinality int64
-	lazy        bool
+	addAll       bool
+	name         string
+	matchers     []*labels.Matcher
+	addKeys      []string
+	removeKeys   []string
+	cardinality  int64
+	existentKeys int
+	lazy         bool
 }
 
 func newPostingGroup(addAll bool, name string, addKeys, removeKeys []string) *postingGroup {
@@ -2845,6 +2981,16 @@ func matchersToPostingGroups(ctx context.Context, lvalsFn func(name string) ([]s
 
 // NOTE: Derived from tsdb.postingsForMatcher. index.Merge is equivalent to map duplication.
 func toPostingGroup(ctx context.Context, lvalsFn func(name string) ([]string, error), m *labels.Matcher) (*postingGroup, []string, error) {
+	// .* regexp matches any string.
+	if m.Type == labels.MatchRegexp && m.Value == ".*" {
+		return newPostingGroup(true, m.Name, nil, nil), nil, nil
+	}
+
+	// .* not regexp doesn't match any string.
+	if m.Type == labels.MatchNotRegexp && m.Value == ".*" {
+		return newPostingGroup(false, m.Name, nil, nil), nil, nil
+	}
+
 	// If the matcher selects an empty value, it selects all the series which don't
 	// have the label name set too. See: https://github.com/prometheus/prometheus/issues/3575
 	// and https://github.com/prometheus/prometheus/pull/3578#issuecomment-351653555.
@@ -2872,6 +3018,17 @@ func toPostingGroup(ctx context.Context, lvalsFn func(name string) ([]string, er
 			return nil, nil, err
 		}
 
+		// If the matcher is ="" or =~"", it is the same as removing all values for the label.
+		// We can skip calling `Matches` here.
+		if m.Value == "" && (m.Type == labels.MatchEqual || m.Type == labels.MatchRegexp) {
+			return newPostingGroup(true, m.Name, nil, vals), vals, nil
+		}
+
+		// .+ regexp matches any non-empty string: get postings for all label values and remove them.
+		if m.Type == labels.MatchNotRegexp && m.Value == ".+" {
+			return newPostingGroup(true, m.Name, nil, vals), vals, nil
+		}
+
 		for i, val := range vals {
 			if (i+1)%checkContextEveryNIterations == 0 && ctx.Err() != nil {
 				return nil, nil, ctx.Err()
@@ -2883,6 +3040,7 @@ func toPostingGroup(ctx context.Context, lvalsFn func(name string) ([]string, er
 
 		return newPostingGroup(true, m.Name, nil, toRemove), vals, nil
 	}
+
 	if m.Type == labels.MatchRegexp {
 		if vals := m.SetMatches(); len(vals) > 0 {
 			sort.Strings(vals)
@@ -2898,6 +3056,17 @@ func toPostingGroup(ctx context.Context, lvalsFn func(name string) ([]string, er
 	vals, err := lvalsFn(m.Name)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// If the matcher is !="" or !~"", it is the same as adding all values for the label.
+	// We can skip calling `Matches` here.
+	if m.Value == "" && (m.Type == labels.MatchNotEqual || m.Type == labels.MatchNotRegexp) {
+		return newPostingGroup(false, m.Name, vals, nil), vals, nil
+	}
+
+	// .+ regexp matches any non-empty string: get postings for all label values.
+	if m.Type == labels.MatchRegexp && m.Value == ".+" {
+		return newPostingGroup(false, m.Name, vals, nil), vals, nil
 	}
 
 	var toAdd []string
@@ -2941,6 +3110,7 @@ func (r *bucketIndexReader) fetchExpandedPostingsFromCache(ctx context.Context, 
 	}
 
 	ps, err := ExpandPostingsWithContext(ctx, p)
+	r.postings = ps
 	if err != nil {
 		level.Error(r.logger).Log("msg", "failed to expand cached expanded postings, refetch postings", "id", r.block.meta.ULID.String(), "err", err)
 		return false, nil, nil
@@ -2993,12 +3163,14 @@ func (r *bucketIndexReader) fetchPostings(ctx context.Context, keys []labels.Lab
 
 	output := make([]index.Postings, len(keys))
 
+	var size int64
 	// Fetch postings from the cache with a single call.
 	fromCache, _ := r.block.indexCache.FetchMultiPostings(ctx, r.block.meta.ULID, keys, tenant)
 	for _, dataFromCache := range fromCache {
-		if err := bytesLimiter.ReserveWithType(uint64(len(dataFromCache)), PostingsTouched); err != nil {
-			return nil, closeFns, httpgrpc.Errorf(int(codes.ResourceExhausted), "exceeded bytes limit while loading postings from index cache: %s", err)
-		}
+		size += int64(len(dataFromCache))
+	}
+	if err := bytesLimiter.ReserveWithType(uint64(size), PostingsTouched); err != nil {
+		return nil, closeFns, httpgrpc.Errorf(int(codes.ResourceExhausted), "exceeded bytes limit while loading postings from index cache: %s", err)
 	}
 
 	// Iterate over all groups and fetch posting from cache.
@@ -3049,13 +3221,14 @@ func (r *bucketIndexReader) fetchPostings(ctx context.Context, keys []labels.Lab
 		return uint64(ptrs[i].ptr.Start), uint64(ptrs[i].ptr.End)
 	})
 
+	size = 0
 	for _, part := range parts {
 		start := int64(part.Start)
 		length := int64(part.End) - start
-
-		if err := bytesLimiter.ReserveWithType(uint64(length), PostingsFetched); err != nil {
-			return nil, closeFns, httpgrpc.Errorf(int(codes.ResourceExhausted), "exceeded bytes limit while fetching postings: %s", err)
-		}
+		size += length
+	}
+	if err := bytesLimiter.ReserveWithType(uint64(size), PostingsFetched); err != nil {
+		return nil, closeFns, httpgrpc.Errorf(int(codes.ResourceExhausted), "exceeded bytes limit while fetching postings: %s", err)
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
@@ -3141,7 +3314,7 @@ func (r *bucketIndexReader) decodeCachedPostings(b []byte) (index.Postings, []fu
 			closeFns = append(closeFns, l.(closeablePostings).close)
 		}
 	} else {
-		_, l, err = r.dec.Postings(b)
+		_, l, err = index.DecodePostingsRaw(encoding.Decbuf{B: b})
 	}
 	return l, closeFns, err
 }
@@ -3226,11 +3399,13 @@ func (r *bucketIndexReader) PreloadSeries(ctx context.Context, ids []storage.Ser
 	// Load series from cache, overwriting the list of ids to preload
 	// with the missing ones.
 	fromCache, ids := r.block.indexCache.FetchMultiSeries(ctx, r.block.meta.ULID, ids, tenant)
+	var size uint64
 	for id, b := range fromCache {
 		r.loadedSeries[id] = b
-		if err := bytesLimiter.ReserveWithType(uint64(len(b)), SeriesTouched); err != nil {
-			return httpgrpc.Errorf(int(codes.ResourceExhausted), "exceeded bytes limit while loading series from index cache: %s", err)
-		}
+		size += uint64(len(b))
+	}
+	if err := bytesLimiter.ReserveWithType(size, SeriesTouched); err != nil {
+		return httpgrpc.Errorf(int(codes.ResourceExhausted), "exceeded bytes limit while loading series from index cache: %s", err)
 	}
 
 	parts := r.block.partitioner.Partition(len(ids), func(i int) (start, end uint64) {
@@ -3377,6 +3552,10 @@ func (r *bucketIndexReader) LoadSeriesForTime(ref storage.SeriesRef, lset *[]sym
 // Close released the underlying resources of the reader.
 func (r *bucketIndexReader) Close() error {
 	r.block.pendingReaders.Done()
+
+	if r.postings != nil {
+		putPostingsSlice(r.postings)
+	}
 	return nil
 }
 
@@ -3561,10 +3740,12 @@ func (r *bucketChunkReader) load(ctx context.Context, res []seriesEntry, aggrs [
 			return uint64(pIdxs[i].offset), uint64(pIdxs[i].offset) + uint64(r.block.estimatedMaxChunkSize)
 		})
 
+		var size uint64
 		for _, p := range parts {
-			if err := bytesLimiter.ReserveWithType(uint64(p.End-p.Start), ChunksFetched); err != nil {
-				return httpgrpc.Errorf(int(codes.ResourceExhausted), "exceeded bytes limit while fetching chunks: %s", err)
-			}
+			size += p.End - p.Start
+		}
+		if err := bytesLimiter.ReserveWithType(size, ChunksFetched); err != nil {
+			return httpgrpc.Errorf(int(codes.ResourceExhausted), "exceeded bytes limit while fetching chunks: %s", err)
 		}
 
 		for _, p := range parts {

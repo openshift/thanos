@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"syscall"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/run"
@@ -26,7 +27,6 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/promql/parser"
 	"go.uber.org/automaxprocs/maxprocs"
-	"gopkg.in/alecthomas/kingpin.v2"
 
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/logging"
