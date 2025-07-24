@@ -17,14 +17,18 @@ package trace
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
-	traceclient "cloud.google.com/go/trace/apiv2"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.uber.org/multierr"
+
+	traceapi "cloud.google.com/go/trace/apiv2"
+	"cloud.google.com/go/trace/apiv2/tracepb"
 	"google.golang.org/api/option"
-	tracepb "google.golang.org/genproto/googleapis/devtools/cloudtrace/v2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 // traceExporter is an implementation of trace.Exporter and trace.BatchExporter
@@ -33,17 +37,18 @@ type traceExporter struct {
 	o *options
 	// uploadFn defaults in uploadSpans; it can be replaced for tests.
 	uploadFn  func(ctx context.Context, req *tracepb.BatchWriteSpansRequest) error
-	client    *traceclient.Client
+	client    *traceapi.Client
 	projectID string
 	overflowLogger
 }
 
 func newTraceExporter(o *options) (*traceExporter, error) {
-	clientOps := append(o.traceClientOptions, option.WithUserAgent(userAgent))
-	client, err := traceclient.NewClient(o.context, clientOps...)
+	clientOps := append([]option.ClientOption{option.WithGRPCDialOption(grpc.WithUserAgent(userAgent))}, o.traceClientOptions...)
+	client, err := traceapi.NewClient(o.context, clientOps...)
 	if err != nil {
 		return nil, fmt.Errorf("stackdriver: couldn't initiate trace client: %v", err)
 	}
+
 	e := &traceExporter{
 		projectID:      o.projectID,
 		client:         client,
@@ -67,15 +72,9 @@ func (e *traceExporter) ExportSpans(ctx context.Context, spanData []sdktrace.Rea
 			Name:  "projects/" + projectID,
 			Spans: spans,
 		}
-		err := e.uploadFn(ctx, req)
-		if err != nil {
-			errs = append(errs, err)
-		}
+		errs = append(errs, e.uploadFn(ctx, req))
 	}
-	if len(errs) > 0 {
-		return multierr.Combine(errs...)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ConvertSpan converts a ReadOnlySpan to Stackdriver Trace.
@@ -90,7 +89,6 @@ func (e *traceExporter) Shutdown(ctx context.Context) error {
 
 // uploadSpans sends a set of spans to Stackdriver.
 func (e *traceExporter) uploadSpans(ctx context.Context, req *tracepb.BatchWriteSpansRequest) error {
-
 	var cancel func()
 	ctx, cancel = newContextWithTimeout(ctx, e.o.timeout)
 	defer cancel()
@@ -105,6 +103,10 @@ func (e *traceExporter) uploadSpans(ctx context.Context, req *tracepb.BatchWrite
 	// )
 	// defer span.End()
 	// span.SetAttributes(kv.Int64("num_spans", int64(len(spans))))
+
+	if e.o.destinationProjectQuota {
+		ctx = metadata.NewOutgoingContext(ctx, metadata.New(map[string]string{"x-goog-user-project": strings.TrimPrefix(req.Name, "projects/")}))
+	}
 
 	err := e.client.BatchWriteSpans(ctx, req)
 	if err != nil {

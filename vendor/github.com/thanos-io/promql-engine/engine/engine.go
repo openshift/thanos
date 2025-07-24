@@ -5,39 +5,41 @@ package engine
 
 import (
 	"context"
+	"log/slog"
 	"math"
 	"runtime"
+	"slices"
 	"sort"
 	"time"
-
-	"github.com/efficientgo/core/errors"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/promql/parser"
-	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/util/annotations"
-	"github.com/prometheus/prometheus/util/stats"
 
 	"github.com/thanos-io/promql-engine/execution"
 	"github.com/thanos-io/promql-engine/execution/function"
 	"github.com/thanos-io/promql-engine/execution/model"
 	"github.com/thanos-io/promql-engine/execution/parse"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/execution/warnings"
 	"github.com/thanos-io/promql-engine/extlabels"
 	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/thanos-io/promql-engine/query"
 	engstorage "github.com/thanos-io/promql-engine/storage"
 	promstorage "github.com/thanos-io/promql-engine/storage/prometheus"
+
+	"github.com/efficientgo/core/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/promslog"
+	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
+	"github.com/prometheus/prometheus/util/stats"
 )
 
 type QueryType int
 
 type engineMetrics struct {
 	currentQueries prometheus.Gauge
-	queries        *prometheus.CounterVec
+	totalQueries   prometheus.Counter
 }
 
 const (
@@ -48,15 +50,15 @@ const (
 	stepsBatch             = 10
 )
 
+func IsUnimplemented(err error) bool {
+	return errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented)
+}
+
 type Opts struct {
 	promql.EngineOpts
 
 	// LogicalOptimizers are optimizers that are run if the value is not nil. If it is nil then the default optimizers are run. Default optimizer list is available in the logicalplan package.
 	LogicalOptimizers []logicalplan.Optimizer
-
-	// DisableFallback enables mode where engine returns error if some expression of feature is not yet implemented
-	// in the new engine, instead of falling back to prometheus engine.
-	DisableFallback bool
 
 	// ExtLookbackDelta specifies what time range to use to determine valid previous sample for extended range functions.
 	// Defaults to 1 hour if not specified.
@@ -65,18 +67,15 @@ type Opts struct {
 	// DecodingConcurrency is the maximum number of goroutines that can be used to decode samples. Defaults to GOMAXPROCS / 2.
 	DecodingConcurrency int
 
+	// SelectorBatchSize specifies the maximum number of samples to be returned by selectors in a single batch.
+	SelectorBatchSize int64
+
 	// EnableXFunctions enables custom xRate, xIncrease and xDelta functions.
 	// This will default to false.
 	EnableXFunctions bool
 
-	// FallbackEngine
-	Engine promql.QueryEngine
-
 	// EnableAnalysis enables query analysis.
 	EnableAnalysis bool
-
-	// SelectorBatchSize specifies the maximum number of samples to be returned by selectors in a single batch.
-	SelectorBatchSize int64
 
 	// The Prometheus engine has internal check for duplicate labels produced by functions, aggregations or binary operators.
 	// This check can produce false positives when querying time-series data which does not conform to the Prometheus data model,
@@ -84,16 +83,34 @@ type Opts struct {
 	DisableDuplicateLabelChecks bool
 }
 
-func (o Opts) getLogicalOptimizers() []logicalplan.Optimizer {
-	var optimizers []logicalplan.Optimizer
-	if o.LogicalOptimizers == nil {
-		optimizers = make([]logicalplan.Optimizer, len(logicalplan.DefaultOptimizers))
-		copy(optimizers, logicalplan.DefaultOptimizers)
-	} else {
-		optimizers = make([]logicalplan.Optimizer, len(o.LogicalOptimizers))
-		copy(optimizers, o.LogicalOptimizers)
+// QueryOpts implements promql.QueryOpts but allows to override more engine default options.
+type QueryOpts struct {
+	// These values are used to implement promql.QueryOpts, they have weird "Param" suffix because
+	// they are accessed by methods of the same name.
+	LookbackDeltaParam      time.Duration
+	EnablePerStepStatsParam bool
+
+	// DecodingConcurrency can be used to override the DecodingConcurrency engine setting.
+	DecodingConcurrency int
+
+	// SelectorBatchSize can be used to override the SelectorBatchSize engine setting.
+	SelectorBatchSize int64
+
+	// LogicalOptimizers can be used to override the LogicalOptimizers engine setting.
+	LogicalOptimizers []logicalplan.Optimizer
+}
+
+func (opts QueryOpts) LookbackDelta() time.Duration { return opts.LookbackDeltaParam }
+func (opts QueryOpts) EnablePerStepStats() bool     { return opts.EnablePerStepStatsParam }
+
+func fromPromQLOpts(opts promql.QueryOpts) *QueryOpts {
+	if opts == nil {
+		return &QueryOpts{}
 	}
-	return optimizers
+	return &QueryOpts{
+		LookbackDeltaParam:      opts.LookbackDelta(),
+		EnablePerStepStatsParam: opts.EnablePerStepStats(),
+	}
 }
 
 // New creates a new query engine with the given options. The query engine will
@@ -109,20 +126,19 @@ func New(opts Opts) *Engine {
 // This method is useful when the data being queried does not easily fit into the Prometheus storage model.
 func NewWithScanners(opts Opts, scanners engstorage.Scanners) *Engine {
 	if opts.Logger == nil {
-		opts.Logger = log.NewNopLogger()
+		opts.Logger = promslog.NewNopLogger()
 	}
 	if opts.LookbackDelta == 0 {
 		opts.LookbackDelta = 5 * time.Minute
-		level.Debug(opts.Logger).Log("msg", "lookback delta is zero, setting to default value", "value", 5*time.Minute)
+		opts.Logger.Debug("lookback delta is zero, setting to default value", "value", 5*time.Minute)
 	}
 	if opts.ExtLookbackDelta == 0 {
 		opts.ExtLookbackDelta = 1 * time.Hour
-		level.Debug(opts.Logger).Log("msg", "externallookback delta is zero, setting to default value", "value", 1*24*time.Hour)
+		opts.Logger.Debug("external lookback delta is zero, setting to default value", "value", 1*time.Hour)
 	}
-	if opts.SelectorBatchSize != 0 {
+	if len(opts.LogicalOptimizers) == 0 {
 		opts.LogicalOptimizers = append(
-			[]logicalplan.Optimizer{logicalplan.SelectorBatchSize{Size: opts.SelectorBatchSize}},
-			opts.LogicalOptimizers...,
+			opts.LogicalOptimizers, logicalplan.DefaultOptimizers...,
 		)
 	}
 
@@ -145,21 +161,14 @@ func NewWithScanners(opts Opts, scanners engstorage.Scanners) *Engine {
 				Help:      "The current number of queries being executed or waiting.",
 			},
 		),
-		queries: promauto.With(opts.Reg).NewCounterVec(
+		totalQueries: promauto.With(opts.Reg).NewCounter(
 			prometheus.CounterOpts{
 				Namespace: namespace,
 				Subsystem: subsystem,
 				Name:      "queries_total",
 				Help:      "Number of PromQL queries.",
-			}, []string{"fallback"},
+			},
 		),
-	}
-
-	var engine promql.QueryEngine
-	if opts.Engine == nil {
-		engine = promql.NewEngine(opts.EngineOpts)
-	} else {
-		engine = opts.Engine
 	}
 
 	decodingConcurrency := opts.DecodingConcurrency
@@ -169,6 +178,7 @@ func NewWithScanners(opts Opts, scanners engstorage.Scanners) *Engine {
 			decodingConcurrency = 1
 		}
 	}
+	selectorBatchSize := opts.SelectorBatchSize
 
 	var queryTracker promql.QueryTracker = nopQueryTracker{}
 	if opts.ActiveQueryTracker != nil {
@@ -176,18 +186,16 @@ func NewWithScanners(opts Opts, scanners engstorage.Scanners) *Engine {
 	}
 
 	return &Engine{
-		prom:               engine,
 		functions:          functions,
 		scanners:           scanners,
 		activeQueryTracker: queryTracker,
 
 		disableDuplicateLabelChecks: opts.DisableDuplicateLabelChecks,
-		disableFallback:             opts.DisableFallback,
 
 		logger:             opts.Logger,
 		lookbackDelta:      opts.LookbackDelta,
 		enablePerStepStats: opts.EnablePerStepStats,
-		logicalOptimizers:  opts.getLogicalOptimizers(),
+		logicalOptimizers:  opts.LogicalOptimizers,
 		timeout:            opts.Timeout,
 		metrics:            metrics,
 		extLookbackDelta:   opts.ExtLookbackDelta,
@@ -196,6 +204,7 @@ func NewWithScanners(opts Opts, scanners engstorage.Scanners) *Engine {
 			return time.Duration(opts.NoStepSubqueryIntervalFn(d.Milliseconds()) * 1000000)
 		},
 		decodingConcurrency: decodingConcurrency,
+		selectorBatchSize:   selectorBatchSize,
 	}
 }
 
@@ -207,15 +216,13 @@ var (
 )
 
 type Engine struct {
-	prom               promql.QueryEngine
 	functions          map[string]*parser.Function
 	scanners           engstorage.Scanners
 	activeQueryTracker promql.QueryTracker
 
 	disableDuplicateLabelChecks bool
-	disableFallback             bool
 
-	logger             log.Logger
+	logger             *slog.Logger
 	lookbackDelta      time.Duration
 	enablePerStepStats bool
 	logicalOptimizers  []logicalplan.Optimizer
@@ -224,11 +231,12 @@ type Engine struct {
 
 	extLookbackDelta         time.Duration
 	decodingConcurrency      int
+	selectorBatchSize        int64
 	enableAnalysis           bool
 	noStepSubqueryIntervalFn func(time.Duration) time.Duration
 }
 
-func (e *Engine) NewInstantQuery(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, qs string, ts time.Time) (promql.Query, error) {
+func (e *Engine) MakeInstantQuery(ctx context.Context, q storage.Queryable, opts *QueryOpts, qs string, ts time.Time) (promql.Query, error) {
 	idx, err := e.activeQueryTracker.Insert(ctx, qs)
 	if err != nil {
 		return nil, err
@@ -239,31 +247,12 @@ func (e *Engine) NewInstantQuery(ctx context.Context, q storage.Queryable, opts 
 	if err != nil {
 		return nil, err
 	}
-
-	if opts == nil {
-		opts = promql.NewPrometheusQueryOpts(false, e.lookbackDelta)
-	}
-	if opts.LookbackDelta() <= 0 {
-		opts = promql.NewPrometheusQueryOpts(opts.EnablePerStepStats(), e.lookbackDelta)
-	}
-
 	// determine sorting order before optimizers run, we do this by looking for "sort"
 	// and "sort_desc" and optimize them away afterwards since they are only needed at
 	// the presentation layer and not when computing the results.
 	resultSort := newResultSort(expr)
 
-	qOpts := &query.Options{
-		Start:                    ts,
-		End:                      ts,
-		Step:                     0,
-		StepsBatch:               stepsBatch,
-		LookbackDelta:            opts.LookbackDelta(),
-		EnablePerStepStats:       e.enablePerStepStats && opts.EnablePerStepStats(),
-		ExtLookbackDelta:         e.extLookbackDelta,
-		EnableAnalysis:           e.enableAnalysis,
-		NoStepSubqueryIntervalFn: e.noStepSubqueryIntervalFn,
-		DecodingConcurrency:      e.decodingConcurrency,
-	}
+	qOpts := e.makeQueryOpts(ts, ts, 0, opts)
 	if qOpts.StepsBatch > 64 {
 		return nil, ErrStepsBatchTooLarge
 	}
@@ -271,7 +260,7 @@ func (e *Engine) NewInstantQuery(ctx context.Context, q storage.Queryable, opts 
 	planOpts := logicalplan.PlanOptions{
 		DisableDuplicateLabelCheck: e.disableDuplicateLabelChecks,
 	}
-	lplan, warns := logicalplan.NewFromAST(expr, qOpts, planOpts).Optimize(e.logicalOptimizers)
+	lplan, warns := logicalplan.NewFromAST(expr, qOpts, planOpts).Optimize(e.getLogicalOptimizers(opts))
 
 	scanners, err := e.storageScanners(q, qOpts, lplan)
 	if err != nil {
@@ -281,39 +270,31 @@ func (e *Engine) NewInstantQuery(ctx context.Context, q storage.Queryable, opts 
 	ctx = warnings.NewContext(ctx)
 	defer func() { warns.Merge(warnings.FromContext(ctx)) }()
 	exec, err := execution.New(ctx, lplan.Root(), scanners, qOpts)
-	if e.triggerFallback(err) {
-		e.metrics.queries.WithLabelValues("true").Inc()
-		return e.prom.NewInstantQuery(ctx, q, opts, qs, ts)
-	}
-	e.metrics.queries.WithLabelValues("false").Inc()
 	if err != nil {
 		return nil, err
 	}
+	e.metrics.totalQueries.Inc()
 	return &compatibilityQuery{
 		Query:      &Query{exec: exec, opts: opts},
 		engine:     e,
 		plan:       lplan,
-		ts:         ts,
 		warns:      warns,
+		ts:         ts,
 		t:          InstantQuery,
 		resultSort: resultSort,
 		scanners:   scanners,
+		start:      ts,
+		end:        ts,
+		step:       0,
 	}, nil
 }
 
-func (e *Engine) NewInstantQueryFromPlan(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, root logicalplan.Node, ts time.Time) (promql.Query, error) {
+func (e *Engine) MakeInstantQueryFromPlan(ctx context.Context, q storage.Queryable, opts *QueryOpts, root logicalplan.Node, ts time.Time) (promql.Query, error) {
 	idx, err := e.activeQueryTracker.Insert(ctx, root.String())
 	if err != nil {
 		return nil, err
 	}
 	defer e.activeQueryTracker.Delete(idx)
-
-	if opts == nil {
-		opts = promql.NewPrometheusQueryOpts(false, e.lookbackDelta)
-	}
-	if opts.LookbackDelta() <= 0 {
-		opts = promql.NewPrometheusQueryOpts(opts.EnablePerStepStats(), e.lookbackDelta)
-	}
 
 	qOpts := e.makeQueryOpts(ts, ts, 0, opts)
 	if qOpts.StepsBatch > 64 {
@@ -322,7 +303,7 @@ func (e *Engine) NewInstantQueryFromPlan(ctx context.Context, q storage.Queryabl
 	planOpts := logicalplan.PlanOptions{
 		DisableDuplicateLabelCheck: e.disableDuplicateLabelChecks,
 	}
-	lplan, warns := logicalplan.New(root, qOpts, planOpts).Optimize(e.logicalOptimizers)
+	lplan, warns := logicalplan.New(root, qOpts, planOpts).Optimize(e.getLogicalOptimizers(opts))
 
 	ctx = warnings.NewContext(ctx)
 	defer func() { warns.Merge(warnings.FromContext(ctx)) }()
@@ -333,29 +314,28 @@ func (e *Engine) NewInstantQueryFromPlan(ctx context.Context, q storage.Queryabl
 	}
 
 	exec, err := execution.New(ctx, lplan.Root(), scnrs, qOpts)
-	if e.triggerFallback(err) {
-		e.metrics.queries.WithLabelValues("true").Inc()
-		return e.prom.NewInstantQuery(ctx, q, opts, root.String(), ts)
-	}
-	e.metrics.queries.WithLabelValues("false").Inc()
 	if err != nil {
 		return nil, err
 	}
+	e.metrics.totalQueries.Inc()
 
 	return &compatibilityQuery{
 		Query:  &Query{exec: exec, opts: opts},
 		engine: e,
 		plan:   lplan,
-		ts:     ts,
 		warns:  warns,
+		ts:     ts,
 		t:      InstantQuery,
 		// TODO(fpetkovski): Infer the sort order from the plan, ideally without copying the newResultSort function.
 		resultSort: noSortResultSort{},
 		scanners:   scnrs,
+		start:      ts,
+		end:        ts,
+		step:       0,
 	}, nil
 }
 
-func (e *Engine) NewRangeQuery(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, qs string, start, end time.Time, step time.Duration) (promql.Query, error) {
+func (e *Engine) MakeRangeQuery(ctx context.Context, q storage.Queryable, opts *QueryOpts, qs string, start, end time.Time, step time.Duration) (promql.Query, error) {
 	idx, err := e.activeQueryTracker.Insert(ctx, qs)
 	if err != nil {
 		return nil, err
@@ -371,12 +351,6 @@ func (e *Engine) NewRangeQuery(ctx context.Context, q storage.Queryable, opts pr
 	if expr.Type() != parser.ValueTypeVector && expr.Type() != parser.ValueTypeScalar {
 		return nil, errors.Newf("invalid expression type %q for range query, must be Scalar or instant Vector", parser.DocumentedType(expr.Type()))
 	}
-	if opts == nil {
-		opts = promql.NewPrometheusQueryOpts(false, e.lookbackDelta)
-	}
-	if opts.LookbackDelta() <= 0 {
-		opts = promql.NewPrometheusQueryOpts(opts.EnablePerStepStats(), e.lookbackDelta)
-	}
 	qOpts := e.makeQueryOpts(start, end, step, opts)
 	if qOpts.StepsBatch > 64 {
 		return nil, ErrStepsBatchTooLarge
@@ -384,7 +358,7 @@ func (e *Engine) NewRangeQuery(ctx context.Context, q storage.Queryable, opts pr
 	planOpts := logicalplan.PlanOptions{
 		DisableDuplicateLabelCheck: e.disableDuplicateLabelChecks,
 	}
-	lplan, warns := logicalplan.NewFromAST(expr, qOpts, planOpts).Optimize(e.logicalOptimizers)
+	lplan, warns := logicalplan.NewFromAST(expr, qOpts, planOpts).Optimize(e.getLogicalOptimizers(opts))
 
 	ctx = warnings.NewContext(ctx)
 	defer func() { warns.Merge(warnings.FromContext(ctx)) }()
@@ -394,14 +368,10 @@ func (e *Engine) NewRangeQuery(ctx context.Context, q storage.Queryable, opts pr
 	}
 
 	exec, err := execution.New(ctx, lplan.Root(), scnrs, qOpts)
-	if e.triggerFallback(err) {
-		e.metrics.queries.WithLabelValues("true").Inc()
-		return e.prom.NewRangeQuery(ctx, q, opts, qs, start, end, step)
-	}
-	e.metrics.queries.WithLabelValues("false").Inc()
 	if err != nil {
 		return nil, err
 	}
+	e.metrics.totalQueries.Inc()
 
 	return &compatibilityQuery{
 		Query:    &Query{exec: exec, opts: opts},
@@ -410,22 +380,19 @@ func (e *Engine) NewRangeQuery(ctx context.Context, q storage.Queryable, opts pr
 		warns:    warns,
 		t:        RangeQuery,
 		scanners: scnrs,
+		start:    start,
+		end:      end,
+		step:     step,
 	}, nil
 }
 
-func (e *Engine) NewRangeQueryFromPlan(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, root logicalplan.Node, start, end time.Time, step time.Duration) (promql.Query, error) {
+func (e *Engine) MakeRangeQueryFromPlan(ctx context.Context, q storage.Queryable, opts *QueryOpts, root logicalplan.Node, start, end time.Time, step time.Duration) (promql.Query, error) {
 	idx, err := e.activeQueryTracker.Insert(ctx, root.String())
 	if err != nil {
 		return nil, err
 	}
 	defer e.activeQueryTracker.Delete(idx)
 
-	if opts == nil {
-		opts = promql.NewPrometheusQueryOpts(false, e.lookbackDelta)
-	}
-	if opts.LookbackDelta() <= 0 {
-		opts = promql.NewPrometheusQueryOpts(opts.EnablePerStepStats(), e.lookbackDelta)
-	}
 	qOpts := e.makeQueryOpts(start, end, step, opts)
 	if qOpts.StepsBatch > 64 {
 		return nil, ErrStepsBatchTooLarge
@@ -433,7 +400,7 @@ func (e *Engine) NewRangeQueryFromPlan(ctx context.Context, q storage.Queryable,
 	planOpts := logicalplan.PlanOptions{
 		DisableDuplicateLabelCheck: e.disableDuplicateLabelChecks,
 	}
-	lplan, warns := logicalplan.New(root, qOpts, planOpts).Optimize(e.logicalOptimizers)
+	lplan, warns := logicalplan.New(root, qOpts, planOpts).Optimize(e.getLogicalOptimizers(opts))
 
 	scnrs, err := e.storageScanners(q, qOpts, lplan)
 	if err != nil {
@@ -443,14 +410,11 @@ func (e *Engine) NewRangeQueryFromPlan(ctx context.Context, q storage.Queryable,
 	ctx = warnings.NewContext(ctx)
 	defer func() { warns.Merge(warnings.FromContext(ctx)) }()
 	exec, err := execution.New(ctx, lplan.Root(), scnrs, qOpts)
-	if e.triggerFallback(err) {
-		e.metrics.queries.WithLabelValues("true").Inc()
-		return e.prom.NewRangeQuery(ctx, q, opts, lplan.Root().String(), start, end, step)
-	}
-	e.metrics.queries.WithLabelValues("false").Inc()
 	if err != nil {
 		return nil, err
 	}
+	e.metrics.totalQueries.Inc()
+
 	return &compatibilityQuery{
 		Query:    &Query{exec: exec, opts: opts},
 		engine:   e,
@@ -458,23 +422,67 @@ func (e *Engine) NewRangeQueryFromPlan(ctx context.Context, q storage.Queryable,
 		warns:    warns,
 		t:        RangeQuery,
 		scanners: scnrs,
+		start:    start,
+		end:      end,
+		step:     step,
 	}, nil
 }
 
-func (e *Engine) makeQueryOpts(start time.Time, end time.Time, step time.Duration, opts promql.QueryOpts) *query.Options {
-	qOpts := &query.Options{
+// PromQL compatibility constructors
+
+// NewInstantQuery implements the promql.Engine interface.
+func (e *Engine) NewInstantQuery(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, qs string, ts time.Time) (promql.Query, error) {
+	return e.MakeInstantQuery(ctx, q, fromPromQLOpts(opts), qs, ts)
+}
+
+// NewRangeQuery implements the promql.Engine interface.
+func (e *Engine) NewRangeQuery(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, qs string, start, end time.Time, step time.Duration) (promql.Query, error) {
+	return e.MakeRangeQuery(ctx, q, fromPromQLOpts(opts), qs, start, end, step)
+}
+
+func (e *Engine) makeQueryOpts(start time.Time, end time.Time, step time.Duration, opts *QueryOpts) *query.Options {
+	res := &query.Options{
 		Start:                    start,
 		End:                      end,
 		Step:                     step,
 		StepsBatch:               stepsBatch,
-		LookbackDelta:            opts.LookbackDelta(),
-		EnablePerStepStats:       e.enablePerStepStats && opts.EnablePerStepStats(),
+		LookbackDelta:            e.lookbackDelta,
+		EnablePerStepStats:       e.enablePerStepStats,
 		ExtLookbackDelta:         e.extLookbackDelta,
 		EnableAnalysis:           e.enableAnalysis,
 		NoStepSubqueryIntervalFn: e.noStepSubqueryIntervalFn,
 		DecodingConcurrency:      e.decodingConcurrency,
 	}
-	return qOpts
+	if opts == nil {
+		return res
+	}
+
+	if opts.LookbackDelta() > 0 {
+		res.LookbackDelta = opts.LookbackDelta()
+	}
+	if opts.EnablePerStepStats() {
+		res.EnablePerStepStats = opts.EnablePerStepStats()
+	}
+
+	if opts.DecodingConcurrency != 0 {
+		res.DecodingConcurrency = opts.DecodingConcurrency
+	}
+
+	return res
+}
+
+func (e *Engine) getLogicalOptimizers(opts *QueryOpts) []logicalplan.Optimizer {
+	var optimizers []logicalplan.Optimizer
+	if len(opts.LogicalOptimizers) != 0 {
+		optimizers = slices.Clone(opts.LogicalOptimizers)
+	} else {
+		optimizers = slices.Clone(e.logicalOptimizers)
+	}
+	selectorBatchSize := e.selectorBatchSize
+	if opts.SelectorBatchSize != 0 {
+		selectorBatchSize = opts.SelectorBatchSize
+	}
+	return append(optimizers, logicalplan.SelectorBatchSize{Size: selectorBatchSize})
 }
 
 func (e *Engine) storageScanners(queryable storage.Queryable, qOpts *query.Options, lplan logicalplan.Plan) (engstorage.Scanners, error) {
@@ -482,14 +490,6 @@ func (e *Engine) storageScanners(queryable storage.Queryable, qOpts *query.Optio
 		return promstorage.NewPrometheusScanners(queryable, qOpts, lplan)
 	}
 	return e.scanners, nil
-}
-
-func (e *Engine) triggerFallback(err error) bool {
-	if e.disableFallback {
-		return false
-	}
-
-	return errors.Is(err, parse.ErrNotSupportedExpr) || errors.Is(err, parse.ErrNotImplemented)
 }
 
 type Query struct {
@@ -504,7 +504,7 @@ func (q *Query) Explain() *ExplainOutputNode {
 }
 
 func (q *Query) Analyze() *AnalyzeOutputNode {
-	if observableRoot, ok := q.exec.(model.ObservableVectorOperator); ok {
+	if observableRoot, ok := q.exec.(telemetry.ObservableVectorOperator); ok {
 		return analyzeQuery(observableRoot)
 	}
 	return nil
@@ -516,6 +516,9 @@ type compatibilityQuery struct {
 	plan   logicalplan.Plan
 	ts     time.Time // Empty for range queries.
 	warns  annotations.Annotations
+	start  time.Time
+	end    time.Time
+	step   time.Duration
 
 	t          QueryType
 	resultSort resultSorter
@@ -653,6 +656,9 @@ loop:
 			}
 		}
 		sort.Slice(vector, q.resultSort.comparer(&vector))
+		if vector.ContainsSameLabelset() {
+			return newErrResult(ret, extlabels.ErrDuplicateLabelSet)
+		}
 		result = vector
 	case parser.ValueTypeScalar:
 		v := math.NaN()
@@ -689,6 +695,10 @@ func (q *compatibilityQuery) Stats() *stats.Statistics {
 
 	analysis := q.Analyze()
 	samples := stats.NewQuerySamples(enablePerStepStats)
+	if enablePerStepStats {
+		samples.InitStepTracking(q.start.UnixMilli(), q.end.UnixMilli(), telemetry.StepTrackingInterval(q.step))
+	}
+
 	if analysis != nil {
 		samples.PeakSamples = int(analysis.PeakSamples())
 		samples.TotalSamples = analysis.TotalSamples()
@@ -700,7 +710,7 @@ func (q *compatibilityQuery) Stats() *stats.Statistics {
 
 func (q *compatibilityQuery) Close() {
 	if err := q.scanners.Close(); err != nil {
-		level.Warn(q.engine.logger).Log("msg", "error closing storage scanners, some memory might have leaked", "err", err)
+		q.engine.logger.Warn("error closing storage scanners, some memory might have leaked", "err", err)
 	}
 }
 
@@ -720,7 +730,7 @@ func (n nopQueryTracker) Insert(ctx context.Context, query string) (int, error) 
 func (n nopQueryTracker) Delete(insertIndex int)                                {}
 func (n nopQueryTracker) Close() error                                          { return nil }
 
-func recoverEngine(logger log.Logger, plan logicalplan.Plan, errp *error) {
+func recoverEngine(logger *slog.Logger, plan logicalplan.Plan, errp *error) {
 	e := recover()
 	if e == nil {
 		return
@@ -732,7 +742,7 @@ func recoverEngine(logger log.Logger, plan logicalplan.Plan, errp *error) {
 		buf := make([]byte, 64<<10)
 		buf = buf[:runtime.Stack(buf, false)]
 
-		level.Error(logger).Log("msg", "runtime panic in engine", "expr", plan.Root().String(), "err", e, "stacktrace", string(buf))
+		logger.Error("runtime panic in engine", "expr", plan.Root().String(), "err", e, "stacktrace", string(buf))
 		*errp = errors.Wrap(err, "unexpected error")
 	}
 }

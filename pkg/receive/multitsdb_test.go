@@ -18,7 +18,8 @@ import (
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/labels"
@@ -46,21 +47,14 @@ func TestMultiTSDB(t *testing.T) {
 
 	logger := log.NewLogfmtLogger(os.Stderr)
 	t.Run("run fresh", func(t *testing.T) {
-		m := NewMultiTSDB(
-			dir, logger, prometheus.NewRegistry(), &tsdb.Options{
-				MinBlockDuration:      (2 * time.Hour).Milliseconds(),
-				MaxBlockDuration:      (2 * time.Hour).Milliseconds(),
-				RetentionDuration:     (6 * time.Hour).Milliseconds(),
-				NoLockfile:            true,
-				MaxExemplars:          100,
-				EnableExemplarStorage: true,
-			},
-			labels.FromStrings("replica", "01"),
-			"tenant_id",
-			nil,
-			false,
-			metadata.NoneFunc,
-		)
+		m := NewMultiTSDB(dir, logger, prometheus.NewRegistry(), &tsdb.Options{
+			MinBlockDuration:      (2 * time.Hour).Milliseconds(),
+			MaxBlockDuration:      (2 * time.Hour).Milliseconds(),
+			RetentionDuration:     (6 * time.Hour).Milliseconds(),
+			NoLockfile:            true,
+			MaxExemplars:          100,
+			EnableExemplarStorage: true,
+		}, labels.FromStrings("replica", "01"), "tenant_id", nil, false, false, metadata.NoneFunc)
 		defer func() { testutil.Ok(t, m.Close()) }()
 
 		testutil.Ok(t, m.Flush())
@@ -143,6 +137,7 @@ func TestMultiTSDB(t *testing.T) {
 			"tenant_id",
 			nil,
 			false,
+			false,
 			metadata.NoneFunc,
 		)
 		defer func() { testutil.Ok(t, m.Close()) }()
@@ -175,19 +170,12 @@ func TestMultiTSDB(t *testing.T) {
 
 	t.Run("flush with one sample produces a block", func(t *testing.T) {
 		const testTenant = "test_tenant"
-		m := NewMultiTSDB(
-			dir, logger, prometheus.NewRegistry(), &tsdb.Options{
-				MinBlockDuration:  (2 * time.Hour).Milliseconds(),
-				MaxBlockDuration:  (2 * time.Hour).Milliseconds(),
-				RetentionDuration: (6 * time.Hour).Milliseconds(),
-				NoLockfile:        true,
-			},
-			labels.FromStrings("replica", "01"),
-			"tenant_id",
-			nil,
-			false,
-			metadata.NoneFunc,
-		)
+		m := NewMultiTSDB(dir, logger, prometheus.NewRegistry(), &tsdb.Options{
+			MinBlockDuration:  (2 * time.Hour).Milliseconds(),
+			MaxBlockDuration:  (2 * time.Hour).Milliseconds(),
+			RetentionDuration: (6 * time.Hour).Milliseconds(),
+			NoLockfile:        true,
+		}, labels.FromStrings("replica", "01"), "tenant_id", nil, false, false, metadata.NoneFunc)
 		defer func() { testutil.Ok(t, m.Close()) }()
 
 		testutil.Ok(t, m.Flush())
@@ -455,6 +443,7 @@ func TestMultiTSDBPrune(t *testing.T) {
 				"tenant_id",
 				test.bucket,
 				false,
+				false,
 				metadata.NoneFunc,
 			)
 			defer func() { testutil.Ok(t, m.Close()) }()
@@ -530,6 +519,7 @@ func TestMultiTSDBRecreatePrunedTenant(t *testing.T) {
 		"tenant_id",
 		objstore.NewInMemBucket(),
 		false,
+		false,
 		metadata.NoneFunc,
 	)
 	defer func() { testutil.Ok(t, m.Close()) }()
@@ -558,6 +548,7 @@ func TestMultiTSDBAddNewTenant(t *testing.T) {
 				labels.FromStrings("replica", "test"),
 				"tenant_id",
 				objstore.NewInMemBucket(),
+				false,
 				false,
 				metadata.NoneFunc,
 			)
@@ -633,6 +624,7 @@ func TestAlignedHeadFlush(t *testing.T) {
 				labels.FromStrings("replica", "test"),
 				"tenant_id",
 				test.bucket,
+				false,
 				false,
 				metadata.NoneFunc,
 			)
@@ -710,6 +702,7 @@ func TestMultiTSDBStats(t *testing.T) {
 				"tenant_id",
 				nil,
 				false,
+				false,
 				metadata.NoneFunc,
 			)
 			defer func() { testutil.Ok(t, m.Close()) }()
@@ -740,6 +733,7 @@ func TestMultiTSDBWithNilStore(t *testing.T) {
 		labels.FromStrings("replica", "test"),
 		"tenant_id",
 		nil,
+		false,
 		false,
 		metadata.NoneFunc,
 	)
@@ -783,6 +777,7 @@ func TestProxyLabelValues(t *testing.T) {
 		labels.FromStrings("replica", "01"),
 		"tenant_id",
 		nil,
+		false,
 		false,
 		metadata.NoneFunc,
 	)
@@ -877,6 +872,7 @@ func BenchmarkMultiTSDB(b *testing.B) {
 		"tenant_id",
 		nil,
 		false,
+		false,
 		metadata.NoneFunc,
 	)
 	defer func() { testutil.Ok(b, m.Close()) }()
@@ -957,7 +953,13 @@ func TestMultiTSDBDoesNotDeleteNotUploadedBlocks(t *testing.T) {
 			Uploaded: []ulid.ULID{mockBlockIDs[0]},
 		}))
 
-		tenant.ship = shipper.New(log.NewNopLogger(), nil, td, nil, nil, metadata.BucketUploadSource, nil, false, metadata.NoneFunc, "")
+		tenant.ship = shipper.New(
+			nil,
+			td,
+			shipper.WithLogger(log.NewNopLogger()),
+			shipper.WithSource(metadata.BucketUploadSource),
+			shipper.WithHashFunc(metadata.NoneFunc),
+		)
 		require.Equal(t, map[ulid.ULID]struct{}{
 			mockBlockIDs[0]: {},
 		}, tenant.blocksToDelete(nil))

@@ -2,6 +2,7 @@ package promqlsmith
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"strings"
@@ -16,43 +17,46 @@ import (
 const (
 	// max number of grouping labels in either by or without clause.
 	maxGroupingLabels = 5
+
+	// Destination label used in functions like label_replace and label_join.
+	destinationLabel = "__promqlsmith_dst_label__"
 )
 
 // walkExpr generates the given expression type with one of the required value type.
 // valueTypes is only used for expressions that could have multiple possible return value types.
-func (s *PromQLSmith) walkExpr(e ExprType, valueTypes ...parser.ValueType) (parser.Expr, error) {
+func (s *PromQLSmith) walkExpr(e ExprType, depth int, valueTypes ...parser.ValueType) (parser.Expr, error) {
 	switch e {
 	case AggregateExpr:
-		return s.walkAggregateExpr(), nil
+		return s.walkAggregateExpr(depth), nil
 	case BinaryExpr:
 		// Wrap binary expression with paren for readability.
-		return wrapParenExpr(s.walkBinaryExpr(valueTypes...)), nil
+		return wrapParenExpr(s.walkBinaryExpr(depth, valueTypes...)), nil
 	case SubQueryExpr:
 		return s.walkSubQueryExpr(), nil
 	case MatrixSelector:
 		return s.walkMatrixSelector(), nil
 	case VectorSelector:
-		return s.walkVectorSelector(), nil
+		return s.walkVectorSelector(s.enableAtModifier), nil
 	case CallExpr:
-		return s.walkCall(valueTypes...), nil
+		return s.walkCall(depth, valueTypes...), nil
 	case NumberLiteral:
 		return s.walkNumberLiteral(), nil
 	case UnaryExpr:
-		return s.walkUnaryExpr(valueTypes...), nil
+		return s.walkUnaryExpr(depth, valueTypes...), nil
 	default:
 		return nil, fmt.Errorf("unsupported ExprType %d", e)
 	}
 }
 
-func (s *PromQLSmith) walkAggregateExpr() parser.Expr {
+func (s *PromQLSmith) walkAggregateExpr(depth int) parser.Expr {
 	expr := &parser.AggregateExpr{
 		Op:       s.supportedAggrs[s.rnd.Intn(len(s.supportedAggrs))],
 		Without:  s.rnd.Int()%2 == 0,
-		Expr:     s.Walk(parser.ValueTypeVector),
+		Expr:     s.walk(depth-1, parser.ValueTypeVector),
 		Grouping: s.walkGrouping(),
 	}
 	if expr.Op.IsAggregatorWithParam() {
-		expr.Param = s.walkAggregateParam(expr.Op)
+		expr.Param = s.walkAggregateParam(expr.Op, depth-1)
 	}
 	return expr
 }
@@ -72,14 +76,18 @@ func (s *PromQLSmith) walkGrouping() []string {
 	return grouping
 }
 
-func (s *PromQLSmith) walkAggregateParam(op parser.ItemType) parser.Expr {
+func (s *PromQLSmith) walkAggregateParam(op parser.ItemType, depth int) parser.Expr {
 	switch op {
 	case parser.TOPK, parser.BOTTOMK:
-		return s.Walk(parser.ValueTypeScalar)
+		// s.walk prefers generating non-NumberLiteral for scalar.
+		// To simplify generated queries we hardcode number literal here.
+		return &parser.NumberLiteral{Val: float64(s.rnd.Intn(5) + 1)}
 	case parser.QUANTILE:
-		return s.Walk(parser.ValueTypeScalar)
+		return s.walk(depth, parser.ValueTypeScalar)
 	case parser.COUNT_VALUES:
 		return &parser.StringLiteral{Val: "value"}
+	case parser.LIMITK, parser.LIMIT_RATIO:
+		return s.walk(depth, parser.ValueTypeScalar)
 	}
 	return nil
 }
@@ -87,7 +95,7 @@ func (s *PromQLSmith) walkAggregateParam(op parser.ItemType) parser.Expr {
 // Can only do binary expression between vector and scalar. So any expression
 // that returns matrix doesn't work like matrix selector, subquery
 // or function that returns matrix.
-func (s *PromQLSmith) walkBinaryExpr(valueTypes ...parser.ValueType) parser.Expr {
+func (s *PromQLSmith) walkBinaryExpr(depth int, valueTypes ...parser.ValueType) parser.Expr {
 	valueTypes = keepValueTypes(valueTypes, vectorAndScalarValueTypes)
 	expr := &parser.BinaryExpr{
 		Op: s.walkBinaryOp(!slices.Contains(valueTypes, parser.ValueTypeVector)),
@@ -100,8 +108,28 @@ func (s *PromQLSmith) walkBinaryExpr(valueTypes ...parser.ValueType) parser.Expr
 		valueTypes = []parser.ValueType{parser.ValueTypeVector}
 		expr.VectorMatching.Card = parser.CardManyToMany
 	}
-	expr.LHS = wrapParenExpr(s.Walk(valueTypes...))
-	expr.RHS = wrapParenExpr(s.Walk(valueTypes...))
+
+	// Generate vector matching only if we know it asks for vector value type.
+	if !expr.Op.IsSetOperator() && len(valueTypes) == 1 && valueTypes[0] == parser.ValueTypeVector && s.enableVectorMatching && s.rnd.Float64() > 0.8 {
+		lhs, _ := s.walkExpr(VectorSelector, depth-1, valueTypes...)
+		expr.LHS = wrapParenExpr(lhs)
+		rhs, _ := s.walkExpr(VectorSelector, depth-1, valueTypes...)
+		expr.RHS = wrapParenExpr(rhs)
+
+		leftSeriesSet, stop := getOutputSeries(expr.LHS)
+		if stop {
+			return expr
+		}
+		rightSeriesSet, stop := getOutputSeries(expr.RHS)
+		if stop {
+			return expr
+		}
+		s.walkVectorMatching(expr, leftSeriesSet, rightSeriesSet, s.rnd.Intn(2) == 0, s.rnd.Intn(4) == 0)
+	} else {
+		expr.LHS = wrapParenExpr(s.walk(depth-1, valueTypes...))
+		expr.RHS = wrapParenExpr(s.walk(depth-1, valueTypes...))
+	}
+
 	lvt := expr.LHS.Type()
 	rvt := expr.RHS.Type()
 	// ReturnBool can only be set for comparison operator. It is
@@ -111,23 +139,10 @@ func (s *PromQLSmith) walkBinaryExpr(valueTypes ...parser.ValueType) parser.Expr
 			expr.ReturnBool = true
 		}
 	}
-
-	if !expr.Op.IsSetOperator() && s.enableVectorMatching && lvt == parser.ValueTypeVector &&
-		rvt == parser.ValueTypeVector && s.rnd.Intn(2) == 0 {
-		leftSeriesSet, stop := getOutputSeries(expr.LHS)
-		if stop {
-			return expr
-		}
-		rightSeriesSet, stop := getOutputSeries(expr.RHS)
-		if stop {
-			return expr
-		}
-		s.walkVectorMatching(expr, leftSeriesSet, rightSeriesSet, s.rnd.Intn(4) == 0)
-	}
 	return expr
 }
 
-func (s *PromQLSmith) walkVectorMatching(expr *parser.BinaryExpr, seriesSetA []labels.Labels, seriesSetB []labels.Labels, includeLabels bool) {
+func (s *PromQLSmith) walkVectorMatching(expr *parser.BinaryExpr, seriesSetA []labels.Labels, seriesSetB []labels.Labels, on, includeLabels bool) {
 	sa := make(map[string]struct{})
 	for _, series := range seriesSetA {
 		series.Range(func(lbl labels.Label) {
@@ -147,46 +162,127 @@ func (s *PromQLSmith) walkVectorMatching(expr *parser.BinaryExpr, seriesSetA []l
 			sb[lbl.Name] = struct{}{}
 		})
 	}
-	expr.VectorMatching.On = true
-	matchedLabels := make([]string, 0)
+
+	// Find all matching labels
+	allMatchedLabels := make([]string, 0)
 	for key := range sb {
 		if _, ok := sa[key]; ok {
-			matchedLabels = append(matchedLabels, key)
+			allMatchedLabels = append(allMatchedLabels, key)
 		}
 	}
+	// If there is no matching labels, we don't need to do vector matching.
+	if len(allMatchedLabels) == 0 {
+		return
+	}
+
+	// Randomly select a subset of matched labels
+	sort.Strings(allMatchedLabels)                     // Sort for deterministic selection
+	numLabels := s.rnd.Intn(len(allMatchedLabels)) + 1 // Select at least 1 label
+	selectedIndices := s.rnd.Perm(len(allMatchedLabels))[:numLabels]
+	sort.Ints(selectedIndices) // Sort indices for consistent order
+
+	matchedLabels := make([]string, numLabels)
+	for i, idx := range selectedIndices {
+		matchedLabels[i] = allMatchedLabels[idx]
+	}
+
+	expr.VectorMatching.On = on
+
 	// We are doing a very naive approach of guessing side cardinalities
 	// by checking number of series each side.
 	oneSideLabelsSet := sa
-	if len(seriesSetA) > len(seriesSetB) {
+	if expr.VectorMatching.On {
 		expr.VectorMatching.MatchingLabels = matchedLabels
+	} else {
+		// For 'ignoring', we need to use all labels except the matched ones
+		expr.VectorMatching.MatchingLabels = getDifference(getAllLabels(sa), matchedLabels)
+	}
+
+	if len(seriesSetA) > len(seriesSetB) {
 		expr.VectorMatching.Card = parser.CardManyToOne
 		oneSideLabelsSet = sb
 	} else if len(seriesSetA) < len(seriesSetB) {
-		expr.VectorMatching.MatchingLabels = matchedLabels
 		expr.VectorMatching.Card = parser.CardOneToMany
 	}
+
 	// Otherwise we do 1:1 match.
 
-	// For simplicity, we always include all labels on the one side.
 	if expr.VectorMatching.Card != parser.CardOneToOne && includeLabels {
-		includeLabels := getIncludeLabels(oneSideLabelsSet, matchedLabels)
+		includeLabels := getRandomIncludeLabels(s.rnd, oneSideLabelsSet, expr.VectorMatching.MatchingLabels)
 		expr.VectorMatching.Include = includeLabels
 	}
 }
 
-func getIncludeLabels(labelNameSet map[string]struct{}, matchedLabels []string) []string {
-	output := make([]string, 0)
-OUTER:
-	for lbl := range labelNameSet {
-		for _, matchedLabel := range matchedLabels {
-			if lbl == matchedLabel {
-				continue OUTER
-			}
-		}
-		output = append(output, lbl)
+// Helper function to get all labels from a map
+func getAllLabels(labelSet map[string]struct{}) []string {
+	labels := make([]string, 0, len(labelSet))
+	for label := range labelSet {
+		labels = append(labels, label)
 	}
+	sort.Strings(labels)
+	return labels
+}
+
+// Helper function to get the difference between two sorted string slices
+func getDifference(all, exclude []string) []string {
+	result := make([]string, 0)
+	excludeMap := make(map[string]struct{})
+	for _, e := range exclude {
+		excludeMap[e] = struct{}{}
+	}
+
+	for _, label := range all {
+		if _, exists := excludeMap[label]; !exists {
+			result = append(result, label)
+		}
+	}
+	return result
+}
+
+// Helper function to get all eligible labels that aren't in the matched set
+func getIncludeLabels(labelNameSet map[string]struct{}, matchedLabels []string) []string {
+	// Create a map of matched labels for quick lookup
+	matchedSet := make(map[string]struct{})
+	for _, label := range matchedLabels {
+		matchedSet[label] = struct{}{}
+	}
+
+	// Collect all eligible labels that aren't in the matched set
+	output := make([]string, 0)
+	for lbl := range labelNameSet {
+		if _, matched := matchedSet[lbl]; !matched {
+			output = append(output, lbl)
+		}
+	}
+
+	// Sort for deterministic output
 	sort.Strings(output)
 	return output
+}
+
+// Helper function to randomly select a subset of include labels
+func getRandomIncludeLabels(rnd *rand.Rand, labelNameSet map[string]struct{}, matchedLabels []string) []string {
+	eligible := getIncludeLabels(labelNameSet, matchedLabels)
+	if len(eligible) == 0 {
+		return nil
+	}
+
+	// Pick a random number of labels to include (at least 1 if available)
+	numLabels := rnd.Intn(len(eligible)) + 1
+	if numLabels > len(eligible) {
+		numLabels = len(eligible)
+	}
+
+	// Randomly select the labels
+	indices := rnd.Perm(len(eligible))[:numLabels]
+	sort.Ints(indices)
+
+	// Create the final selection
+	result := make([]string, numLabels)
+	for i, idx := range indices {
+		result[i] = eligible[idx]
+	}
+	return result
 }
 
 // Walk binary op based on whether vector value type is allowed or not.
@@ -211,7 +307,7 @@ func (s *PromQLSmith) walkSubQueryExpr() parser.Expr {
 	expr := &parser.SubqueryExpr{
 		Range: time.Hour,
 		Step:  time.Minute,
-		Expr:  s.walkVectorSelector(),
+		Expr:  s.walkVectorSelector(s.enableAtModifier),
 	}
 	if s.enableOffset && s.rnd.Int()%2 == 0 {
 		negativeOffset := s.rnd.Intn(2) == 0
@@ -226,7 +322,7 @@ func (s *PromQLSmith) walkSubQueryExpr() parser.Expr {
 	return expr
 }
 
-func (s *PromQLSmith) walkCall(valueTypes ...parser.ValueType) parser.Expr {
+func (s *PromQLSmith) walkCall(depth int, valueTypes ...parser.ValueType) parser.Expr {
 	expr := &parser.Call{}
 
 	funcs := s.supportedFuncs
@@ -244,28 +340,172 @@ func (s *PromQLSmith) walkCall(valueTypes ...parser.ValueType) parser.Expr {
 	}
 	sort.Slice(funcs, func(i, j int) bool { return strings.Compare(funcs[i].Name, funcs[j].Name) < 0 })
 	expr.Func = funcs[s.rnd.Intn(len(funcs))]
-	s.walkFuncArgs(expr)
+	s.walkFunctions(expr, depth)
 	return expr
 }
 
-func (s *PromQLSmith) walkFuncArgs(expr *parser.Call) {
+func (s *PromQLSmith) walkFunctions(expr *parser.Call, depth int) {
+	switch expr.Func.Name {
+	case "label_join":
+		s.walkLabelJoin(expr, depth)
+		return
+	case "sort_by_label", "sort_by_label_desc":
+		s.walkSortByLabel(expr, depth)
+		return
+	default:
+	}
+
 	expr.Args = make([]parser.Expr, len(expr.Func.ArgTypes))
 	if expr.Func.Name == "holt_winters" {
-		s.walkHoltWinters(expr)
+		s.walkHoltWinters(expr, depth)
+		return
+	} else if expr.Func.Name == "label_replace" {
+		s.walkLabelReplace(expr, depth)
+		return
+	} else if expr.Func.Name == "info" {
+		s.walkInfo(expr, depth)
+		return
+	}
+	if expr.Func.Variadic != 0 {
+		s.walkVariadicFunctions(expr, depth)
 		return
 	}
 	for i, arg := range expr.Func.ArgTypes {
-		expr.Args[i] = s.Walk(arg)
+		expr.Args[i] = s.walk(depth-1, arg)
 	}
 }
 
-func (s *PromQLSmith) walkHoltWinters(expr *parser.Call) {
-	expr.Args[0] = s.Walk(expr.Func.ArgTypes[0])
+func (s *PromQLSmith) walkHoltWinters(expr *parser.Call, depth int) {
+	expr.Args[0] = s.walk(depth-1, expr.Func.ArgTypes[0])
 	expr.Args[1] = &parser.NumberLiteral{Val: getNonZeroFloat64(s.rnd)}
 	expr.Args[2] = &parser.NumberLiteral{Val: getNonZeroFloat64(s.rnd)}
 }
 
-func (s *PromQLSmith) walkVectorSelector() parser.Expr {
+func (s *PromQLSmith) walkInfo(expr *parser.Call, depth int) {
+	expr.Args[0] = s.walk(depth-1, expr.Func.ArgTypes[0])
+	if s.rnd.Int()%2 == 0 {
+		// skip second parameter
+		expr.Args = expr.Args[:1]
+	} else {
+		expr.Args[1] = s.walkVectorSelector(false)
+	}
+}
+
+func (s *PromQLSmith) walkLabelReplace(expr *parser.Call, depth int) {
+	expr.Args[0] = s.walk(depth-1, expr.Func.ArgTypes[0])
+	expr.Args[1] = &parser.StringLiteral{Val: destinationLabel}
+	expr.Args[2] = &parser.StringLiteral{Val: "$1"}
+	seriesSet, _ := getOutputSeries(expr.Args[0])
+
+	var srcLabel string
+	if len(seriesSet) > 0 {
+		lbls := seriesSet[0]
+		if lbls.Len() > 0 {
+			idx := s.rnd.Intn(lbls.Len())
+			cnt := 0
+			lbls.Range(func(lbl labels.Label) {
+				if cnt == idx {
+					srcLabel = lbl.Name
+				}
+				cnt++
+			})
+		}
+	}
+	if srcLabel != "" {
+		// It is possible that the vector selector match nothing. In this case, it doesn't matter which label
+		// we pick. Just pick something from all series labels.
+		idx := s.rnd.Intn(len(s.labelNames))
+		srcLabel = s.labelNames[idx]
+	}
+	expr.Args[3] = &parser.StringLiteral{Val: srcLabel}
+	// Just copy the label we picked.
+	expr.Args[4] = &parser.StringLiteral{Val: "(.*)"}
+}
+
+func (s *PromQLSmith) walkSortByLabel(expr *parser.Call, depth int) {
+	expr.Args = make([]parser.Expr, 0, len(expr.Func.ArgTypes))
+	expr.Args = append(expr.Args, s.walk(depth-1, expr.Func.ArgTypes[0]))
+	seriesSet, _ := getOutputSeries(expr.Args[0])
+
+	// Let's try to not sort more than 1 label for simplicity.
+	cnt := 0
+	if len(seriesSet) > 0 {
+		seriesSet[0].Range(func(lbl labels.Label) {
+			if cnt < 2 {
+				if s.rnd.Int()%2 == 0 {
+					expr.Args = append(expr.Args, &parser.StringLiteral{Val: lbl.Name})
+					cnt++
+				}
+			}
+		})
+
+		return
+	}
+
+	// It is possible that the vector selector match nothing. In this case, it doesn't matter which label
+	// we pick. Just pick something from all series labels.
+	for _, name := range s.labelNames {
+		if cnt < 1 {
+			if s.rnd.Int()%2 == 0 {
+				expr.Args = append(expr.Args, &parser.StringLiteral{Val: name})
+				cnt++
+			}
+		}
+	}
+}
+
+func (s *PromQLSmith) walkLabelJoin(expr *parser.Call, depth int) {
+	expr.Args = make([]parser.Expr, 0, len(expr.Func.ArgTypes))
+	expr.Args = append(expr.Args, s.walk(depth-1, expr.Func.ArgTypes[0]))
+	seriesSet, _ := getOutputSeries(expr.Args[0])
+	expr.Args = append(expr.Args, &parser.StringLiteral{Val: destinationLabel})
+	expr.Args = append(expr.Args, &parser.StringLiteral{Val: ","})
+
+	// Let's try to not join more than 2 labels for simplicity.
+	cnt := 0
+	if len(seriesSet) > 0 {
+		seriesSet[0].Range(func(lbl labels.Label) {
+			if cnt < 2 {
+				if s.rnd.Int()%2 == 0 {
+					expr.Args = append(expr.Args, &parser.StringLiteral{Val: lbl.Name})
+					cnt++
+				}
+			}
+		})
+		return
+	}
+
+	// It is possible that the vector selector match nothing. In this case, it doesn't matter which label
+	// we pick. Just pick something from all series labels.
+	for _, name := range s.labelNames {
+		if cnt < 2 {
+			if s.rnd.Int()%2 == 0 {
+				expr.Args = append(expr.Args, &parser.StringLiteral{Val: name})
+				cnt++
+			}
+		}
+	}
+}
+
+// Supported variadic functions include:
+// days_in_month, day_of_month, day_of_week, day_of_year, year,
+// hour, minute, month, round.
+// Unsupported variadic functions include:
+// label_join, sort_by_label_desc, sort_by_label
+func (s *PromQLSmith) walkVariadicFunctions(expr *parser.Call, depth int) {
+	switch expr.Func.Name {
+	case "round":
+		expr.Args[0] = s.walk(depth-1, expr.Func.ArgTypes[0])
+		expr.Args[1] = &parser.NumberLiteral{Val: float64(s.rnd.Intn(10))}
+	default:
+		// Rest of supported functions have either 0 or 1 function argument.
+		// If not specified it uses current timestamp instead of the vector timestamp.
+		// To reduce test flakiness we always use vector timestamp.
+		expr.Args[0] = s.walk(depth-1, expr.Func.ArgTypes[0])
+	}
+}
+
+func (s *PromQLSmith) walkVectorSelector(enableAtModifier bool) parser.Expr {
 	expr := &parser.VectorSelector{}
 	expr.LabelMatchers = s.walkLabelMatchers()
 	s.populateSeries(expr)
@@ -276,7 +516,7 @@ func (s *PromQLSmith) walkVectorSelector() parser.Expr {
 			expr.OriginalOffset = -expr.OriginalOffset
 		}
 	}
-	if s.enableAtModifier && s.rnd.Float64() > 0.7 {
+	if enableAtModifier && s.rnd.Float64() > 0.7 {
 		expr.Timestamp, expr.StartOrEnd = s.walkAtModifier()
 	}
 
@@ -303,7 +543,7 @@ func (s *PromQLSmith) walkLabelMatchers() []*labels.Matcher {
 	}
 	series := s.seriesSet[s.rnd.Intn(len(s.seriesSet))]
 	orders := s.rnd.Perm(series.Len())
-	items := s.rnd.Intn((series.Len() + 1) / 2)
+	items := s.rnd.Intn(int(math.Ceil(float64(series.Len()+1) / 2)))
 	matchers := make([]*labels.Matcher, 0, items)
 	containsName := false
 	lbls := make([]labels.Label, 0, series.Len())
@@ -311,12 +551,58 @@ func (s *PromQLSmith) walkLabelMatchers() []*labels.Matcher {
 		lbls = append(lbls, l)
 	})
 
+	valF := func(v string) string {
+		// If a label value contains + such as +Inf it will cause parse error for regex.
+		// Always hardcode to .+ for simplicity.
+		if strings.Contains(v, "+") {
+			return ".+"
+		}
+		val := s.rnd.Float64()
+		switch {
+		case val > 0.95:
+			return ""
+		case val > 0.90:
+			return ".*"
+		case val > 0.85:
+			return ".+"
+		case val > 0.75:
+			return fmt.Sprintf(".*%v", v[len(v)/2:])
+		default:
+			return fmt.Sprintf("%v.*", v[:len(v)/2])
+		}
+	}
+
 	for i := 0; i < items; i++ {
+
+		var matcher *labels.Matcher
 
 		if lbls[orders[i]].Name == labels.MetricName {
 			containsName = true
+			matcher = labels.MustNewMatcher(labels.MatchEqual, lbls[orders[i]].Name, lbls[orders[i]].Value)
+		} else {
+			res := s.rnd.Intn(4)
+			matchType := labels.MatchType(res)
+			switch matchType {
+			case labels.MatchEqual:
+				val := lbls[orders[i]].Value
+				if s.rnd.Float64() > 0.9 {
+					val = ""
+				}
+				matcher = labels.MustNewMatcher(labels.MatchEqual, lbls[orders[i]].Name, val)
+			case labels.MatchNotEqual:
+				val := lbls[orders[i]].Value
+				if s.rnd.Float64() > 0.9 {
+					val = ""
+				}
+				matcher = labels.MustNewMatcher(labels.MatchNotEqual, lbls[orders[i]].Name, val)
+			case labels.MatchRegexp:
+				matcher = labels.MustNewMatcher(labels.MatchRegexp, lbls[orders[i]].Name, valF(lbls[orders[i]].Value))
+			case labels.MatchNotRegexp:
+				matcher = labels.MustNewMatcher(labels.MatchNotRegexp, lbls[orders[i]].Name, valF(lbls[orders[i]].Value))
+			}
 		}
-		matchers = append(matchers, labels.MustNewMatcher(labels.MatchEqual, lbls[orders[i]].Name, lbls[orders[i]].Value))
+
+		matchers = append(matchers, matcher)
 	}
 
 	if !containsName {
@@ -333,8 +619,8 @@ func (s *PromQLSmith) walkLabelMatchers() []*labels.Matcher {
 	return matchers
 }
 
-// walkSelectors is similar to walkLabelMatchers, but used for generating various
-// types of matchers more than simple equal matcher.
+// walkSelectors is similar to walkLabelMatchers, but does not guarantee the equal
+// matcher on the metric name
 func (s *PromQLSmith) walkSelectors() []*labels.Matcher {
 	if len(s.seriesSet) == 0 {
 		return nil
@@ -472,17 +758,17 @@ func (s *PromQLSmith) walkMatrixSelector() parser.Expr {
 	return &parser.MatrixSelector{
 		// Make sure the time range is > 0s.
 		Range:          time.Duration(s.rnd.Intn(5)+1) * time.Minute,
-		VectorSelector: s.walkVectorSelector(),
+		VectorSelector: s.walkVectorSelector(s.enableAtModifier),
 	}
 }
 
 // Only vector and scalar result is allowed.
-func (s *PromQLSmith) walkUnaryExpr(valueTypes ...parser.ValueType) parser.Expr {
+func (s *PromQLSmith) walkUnaryExpr(depth int, valueTypes ...parser.ValueType) parser.Expr {
 	expr := &parser.UnaryExpr{
 		Op: parser.SUB,
 	}
 	valueTypes = keepValueTypes(valueTypes, vectorAndScalarValueTypes)
-	expr.Expr = s.Walk(valueTypes...)
+	expr.Expr = s.walk(depth-1, valueTypes...)
 	return expr
 }
 
@@ -538,13 +824,6 @@ func keepValueTypes(input []parser.ValueType, keep []parser.ValueType) []parser.
 	return out
 }
 
-func min(a, b int) int {
-	if a > b {
-		return b
-	}
-	return a
-}
-
 // generate a non-zero float64 value randomly.
 func getNonZeroFloat64(rnd *rand.Rand) float64 {
 	for {
@@ -594,9 +873,7 @@ func getOutputSeries(expr parser.Expr) ([]labels.Labels, bool) {
 		if !node.Without {
 			for _, lbl := range lbls {
 				for _, groupLabel := range node.Grouping {
-					if val := lbl.Get(groupLabel); val == "" {
-						continue
-					} else {
+					if val := lbl.Get(groupLabel); val != "" {
 						lb.Set(groupLabel, val)
 					}
 				}
@@ -664,6 +941,6 @@ func getOutputSeries(expr parser.Expr) ([]labels.Labels, bool) {
 	return lbls, stop
 }
 
-func randRange(min, max int) int {
-	return rand.Intn(max-min) + min
+func randRange(low, high int) int {
+	return rand.Intn(high-low) + low
 }

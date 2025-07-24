@@ -6,6 +6,7 @@ package receive
 import (
 	"bytes"
 	"context"
+	goerrors "errors"
 	"fmt"
 	"io"
 	"math"
@@ -23,8 +24,6 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
-
-	goerrors "errors"
 
 	"github.com/alecthomas/units"
 	"github.com/efficientgo/core/testutil"
@@ -111,11 +110,14 @@ func newFakeAppender(appendErr, commitErr, rollbackErr func() error) *fakeAppend
 	}
 	return &fakeAppender{
 		samples:     make(map[storage.SeriesRef][]prompb.Sample),
+		exemplars:   make(map[storage.SeriesRef][]exemplar.Exemplar),
 		appendErr:   appendErr,
 		commitErr:   commitErr,
 		rollbackErr: rollbackErr,
 	}
 }
+
+func (f *fakeAppender) SetOptions(opts *storage.AppendOptions) {}
 
 func (f *fakeAppender) UpdateMetadata(storage.SeriesRef, labels.Labels, prometheusMetadata.Metadata) (storage.SeriesRef, error) {
 	return 0, nil
@@ -152,6 +154,11 @@ func (f *fakeAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e 
 
 // TODO(rabenhorst): Needs to be implement for native histogram support.
 func (f *fakeAppender) AppendHistogram(ref storage.SeriesRef, l labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	panic("not implemented")
+}
+
+// TODO(sungjin1212): Needs to be implement for native histogram support.
+func (f *fakeAppender) AppendHistogramCTZeroSample(ref storage.SeriesRef, l labels.Labels, t, ct int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
 	panic("not implemented")
 }
 
@@ -232,7 +239,7 @@ func newTestHandlerHashring(
 
 		ag         = addrGen{}
 		logger     = logging.NewLogger("debug", "logfmt", "receive_test")
-		limiter, _ = NewLimiter(NewNopConfig(), nil, RouterIngestor, log.NewNopLogger(), 1*time.Second)
+		limiter, _ = NewLimiter(extkingpin.NewNopConfig(), nil, RouterIngestor, log.NewNopLogger(), 1*time.Second)
 	)
 	for i := range appendables {
 		h := NewHandler(logger, &Options{
@@ -274,7 +281,7 @@ func newTestHandlerHashring(
 		hashringAlgo = AlgorithmHashmod
 	}
 
-	hashring, err := NewMultiHashring(hashringAlgo, replicationFactor, cfg)
+	hashring, err := NewMultiHashring(hashringAlgo, replicationFactor, cfg, prometheus.NewRegistry())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1101,6 +1108,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 		"tenant_id",
 		nil,
 		false,
+		false,
 		metadata.NoneFunc,
 	)
 	defer func() { testutil.Ok(b, m.Close()) }()
@@ -1818,6 +1826,57 @@ func TestDistributeSeries(t *testing.T) {
 	require.Equal(t, 1, labelpb.ZLabelsToPromLabels(remote[endpointReplica{endpoint: endpoint, replica: 0}]["boo"].timeSeries[0].Labels).Len())
 
 	require.Equal(t, map[string]struct{}{"bar": {}, "boo": {}}, hr.seenTenants)
+}
+
+func TestHandlerSplitTenantLabelLocalWrite(t *testing.T) {
+	const tenantIDLabelName = "thanos_tenant_id"
+
+	appendable := &fakeAppendable{
+		appender: newFakeAppender(nil, nil, nil),
+	}
+
+	h := NewHandler(nil, &Options{
+		Endpoint:             "localhost",
+		SplitTenantLabelName: tenantIDLabelName,
+		ReceiverMode:         RouterIngestor,
+		ReplicationFactor:    1,
+		ForwardTimeout:       1 * time.Second,
+		Writer: NewWriter(
+			log.NewNopLogger(),
+			newFakeTenantAppendable(appendable),
+			&WriterOptions{},
+		),
+	})
+
+	// initialize hashring with a single local endpoint matching the handler endpoint to force
+	// using local write
+	hashring, err := newSimpleHashring([]Endpoint{
+		{
+			Address: h.options.Endpoint,
+		},
+	})
+	require.NoError(t, err)
+	hr := &hashringSeenTenants{Hashring: hashring}
+	h.Hashring(hr)
+
+	response, err := h.RemoteWrite(context.Background(), &storepb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: labelpb.ZLabelsFromPromLabels(
+					labels.FromStrings("a", "b", tenantIDLabelName, "bar"),
+				),
+			},
+			{
+				Labels: labelpb.ZLabelsFromPromLabels(
+					labels.FromStrings("b", "a", tenantIDLabelName, "foo"),
+				),
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	require.Equal(t, map[string]struct{}{"bar": {}, "foo": {}}, hr.seenTenants)
 }
 
 func TestHandlerFlippingHashrings(t *testing.T) {

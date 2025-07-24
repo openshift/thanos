@@ -10,17 +10,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/logicalplan"
+	"github.com/thanos-io/promql-engine/query"
+
 	"github.com/efficientgo/core/errors"
 	prommodel "github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
-
-	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/logicalplan"
-	"github.com/thanos-io/promql-engine/query"
 )
 
 type relabelOperator struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	next     model.VectorOperator
 	funcExpr *logicalplan.FunctionCall
@@ -37,7 +38,7 @@ func newRelabelOperator(
 		next:     next,
 		funcExpr: funcExpr,
 	}
-	oper.OperatorTelemetry = model.NewTelemetry(oper, opts)
+	oper.OperatorTelemetry = telemetry.NewTelemetry(oper, opts)
 
 	return oper
 }
@@ -47,7 +48,7 @@ func (o *relabelOperator) String() string {
 }
 
 func (o *relabelOperator) Explain() (next []model.VectorOperator) {
-	return []model.VectorOperator{}
+	return []model.VectorOperator{o.next}
 }
 
 func (o *relabelOperator) Series(ctx context.Context) ([]labels.Labels, error) {
@@ -150,6 +151,11 @@ func (o *relabelOperator) loadSeriesForLabelReplace(series []labels.Labels) erro
 	if err != nil {
 		return errors.Newf("invalid regular expression in label_replace(): %s", labelReplaceRegexVal)
 	}
+
+	if !prommodel.LabelNameRE.MatchString(labelReplaceDst) {
+		return errors.Newf("invalid destination label name in label_replace(): %s", labelReplaceDst)
+	}
+
 	for i, s := range series {
 		lbls := s
 

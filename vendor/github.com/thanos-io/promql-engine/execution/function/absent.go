@@ -8,15 +8,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/prometheus/model/labels"
-
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/thanos-io/promql-engine/query"
+
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 type absentOperator struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	once     sync.Once
 	funcExpr *logicalplan.FunctionCall
@@ -36,7 +37,7 @@ func newAbsentOperator(
 		pool:     pool,
 		next:     next,
 	}
-	oper.OperatorTelemetry = model.NewTelemetry(oper, opts)
+	oper.OperatorTelemetry = telemetry.NewTelemetry(oper, opts)
 
 	return oper
 }
@@ -62,7 +63,7 @@ func (o *absentOperator) loadSeries() {
 	o.once.Do(func() {
 		o.pool.SetStepSize(1)
 
-		// https://github.com/prometheus/prometheus/blob/main/promql/functions.go#L1385
+		// https://github.com/prometheus/prometheus/blob/df1b4da348a7c2f8c0b294ffa1f05db5f6641278/promql/functions.go#L1857
 		var lm []*labels.Matcher
 		switch n := o.funcExpr.Args[0].(type) {
 		case *logicalplan.VectorSelector:
@@ -76,19 +77,19 @@ func (o *absentOperator) loadSeries() {
 		}
 
 		has := make(map[string]bool)
-		lmap := make(map[string]string)
+		b := labels.NewBuilder(labels.EmptyLabels())
 		for _, l := range lm {
 			if l.Name == labels.MetricName {
 				continue
 			}
 			if l.Type == labels.MatchEqual && !has[l.Name] {
-				lmap[l.Name] = l.Value
+				b.Set(l.Name, l.Value)
 				has[l.Name] = true
 			} else {
-				delete(lmap, l.Name)
+				b.Del(l.Name)
 			}
 		}
-		o.series = []labels.Labels{labels.FromMap(lmap)}
+		o.series = []labels.Labels{b.Labels()}
 	})
 }
 
