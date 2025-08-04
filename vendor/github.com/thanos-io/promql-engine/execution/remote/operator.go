@@ -9,15 +9,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/execution/warnings"
+	"github.com/thanos-io/promql-engine/query"
+	promstorage "github.com/thanos-io/promql-engine/storage/prometheus"
+
+	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/stats"
-
-	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/execution/warnings"
-	"github.com/thanos-io/promql-engine/query"
-	promstorage "github.com/thanos-io/promql-engine/storage/prometheus"
 )
 
 type Execution struct {
@@ -25,21 +27,24 @@ type Execution struct {
 	query           promql.Query
 	opts            *query.Options
 	queryRangeStart time.Time
-	vectorSelector  model.VectorOperator
-	model.OperatorTelemetry
+	queryRangeEnd   time.Time
+
+	vectorSelector model.VectorOperator
+	telemetry.OperatorTelemetry
 }
 
-func NewExecution(query promql.Query, pool *model.VectorPool, queryRangeStart time.Time, opts *query.Options, _ storage.SelectHints) *Execution {
-	storage := newStorageFromQuery(query, opts)
+func NewExecution(query promql.Query, pool *model.VectorPool, queryRangeStart, queryRangeEnd time.Time, engineLabels []labels.Labels, opts *query.Options, _ storage.SelectHints) *Execution {
+	storage := newStorageFromQuery(query, opts, engineLabels)
 	oper := &Execution{
 		storage:         storage,
 		query:           query,
 		opts:            opts,
 		queryRangeStart: queryRangeStart,
+		queryRangeEnd:   queryRangeEnd,
 		vectorSelector:  promstorage.NewVectorSelector(pool, storage, opts, 0, 0, false, 0, 1),
 	}
 
-	oper.OperatorTelemetry = model.NewTelemetry(oper, opts)
+	oper.OperatorTelemetry = telemetry.NewTelemetry(oper, opts)
 
 	return oper
 }
@@ -54,7 +59,7 @@ func (e *Execution) Series(ctx context.Context) ([]labels.Labels, error) {
 }
 
 func (e *Execution) String() string {
-	return fmt.Sprintf("[remoteExec] %s (%d, %d)", e.query, e.queryRangeStart.Unix(), e.opts.End.Unix())
+	return fmt.Sprintf("[remoteExec] %s (%d, %d)", e.query, e.queryRangeStart.Unix(), e.queryRangeEnd.Unix())
 }
 
 func (e *Execution) Next(ctx context.Context) ([]model.StepVector, error) {
@@ -90,16 +95,18 @@ func (e *Execution) Samples() *stats.QuerySamples {
 type storageAdapter struct {
 	query promql.Query
 	opts  *query.Options
+	lbls  []labels.Labels
 
 	once   sync.Once
 	err    error
 	series []promstorage.SignedSeries
 }
 
-func newStorageFromQuery(query promql.Query, opts *query.Options) *storageAdapter {
+func newStorageFromQuery(query promql.Query, opts *query.Options, lbls []labels.Labels) *storageAdapter {
 	return &storageAdapter{
 		query: query,
 		opts:  opts,
+		lbls:  lbls,
 	}
 }
 
@@ -120,7 +127,7 @@ func (s *storageAdapter) executeQuery(ctx context.Context) {
 		warnings.AddToContext(w, ctx)
 	}
 	if result.Err != nil {
-		s.err = result.Err
+		s.err = errors.Wrapf(result.Err, "remote exec error [%s]", s.lbls)
 		return
 	}
 	switch val := result.Value.(type) {

@@ -66,18 +66,29 @@ type options struct {
 	// to the underlying Stackdriver Trace API client.
 	// Optional.
 	traceClientOptions []option.ClientOption
-	// timeout for all API calls. If not set, defaults to 5 seconds.
+	// timeout for all API calls. If not set, defaults to 12 seconds.
 	timeout time.Duration
+	// destinationProjectQuota sets whether the request should use quota from
+	// the destination project for the request.
+	destinationProjectQuota bool
 }
 
 // WithProjectID sets Google Cloud Platform project as projectID.
 // Without using this option, it automatically detects the project ID
 // from the default credential detection process.
-// Please find the detailed order of the default credentail detection proecess on the doc:
+// Please find the detailed order of the default credential detection process on the doc:
 // https://godoc.org/golang.org/x/oauth2/google#FindDefaultCredentials
 func WithProjectID(projectID string) func(o *options) {
 	return func(o *options) {
 		o.projectID = projectID
+	}
+}
+
+// WithDestinationProjectQuota enables per-request usage of the destination
+// project's quota. For example, when setting the gcp.project.id resource attribute.
+func WithDestinationProjectQuota() func(o *options) {
+	return func(o *options) {
+		o.destinationProjectQuota = true
 	}
 }
 
@@ -106,6 +117,7 @@ func WithContext(ctx context.Context) func(o *options) {
 }
 
 // WithTimeout sets the timeout for trace exporter and metric exporter
+// If unset, it defaults to a 12 second timeout.
 func WithTimeout(t time.Duration) func(o *options) {
 	return func(o *options) {
 		o.timeout = t
@@ -134,7 +146,7 @@ func (o *options) handleError(err error) {
 }
 
 // defaultTimeout is used as default when timeout is not set in newContextWithTimout.
-const defaultTimeout = 5 * time.Second
+const defaultTimeout = 12 * time.Second
 
 // Exporter is a trace exporter that uploads data to Stackdriver.
 //

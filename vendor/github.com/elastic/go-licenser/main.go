@@ -21,10 +21,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/elastic/go-licenser/licensing"
 )
@@ -58,56 +60,9 @@ Options:
 
 `[1:]
 
-// Headers is the map of supported licenses
-var Headers = map[string][]string{
-	"ASL2": {
-		`// Licensed to %s under one or more contributor`,
-		`// license agreements. See the NOTICE file distributed with`,
-		`// this work for additional information regarding copyright`,
-		`// ownership. %s licenses this file to you under`,
-		`// the Apache License, Version 2.0 (the "License"); you may`,
-		`// not use this file except in compliance with the License.`,
-		`// You may obtain a copy of the License at`,
-		`//`,
-		`//     http://www.apache.org/licenses/LICENSE-2.0`,
-		`//`,
-		`// Unless required by applicable law or agreed to in writing,`,
-		`// software distributed under the License is distributed on an`,
-		`// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY`,
-		`// KIND, either express or implied.  See the License for the`,
-		`// specific language governing permissions and limitations`,
-		`// under the License.`,
-	},
-	"ASL2-Short": {
-		`// Licensed to %s under one or more agreements.`,
-		`// %s licenses this file to you under the Apache 2.0 License.`,
-		`// See the LICENSE file in the project root for more information.`,
-	},
-	"Elastic": {
-		`// Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one`,
-		`// or more contributor license agreements. Licensed under the Elastic License;`,
-		`// you may not use this file except in compliance with the Elastic License.`,
-	},
-	"Cloud": {
-		`// ELASTICSEARCH CONFIDENTIAL`,
-		`// __________________`,
-		`//`,
-		`//  Copyright Elasticsearch B.V. All rights reserved.`,
-		`//`,
-		`// NOTICE:  All information contained herein is, and remains`,
-		`// the property of Elasticsearch B.V. and its suppliers, if any.`,
-		`// The intellectual and technical concepts contained herein`,
-		`// are proprietary to Elasticsearch B.V. and its suppliers and`,
-		`// may be covered by U.S. and Foreign Patents, patents in`,
-		`// process, and are protected by trade secret or copyright`,
-		`// law.  Dissemination of this information or reproduction of`,
-		`// this material is strictly forbidden unless prior written`,
-		`// permission is obtained from Elasticsearch B.V.`,
-	},
-}
-
 var (
 	dryRun             bool
+	copyright          bool
 	showVersion        bool
 	extension          string
 	args               []string
@@ -132,9 +87,9 @@ func (f *sliceFlag) Set(value string) error {
 	return nil
 }
 
-func init() {
+func initFlags() {
 	var licenseTypes []string
-	for k := range Headers {
+	for k := range licensing.Headers {
 		licenseTypes = append(licenseTypes, k)
 	}
 	sort.Strings(licenseTypes)
@@ -142,6 +97,7 @@ func init() {
 	flag.Var(&exclude, "exclude", `path to exclude (can be specified multiple times).`)
 	flag.BoolVar(&dryRun, "d", false, `skips rewriting files and returns exitcode 1 if any discrepancies are found.`)
 	flag.BoolVar(&showVersion, "version", false, `prints out the binary version.`)
+	flag.BoolVar(&copyright, "copyright", false, "sets the copyright string as the first line")
 	flag.StringVar(&extension, "ext", defaultExt, "sets the file extension to scan for.")
 	flag.StringVar(&license, "license", defaultLicense, fmt.Sprintf("sets the license type to check: %s", strings.Join(licenseTypes, ", ")))
 	flag.StringVar(&licensor, "licensor", defaultLicensor, "sets the name of the licensor")
@@ -151,12 +107,14 @@ func init() {
 }
 
 func main() {
+	initFlags()
+
 	if showVersion {
 		fmt.Printf("go-licenser %s (%s)\n", version, commit)
 		return
 	}
 
-	err := run(args, license, licensor, exclude, extension, dryRun, os.Stdout)
+	err := run(args, license, licensor, exclude, extension, copyright, dryRun, os.Stdout)
 	if err != nil && err.Error() != "<nil>" {
 		fmt.Fprint(os.Stderr, err)
 	}
@@ -164,13 +122,17 @@ func main() {
 	os.Exit(Code(err))
 }
 
-func run(args []string, license, licensor string, exclude []string, ext string, dry bool, out io.Writer) error {
-	header, ok := Headers[license]
+func run(args []string, license, licensor string, exclude []string, ext string, copyright bool, dry bool, out io.Writer) error {
+	header, ok := licensing.Headers[license]
 	if !ok {
 		return &Error{err: fmt.Errorf("unknown license: %s", license), code: errUnknownLicense}
 	}
 
 	var headerBytes []byte
+	if copyright {
+	        year, _, _ := time.Now().Date()
+		headerBytes = append(headerBytes, []byte(fmt.Sprintf("// Copyright %d %s\n", year, licensor))...)
+	}
 	for i, line := range header {
 		if strings.Contains(line, "%s") {
 			header[i] = fmt.Sprintf(line, licensor)
@@ -202,14 +164,14 @@ func reportFile(out io.Writer, f string) {
 
 func walk(p, ext, license string, headerBytes []byte, exclude []string, dry bool, out io.Writer) error {
 	var err error
-	filepath.Walk(p, func(path string, info os.FileInfo, walkErr error) error {
+	filepath.WalkDir(p, func(path string, info fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			err = &Error{err: walkErr, code: exitFailedToWalkPath}
 			return walkErr
 		}
 
 		var currentPath = cleanPathPrefixes(
-			strings.Replace(path, p, "", 1),
+			strings.TrimLeft(path, p),
 			[]string{string(os.PathSeparator)},
 		)
 
@@ -228,7 +190,7 @@ func walk(p, ext, license string, headerBytes []byte, exclude []string, dry bool
 	return err
 }
 
-func addOrCheckLicense(path, ext, license string, headerBytes []byte, info os.FileInfo, dry bool, out io.Writer) error {
+func addOrCheckLicense(path, ext, license string, headerBytes []byte, info fs.DirEntry, dry bool, out io.Writer) error {
 	if info.IsDir() || filepath.Ext(path) != ext {
 		return nil
 	}
@@ -239,7 +201,7 @@ func addOrCheckLicense(path, ext, license string, headerBytes []byte, info os.Fi
 	}
 	defer f.Close()
 
-	if licensing.ContainsHeader(f, Headers[license]) {
+	if licensing.ContainsHeader(f, licensing.Headers[license]) {
 		return nil
 	}
 
@@ -265,6 +227,6 @@ func stringInSlice(a string, list []string) bool {
 }
 
 func usageFlag() {
-	fmt.Fprintf(os.Stderr, usageText)
+	fmt.Fprint(os.Stderr, usageText)
 	flag.PrintDefaults()
 }

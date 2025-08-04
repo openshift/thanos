@@ -1,5 +1,8 @@
 .envrc
 
+# Keep if in vendor
+!vendor/**/.envrc
+
 /prometheus
 /thanos
 /mixin/vendor/

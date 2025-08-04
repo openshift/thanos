@@ -8,12 +8,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/efficientgo/core/errors"
-	"github.com/prometheus/prometheus/model/labels"
-
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/thanos-io/promql-engine/query"
+
+	"github.com/efficientgo/core/errors"
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 type stepInvariantOperator struct {
@@ -31,7 +32,7 @@ type stepInvariantOperator struct {
 	step        int64
 	currentStep int64
 	stepsBatch  int
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 }
 
 func (u *stepInvariantOperator) Explain() (next []model.VectorOperator) {
@@ -59,7 +60,7 @@ func NewStepInvariantOperator(
 		stepsBatch:  opts.StepsBatch,
 		cacheResult: true,
 	}
-	u.OperatorTelemetry = model.NewTelemetry(u, opts)
+	u.OperatorTelemetry = telemetry.NewStepInvariantTelemetry(u, opts)
 	if u.step == 0 {
 		u.step = 1
 	}

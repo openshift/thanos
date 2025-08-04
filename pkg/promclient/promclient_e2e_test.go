@@ -14,7 +14,8 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
@@ -113,7 +114,7 @@ func TestSnapshot_e2e(t *testing.T) {
 			timestamp.FromTime(now.Add(-4*time.Hour)),
 			labels.EmptyLabels(),
 			0,
-			metadata.NoneFunc,
+			metadata.NoneFunc, nil,
 		)
 		testutil.Ok(t, err)
 
@@ -184,7 +185,7 @@ func TestQueryRange_e2e(t *testing.T) {
 			timestamp.FromTime(now),
 			labels.EmptyLabels(),
 			0,
-			metadata.NoneFunc,
+			metadata.NoneFunc, nil,
 		)
 		testutil.Ok(t, err)
 

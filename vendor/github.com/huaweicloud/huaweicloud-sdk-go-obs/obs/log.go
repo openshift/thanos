@@ -15,11 +15,13 @@ package obs
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Level defines the level of the log
@@ -71,12 +73,16 @@ type loggerWrapper struct {
 	index      int
 	cacheCount int
 	closed     bool
+	loc        *time.Location
 }
 
 func (lw *loggerWrapper) doInit() {
 	lw.queue = make([]string, 0, lw.cacheCount)
 	lw.logger = log.New(lw.fd, "", 0)
 	lw.ch = make(chan string, lw.cacheCount)
+	if lw.loc == nil {
+		lw.loc = time.FixedZone("UTC", 0)
+	}
 	lw.wg.Add(1)
 	go lw.doWrite()
 }
@@ -93,7 +99,7 @@ func (lw *loggerWrapper) rotate() {
 	if stat.Size() >= logConf.maxLogSize {
 		_err := lw.fd.Sync()
 		if _err != nil {
-			panic(err)
+			panic(_err)
 		}
 		_err = lw.fd.Close()
 		if _err != nil {
@@ -104,7 +110,7 @@ func (lw *loggerWrapper) rotate() {
 		}
 		_err = os.Rename(lw.fullPath, lw.fullPath+"."+IntToString(lw.index))
 		if _err != nil {
-			panic(err)
+			panic(_err)
 		}
 		lw.index++
 
@@ -191,13 +197,22 @@ func reset() {
 	logConf = getDefaultLogConf()
 }
 
+type logConfig func(lw *loggerWrapper)
+
+func WithLoggerTimeLoc(loc *time.Location) logConfig {
+	return func(lw *loggerWrapper) {
+		lw.loc = loc
+	}
+}
+
 // InitLog enable logging function with default cacheCnt
-func InitLog(logFullPath string, maxLogSize int64, backups int, level Level, logToConsole bool) error {
-	return InitLogWithCacheCnt(logFullPath, maxLogSize, backups, level, logToConsole, 50)
+func InitLog(logFullPath string, maxLogSize int64, backups int, level Level, logToConsole bool, logConfigs ...logConfig) error {
+
+	return InitLogWithCacheCnt(logFullPath, maxLogSize, backups, level, logToConsole, 50, logConfigs...)
 }
 
 // InitLogWithCacheCnt enable logging function
-func InitLogWithCacheCnt(logFullPath string, maxLogSize int64, backups int, level Level, logToConsole bool, cacheCnt int) error {
+func InitLogWithCacheCnt(logFullPath string, maxLogSize int64, backups int, level Level, logToConsole bool, cacheCnt int, logConfigs ...logConfig) error {
 	lock.Lock()
 	defer lock.Unlock()
 	if cacheCnt <= 0 {
@@ -243,6 +258,9 @@ func InitLogWithCacheCnt(logFullPath string, maxLogSize int64, backups int, leve
 		}
 
 		fileLogger = &loggerWrapper{fullPath: _fullPath, fd: fd, index: index, cacheCount: cacheCnt, closed: false}
+		for _, logConfig := range logConfigs {
+			logConfig(fileLogger)
+		}
 		fileLogger.doInit()
 	}
 	if maxLogSize > 0 {
@@ -285,6 +303,7 @@ func initLogFile(_fullPath string) (os.FileInfo, *os.File, error) {
 			return nil, nil, err
 		}
 	}
+
 	return stat, fd, nil
 }
 
@@ -317,11 +336,16 @@ func doLog(level Level, format string, v ...interface{}) {
 			msg = fmt.Sprintf("%s:%d|%s", file, line, msg)
 		}
 		prefix := logLevelMap[level]
+		defer func() {
+			_ = recover()
+			// ignore ch closed error
+		}()
+		nowDate := FormatNowWithLoc("2006-01-02T15:04:05.000ZZ", fileLogger.loc)
+
 		if consoleLogger != nil {
 			consoleLogger.Printf("%s%s", prefix, msg)
 		}
 		if fileLogger != nil {
-			nowDate := FormatUtcNow("2006-01-02T15:04:05Z")
 			fileLogger.Printf("%s %s%s", nowDate, prefix, msg)
 		}
 	}
@@ -331,4 +355,40 @@ func checkAndLogErr(err error, level Level, format string, v ...interface{}) {
 	if err != nil {
 		doLog(level, format, v...)
 	}
+}
+
+func logResponseHeader(respHeader http.Header) string {
+	resp := make([]string, 0, len(respHeader)+1)
+	for key, value := range respHeader {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		_key := strings.ToLower(key)
+		if strings.HasPrefix(_key, HEADER_PREFIX) || strings.HasPrefix(_key, HEADER_PREFIX_OBS) {
+			_key = _key[len(HEADER_PREFIX):]
+		}
+		if _, ok := allowedLogResponseHTTPHeaderNames[_key]; ok {
+			resp = append(resp, fmt.Sprintf("%s: [%s]", key, value[0]))
+		}
+		if _key == HEADER_REQUEST_ID {
+			resp = append(resp, fmt.Sprintf("%s: [%s]", key, value[0]))
+		}
+	}
+	return strings.Join(resp, " ")
+}
+
+func logRequestHeader(reqHeader http.Header) string {
+	resp := make([]string, 0, len(reqHeader)+1)
+	for key, value := range reqHeader {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		_key := strings.ToLower(key)
+		if _, ok := allowedRequestHTTPHeaderMetadataNames[_key]; ok {
+			resp = append(resp, fmt.Sprintf("%s: [%s]", key, value[0]))
+		}
+	}
+	return strings.Join(resp, " ")
 }

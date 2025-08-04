@@ -9,6 +9,7 @@
 // under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 // CONDITIONS OF ANY KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations under the License.
+
 package obs
 
 import (
@@ -56,7 +57,7 @@ type AbortMultipartUploadInput struct {
 // InitiateMultipartUploadInput is the input parameter of InitiateMultipartUpload function
 type InitiateMultipartUploadInput struct {
 	ObjectOperationInput
-	ContentType  string
+	HttpHeader
 	EncodingType string
 }
 
@@ -73,16 +74,17 @@ type InitiateMultipartUploadOutput struct {
 
 // UploadPartInput is the input parameter of UploadPart function
 type UploadPartInput struct {
-	Bucket     string
-	Key        string
-	PartNumber int
-	UploadId   string
-	ContentMD5 string
-	SseHeader  ISseHeader
-	Body       io.Reader
-	SourceFile string
-	Offset     int64
-	PartSize   int64
+	Bucket        string
+	Key           string
+	PartNumber    int
+	UploadId      string
+	ContentMD5    string
+	ContentSHA256 string
+	SseHeader     ISseHeader
+	Body          io.Reader
+	SourceFile    string
+	Offset        int64
+	PartSize      int64
 }
 
 // UploadPartOutput is the result of UploadPart function

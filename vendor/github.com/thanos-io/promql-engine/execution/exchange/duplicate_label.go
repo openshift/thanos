@@ -8,17 +8,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/prometheus/model/labels"
-
 	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/extlabels"
 	"github.com/thanos-io/promql-engine/query"
+
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 type pair struct{ a, b int }
 
 type duplicateLabelCheckOperator struct {
-	model.OperatorTelemetry
+	telemetry.OperatorTelemetry
 
 	once sync.Once
 	next model.VectorOperator
@@ -31,7 +32,7 @@ func NewDuplicateLabelCheck(next model.VectorOperator, opts *query.Options) mode
 	oper := &duplicateLabelCheckOperator{
 		next: next,
 	}
-	oper.OperatorTelemetry = model.NewTelemetry(oper, opts)
+	oper.OperatorTelemetry = telemetry.NewTelemetry(oper, opts)
 
 	return oper
 }
