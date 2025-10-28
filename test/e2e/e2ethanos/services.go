@@ -777,6 +777,7 @@ type RulerBuilder struct {
 	evalInterval         string
 	forGracePeriod       string
 	restoreIgnoredLabels []string
+	nativeHistograms     bool
 }
 
 // NewRulerBuilder is a Ruler future that allows extra configuration before initialization.
@@ -824,6 +825,11 @@ func (r *RulerBuilder) WithForGracePeriod(forGracePeriod string) *RulerBuilder {
 
 func (r *RulerBuilder) WithRestoreIgnoredLabels(labels ...string) *RulerBuilder {
 	r.restoreIgnoredLabels = labels
+	return r
+}
+
+func (r *RulerBuilder) WithNativeHistograms() *RulerBuilder {
+	r.nativeHistograms = true
 	return r
 }
 
@@ -892,6 +898,10 @@ func (r *RulerBuilder) initRule(internalRuleDir string, queryCfg []clientconfig.
 			return &e2eobs.Observable{Runnable: e2e.NewFailedRunnable(r.Name(), errors.Wrapf(err, "generate remote write config: %v", remoteWriteCfg))}
 		}
 		ruleArgs["--remote-write.config"] = string(rwCfgBytes)
+	}
+
+	if r.nativeHistograms {
+		ruleArgs["--tsdb.enable-native-histograms"] = ""
 	}
 
 	args := e2e.BuildArgs(ruleArgs)
@@ -1054,7 +1064,7 @@ func NewQueryFrontend(e e2e.Environment, name, downstreamURL string, config quer
 		"--query-range.response-cache-config": string(cacheConfigBytes),
 	}
 
-	if !config.QueryRangeConfig.AlignRangeWithStep {
+	if !config.AlignRangeWithStep {
 		flags["--no-query-range.align-range-with-step"] = ""
 	}
 
@@ -1062,10 +1072,10 @@ func NewQueryFrontend(e e2e.Environment, name, downstreamURL string, config quer
 		flags["--query-frontend.vertical-shards"] = strconv.Itoa(config.NumShards)
 	}
 
-	if config.QueryRangeConfig.MinQuerySplitInterval != 0 {
-		flags["--query-range.min-split-interval"] = config.QueryRangeConfig.MinQuerySplitInterval.String()
-		flags["--query-range.max-split-interval"] = config.QueryRangeConfig.MaxQuerySplitInterval.String()
-		flags["--query-range.horizontal-shards"] = strconv.FormatInt(config.QueryRangeConfig.HorizontalShards, 10)
+	if config.MinQuerySplitInterval != 0 {
+		flags["--query-range.min-split-interval"] = config.MinQuerySplitInterval.String()
+		flags["--query-range.max-split-interval"] = config.MaxQuerySplitInterval.String()
+		flags["--query-range.horizontal-shards"] = strconv.FormatInt(config.HorizontalShards, 10)
 		flags["--query-range.split-interval"] = "0"
 	}
 
@@ -1259,7 +1269,7 @@ scrape_configs:
 		config = fmt.Sprintf(`
 %s
 remote_write:`, config)
-		for _, url := range strings.Split(remoteWriteEndpoint, ",") {
+		for url := range strings.SplitSeq(remoteWriteEndpoint, ",") {
 			config = fmt.Sprintf(`
 %s
 - url: "%s"

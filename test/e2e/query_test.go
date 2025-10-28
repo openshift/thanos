@@ -207,8 +207,7 @@ func TestSidecarNotReady(t *testing.T) {
 	testutil.Ok(t, e2e.StartAndWaitReady(prom, sidecar))
 	testutil.Ok(t, prom.Stop())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	// Sidecar should not be ready - it cannot accept traffic if Prometheus is down.
 	testutil.Ok(t, runutil.Retry(1*time.Second, ctx.Done(), func() (rerr error) {
@@ -713,7 +712,7 @@ func TestQueryStoreMetrics(t *testing.T) {
 		e,
 		"s1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, minio.InternalEndpoint("http"), minio.InternalDir()),
 		},
 		"",
@@ -864,7 +863,7 @@ func TestQueryStoreDedup(t *testing.T) {
 		e,
 		"s1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, minio.InternalEndpoint("http"), minio.InternalDir()),
 		},
 		"",
@@ -1333,7 +1332,7 @@ func checkNetworkRequests(t *testing.T, addr string) {
 		newCtx, newCancel := chromedp.NewContext(ctx)
 		t.Cleanup(newCancel)
 		// Listen for failed network requests and push them to an array.
-		chromedp.ListenTarget(newCtx, func(ev interface{}) {
+		chromedp.ListenTarget(newCtx, func(ev any) {
 			switch ev := ev.(type) {
 			case *network.EventLoadingFailed:
 				networkErrors = append(networkErrors, ev.ErrorText)
@@ -1376,7 +1375,7 @@ func instantQuery(t testing.TB, ctx context.Context, addr string, q func() strin
 		"msg", fmt.Sprintf("Waiting for %d results for query %s", expectedSeriesLen, q()),
 	)
 
-	testutil.Ok(t, runutil.RetryWithLog(logger, 5*time.Second, ctx.Done(), func() error {
+	testutil.Ok(t, runutil.RetryWithLog(logger, 10*time.Second, ctx.Done(), func() error {
 		res, _, err := simpleInstantQuery(t, ctx, addr, q, ts, opts, expectedSeriesLen)
 		if err != nil {
 			return err
@@ -1572,7 +1571,7 @@ func remoteWrite(ctx context.Context, timeseries []prompb.TimeSeries, addr strin
 	req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
 
 	// Execute HTTP request
-	res, err := promclient.NewDefaultClient().HTTPClient.Do(req.WithContext(ctx))
+	res, err := promclient.NewDefaultClient().Do(req.WithContext(ctx))
 	if err != nil {
 		return err
 	}
@@ -1650,7 +1649,7 @@ func remoteWriteSeriesWithLabels(ctx context.Context, prometheus *e2eobs.Observa
 	samplespb := make([]prompb.TimeSeries, 0, len(series))
 	r := rand.New(rand.NewSource(int64(len(series))))
 	for _, serie := range series {
-		labelspb := make([]prompb.Label, 0, len(serie.intLabels))
+		labelspb := make([]prompb.Label, 0, serie.intLabels.Len())
 		for labelKey, labelValue := range serie.intLabels.Map() {
 			labelspb = append(labelspb, prompb.Label{
 				Name:  labelKey,
@@ -2150,7 +2149,7 @@ func TestQueryTenancyEnforcement(t *testing.T) {
 		e,
 		"s1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, minio.InternalEndpoint("http"), minio.InternalDir()),
 		},
 		"",

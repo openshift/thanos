@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"html/template"
+	"maps"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -41,7 +42,7 @@ import (
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/agent"
-	"github.com/prometheus/prometheus/tsdb/wlog"
+	"github.com/prometheus/prometheus/util/compression"
 	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/objstore"
@@ -54,6 +55,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/clientconfig"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/compressutil"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
 	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/extannotations"
@@ -112,8 +114,9 @@ type ruleConfig struct {
 	storeRateLimits    store.SeriesSelectLimits
 	ruleConcurrentEval int64
 
-	extendedFunctionsEnabled bool
-	EnableFeatures           []string
+	extendedFunctionsEnabled   bool
+	EnableFeatures             []string
+	tsdbEnableNativeHistograms bool
 }
 
 type Expression struct {
@@ -170,6 +173,10 @@ func registerRule(app *extkingpin.App) {
 	cmd.Flag("query.enable-x-functions", "Whether to enable extended rate functions (xrate, xincrease and xdelta). Only has effect when used with Thanos engine.").Default("false").BoolVar(&conf.extendedFunctionsEnabled)
 	cmd.Flag("enable-feature", "Comma separated feature names to enable. Valid options for now: promql-experimental-functions (enables promql experimental functions for ruler)").Default("").StringsVar(&conf.EnableFeatures)
 
+	cmd.Flag("tsdb.enable-native-histograms",
+		"[EXPERIMENTAL] Enables the ingestion of native histograms.").
+		Default("false").BoolVar(&conf.tsdbEnableNativeHistograms)
+
 	conf.rwConfig = extflag.RegisterPathOrContent(cmd, "remote-write.config", "YAML config for the remote-write configurations, that specify servers where samples should be sent to (see https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write). This automatically enables stateless mode for ruler and no series will be stored in the ruler's TSDB. If an empty config (or file) is provided, the flag is ignored and ruler is run with its own TSDB.", extflag.WithEnvSubstitution())
 
 	conf.objStoreConfig = extkingpin.RegisterCommonObjStoreFlags(cmd, "", false)
@@ -189,15 +196,16 @@ func registerRule(app *extkingpin.App) {
 		}
 
 		tsdbOpts := &tsdb.Options{
-			MinBlockDuration:  int64(time.Duration(*tsdbBlockDuration) / time.Millisecond),
-			MaxBlockDuration:  int64(time.Duration(*tsdbBlockDuration) / time.Millisecond),
-			RetentionDuration: int64(time.Duration(*tsdbRetention) / time.Millisecond),
-			NoLockfile:        *noLockFile,
-			WALCompression:    wlog.ParseCompressionType(*walCompression, string(wlog.CompressionSnappy)),
+			MinBlockDuration:       int64(time.Duration(*tsdbBlockDuration) / time.Millisecond),
+			MaxBlockDuration:       int64(time.Duration(*tsdbBlockDuration) / time.Millisecond),
+			RetentionDuration:      int64(time.Duration(*tsdbRetention) / time.Millisecond),
+			NoLockfile:             *noLockFile,
+			WALCompression:         compressutil.ParseCompressionType(*walCompression, compression.Snappy),
+			EnableNativeHistograms: conf.tsdbEnableNativeHistograms,
 		}
 
 		agentOpts := &agent.Options{
-			WALCompression: wlog.ParseCompressionType(*walCompression, string(wlog.CompressionSnappy)),
+			WALCompression: compressutil.ParseCompressionType(*walCompression, compression.Snappy),
 			NoLockfile:     *noLockFile,
 		}
 
@@ -580,9 +588,7 @@ func runRule(
 	)
 	{
 		if conf.extendedFunctionsEnabled {
-			for k, fn := range parse.XFunctions {
-				parser.Functions[k] = fn
-			}
+			maps.Copy(parser.Functions, parse.XFunctions)
 		}
 
 		if len(conf.EnableFeatures) > 0 {
