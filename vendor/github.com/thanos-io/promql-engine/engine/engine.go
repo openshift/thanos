@@ -6,6 +6,7 @@ package engine
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"math"
 	"runtime"
 	"slices"
@@ -13,7 +14,6 @@ import (
 	"time"
 
 	"github.com/thanos-io/promql-engine/execution"
-	"github.com/thanos-io/promql-engine/execution/function"
 	"github.com/thanos-io/promql-engine/execution/model"
 	"github.com/thanos-io/promql-engine/execution/parse"
 	"github.com/thanos-io/promql-engine/execution/telemetry"
@@ -143,13 +143,9 @@ func NewWithScanners(opts Opts, scanners engstorage.Scanners) *Engine {
 	}
 
 	functions := make(map[string]*parser.Function, len(parser.Functions))
-	for k, v := range parser.Functions {
-		functions[k] = v
-	}
+	maps.Copy(functions, parser.Functions)
 	if opts.EnableXFunctions {
-		functions["xdelta"] = function.XFunctions["xdelta"]
-		functions["xincrease"] = function.XFunctions["xincrease"]
-		functions["xrate"] = function.XFunctions["xrate"]
+		maps.Copy(functions, parse.XFunctions)
 	}
 
 	metrics := &engineMetrics{
@@ -173,10 +169,7 @@ func NewWithScanners(opts Opts, scanners engstorage.Scanners) *Engine {
 
 	decodingConcurrency := opts.DecodingConcurrency
 	if opts.DecodingConcurrency < 1 {
-		decodingConcurrency = runtime.GOMAXPROCS(0) / 2
-		if decodingConcurrency < 1 {
-			decodingConcurrency = 1
-		}
+		decodingConcurrency = max(runtime.GOMAXPROCS(0)/2, 1)
 	}
 	selectorBatchSize := opts.SelectorBatchSize
 
@@ -260,16 +253,21 @@ func (e *Engine) MakeInstantQuery(ctx context.Context, q storage.Queryable, opts
 	planOpts := logicalplan.PlanOptions{
 		DisableDuplicateLabelCheck: e.disableDuplicateLabelChecks,
 	}
-	lplan, warns := logicalplan.NewFromAST(expr, qOpts, planOpts).Optimize(e.getLogicalOptimizers(opts))
+	initialPlan, err := logicalplan.NewFromAST(expr, qOpts, planOpts)
+	if err != nil {
+		return nil, errors.Wrap(err, "creating plan")
+	}
+	optimizedPlan, warns := initialPlan.Optimize(e.getLogicalOptimizers(opts))
 
-	scanners, err := e.storageScanners(q, qOpts, lplan)
+	ctx = warnings.NewContext(ctx)
+	defer func() { warns.Merge(warnings.FromContext(ctx)) }()
+
+	scanners, err := e.storageScanners(q, qOpts, optimizedPlan)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating storage scanners")
 	}
 
-	ctx = warnings.NewContext(ctx)
-	defer func() { warns.Merge(warnings.FromContext(ctx)) }()
-	exec, err := execution.New(ctx, lplan.Root(), scanners, qOpts)
+	exec, err := execution.New(ctx, optimizedPlan.Root(), scanners, qOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +275,7 @@ func (e *Engine) MakeInstantQuery(ctx context.Context, q storage.Queryable, opts
 	return &compatibilityQuery{
 		Query:      &Query{exec: exec, opts: opts},
 		engine:     e,
-		plan:       lplan,
+		plan:       optimizedPlan,
 		warns:      warns,
 		ts:         ts,
 		t:          InstantQuery,
@@ -358,16 +356,22 @@ func (e *Engine) MakeRangeQuery(ctx context.Context, q storage.Queryable, opts *
 	planOpts := logicalplan.PlanOptions{
 		DisableDuplicateLabelCheck: e.disableDuplicateLabelChecks,
 	}
-	lplan, warns := logicalplan.NewFromAST(expr, qOpts, planOpts).Optimize(e.getLogicalOptimizers(opts))
+
+	initialPlan, err := logicalplan.NewFromAST(expr, qOpts, planOpts)
+	if err != nil {
+		return nil, errors.Wrap(err, "creating plan")
+	}
+	optimizedPlan, warns := initialPlan.Optimize(e.getLogicalOptimizers(opts))
 
 	ctx = warnings.NewContext(ctx)
 	defer func() { warns.Merge(warnings.FromContext(ctx)) }()
-	scnrs, err := e.storageScanners(q, qOpts, lplan)
+
+	scnrs, err := e.storageScanners(q, qOpts, optimizedPlan)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating storage scanners")
 	}
 
-	exec, err := execution.New(ctx, lplan.Root(), scnrs, qOpts)
+	exec, err := execution.New(ctx, optimizedPlan.Root(), scnrs, qOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +380,7 @@ func (e *Engine) MakeRangeQuery(ctx context.Context, q storage.Queryable, opts *
 	return &compatibilityQuery{
 		Query:    &Query{exec: exec, opts: opts},
 		engine:   e,
-		plan:     lplan,
+		plan:     optimizedPlan,
 		warns:    warns,
 		t:        RangeQuery,
 		scanners: scnrs,
@@ -535,9 +539,7 @@ func (q *compatibilityQuery) Exec(ctx context.Context) (ret *promql.Result) {
 	defer q.engine.activeQueryTracker.Delete(idx)
 
 	ctx = warnings.NewContext(ctx)
-	defer func() {
-		ret.Warnings = ret.Warnings.Merge(warnings.FromContext(ctx))
-	}()
+	warnings.MergeToContext(q.warns, ctx)
 
 	// Handle case with strings early on as this does not need us to process samples.
 	switch e := q.plan.Root().(type) {
@@ -545,8 +547,7 @@ func (q *compatibilityQuery) Exec(ctx context.Context) (ret *promql.Result) {
 		return &promql.Result{Value: promql.String{V: e.Val, T: q.ts.UnixMilli()}}
 	}
 	ret = &promql.Result{
-		Value:    promql.Vector{},
-		Warnings: q.warns,
+		Value: promql.Vector{},
 	}
 	defer recoverEngine(q.engine.logger, q.plan, &ret.Err)
 
@@ -622,6 +623,7 @@ loop:
 		}
 		sort.Sort(matrix)
 		ret.Value = matrix
+		ret.Warnings = warnings.FromContext(ctx)
 		if matrix.ContainsSameLabelset() {
 			return newErrResult(ret, extlabels.ErrDuplicateLabelSet)
 		}
@@ -655,6 +657,10 @@ loop:
 				})
 			}
 		}
+
+		if !q.resultSort.keepHistograms() {
+			vector = filterFloats(vector)
+		}
 		sort.Slice(vector, q.resultSort.comparer(&vector))
 		if vector.ContainsSameLabelset() {
 			return newErrResult(ret, extlabels.ErrDuplicateLabelSet)
@@ -671,6 +677,7 @@ loop:
 	}
 
 	ret.Value = result
+	ret.Warnings = warnings.FromContext(ctx)
 	return ret
 }
 

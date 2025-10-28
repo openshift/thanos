@@ -96,6 +96,8 @@ type Bucket struct {
 	requestMetadata common.RequestMetadata
 }
 
+func (b *Bucket) Provider() objstore.ObjProvider { return objstore.OCI }
+
 // Name returns the bucket name for the provider.
 func (b *Bucket) Name() string {
 	return b.name
@@ -194,7 +196,7 @@ func (b *Bucket) GetRange(ctx context.Context, name string, offset, length int64
 
 // Upload the contents of the reader as an object into the bucket.
 // Upload should be idempotent.
-func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader) (err error) {
+func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader, opts ...objstore.ObjectUploadOption) (err error) {
 	req := transfer.UploadStreamRequest{
 		UploadRequest: transfer.UploadRequest{
 			NamespaceName:                       common.String(b.namespace),
@@ -208,6 +210,11 @@ func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader) (err erro
 	}
 	if b.partSize > 0 {
 		req.UploadRequest.PartSize = &b.partSize
+	}
+
+	uploadOptions := objstore.ApplyObjectUploadOptions(opts...)
+	if uploadOptions.ContentType != "" {
+		req.UploadRequest.ContentType = &uploadOptions.ContentType
 	}
 
 	uploadManager := transfer.NewUploadManager()
@@ -353,7 +360,7 @@ func NewBucket(logger log.Logger, ociConfig []byte, wrapRoundtripper func(http.R
 			return nil, errors.Wrapf(err, "unable to create OKE workload identity config provider")
 		}
 	default:
-		return nil, errors.Wrapf(err, fmt.Sprintf("unsupported OCI provider: %s", provider))
+		return nil, fmt.Errorf("unsupported OCI provider: %s", provider)
 	}
 
 	client, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(configurationProvider)

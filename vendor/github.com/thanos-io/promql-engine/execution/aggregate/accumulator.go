@@ -77,11 +77,11 @@ func (s *sumAcc) Add(ctx context.Context, v float64, h *histogram.FloatHistogram
 	if h.Schema >= s.histSum.Schema {
 		if s.histSum, err = s.histSum.Add(h); err != nil {
 			if errors.Is(err, histogram.ErrHistogramsIncompatibleSchema) {
-				warnings.AddToContext(histogram.ErrHistogramsIncompatibleSchema, ctx)
+				warnings.AddToContext(annotations.MixedExponentialCustomHistogramsWarning, ctx)
 				return nil
 			}
 			if errors.Is(err, histogram.ErrHistogramsIncompatibleBounds) {
-				warnings.AddToContext(histogram.ErrHistogramsIncompatibleBounds, ctx)
+				warnings.AddToContext(annotations.IncompatibleCustomBucketsHistogramsWarning, ctx)
 				return nil
 			}
 			return err
@@ -90,11 +90,11 @@ func (s *sumAcc) Add(ctx context.Context, v float64, h *histogram.FloatHistogram
 		t := h.Copy()
 		if s.histSum, err = t.Add(s.histSum); err != nil {
 			if errors.Is(err, histogram.ErrHistogramsIncompatibleSchema) {
-				warnings.AddToContext(histogram.ErrHistogramsIncompatibleSchema, ctx)
+				warnings.AddToContext(annotations.MixedExponentialCustomHistogramsWarning, ctx)
 				return nil
 			}
 			if errors.Is(err, histogram.ErrHistogramsIncompatibleBounds) {
-				warnings.AddToContext(histogram.ErrHistogramsIncompatibleBounds, ctx)
+				warnings.AddToContext(annotations.IncompatibleCustomBucketsHistogramsWarning, ctx)
 				return nil
 			}
 			return err
@@ -105,6 +105,9 @@ func (s *sumAcc) Add(ctx context.Context, v float64, h *histogram.FloatHistogram
 }
 
 func (s *sumAcc) Value() (float64, *histogram.FloatHistogram) {
+	if s.histSum != nil {
+		s.histSum.Compact(0)
+	}
 	return s.value, s.histSum
 }
 
@@ -451,6 +454,9 @@ func (a *avgAcc) AddVector(ctx context.Context, vs []float64, hs []*histogram.Fl
 }
 
 func (a *avgAcc) Value() (float64, *histogram.FloatHistogram) {
+	if a.histSum != nil {
+		a.histSum.Compact(0)
+	}
 	if a.incremental {
 		return a.avg + a.kahanC, a.histSum
 	}

@@ -24,9 +24,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/model/histogram"
@@ -36,93 +33,14 @@ import (
 	"github.com/prometheus/prometheus/util/strutil"
 )
 
-var (
-	Logger          = log.NewNopLogger()
-	NarrowSelectors = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "prometheus_narrow_selectors_count",
-			Help: "Number of selectors that may unintentionally only match integers on 'quantile' and 'le' labels",
-		},
-		[]string{"component"},
-	)
-)
-
-// isInteger is a light strconv.Atoi that avoids allocations due to Atoi's returned error and doesn't
-// consider as integers invalid, big, or underscored integers.
-func isInteger(s string) (int, bool) {
-	sLen := len(s)
-	if strconv.IntSize == 32 && (0 < sLen && sLen < 10) ||
-		strconv.IntSize == 64 && (0 < sLen && sLen < 19) {
-		// Fast path for small integers that fit int type.
-		s0 := s
-		if s[0] == '-' || s[0] == '+' {
-			s = s[1:]
-			if len(s) < 1 {
-				return 0, false
-			}
-		}
-
-		n := 0
-		for _, ch := range []byte(s) {
-			ch -= '0'
-			if ch > 9 {
-				return 0, false
-			}
-			n = n*10 + int(ch)
-		}
-		if s0[0] == '-' {
-			n = -n
-		}
-		return n, true
-	}
-
-	// Slow path for invalid, big, or underscored integers.
-	i64, err := strconv.ParseInt(s, 10, 0)
-	return int(i64), err == nil
-}
-
-// checkLabelMatchers helps to detect unintentional misuses of matchers on "quantile" and "le" labels after normalization during scraping
-// introduced in Prometheus3. For more details, see https://prometheus.io/docs/prometheus/latest/migration/#le-and-quantile-label-values.
-// It specifically detects integers-only label matchers formatted as "integer" and "integer|integer|integer" (as they're the most likely to contain them).
-// Refer to Test_checkLabelMatchers for more details.
-func checkLabelMatchers(vs *VectorSelector) {
-Outer:
-	for _, lm := range vs.LabelMatchers {
-		if lm == nil {
-			continue
-		}
-		if lm.Name == model.QuantileLabel || (strings.HasSuffix(vs.Name, "_bucket") && lm.Name == model.BucketLabel) {
-			switch lm.Type {
-			case labels.MatchEqual, labels.MatchNotEqual:
-				if n, ok := isInteger(lm.Value); ok {
-					NarrowSelectors.WithLabelValues("prometheus-parser").Inc()
-					level.Debug(Logger).Log("msg", "selector set to explicitly match an integer, but values could be floats", "narrow_matcher_label", lm.Name, "integer", n, "matchers", fmt.Sprintf("%v", vs.LabelMatchers))
-				}
-				break Outer
-			case labels.MatchRegexp, labels.MatchNotRegexp:
-				if len(lm.Value) == 0 {
-					break Outer
-				}
-				vals := strings.Split(lm.Value, "|")
-				for _, val := range vals {
-					if _, ok := isInteger(val); !ok {
-						break Outer
-					}
-				}
-
-				NarrowSelectors.WithLabelValues("prometheus-parser").Inc()
-				level.Debug(Logger).Log("msg", "selector set to explicitly match integers only, but values could be floats", "narrow_matcher_label", lm.Name, "matchers", fmt.Sprintf("%v", vs.LabelMatchers))
-				break Outer
-			}
-		}
-	}
-}
-
 var parserPool = sync.Pool{
 	New: func() interface{} {
 		return &parser{}
 	},
 }
+
+// ExperimentalDurationExpr is a flag to enable experimental duration expression parsing.
+var ExperimentalDurationExpr bool
 
 type Parser interface {
 	ParseExpr() (Expr, error)
@@ -141,6 +59,13 @@ type parser struct {
 	// Everytime an Item is lexed that could be the end
 	// of certain expressions its end position is stored here.
 	lastClosing posrange.Pos
+	// Keep track of closing parentheses in addition, because sometimes the
+	// parser needs to read past a closing parenthesis to find the end of an
+	// expression, e.g. reading ony '(sum(foo)' cannot tell the end of the
+	// aggregation expression, since it could continue with either
+	// '(sum(foo))' or '(sum(foo) by (bar))' by which time we set lastClosing
+	// to the last paren.
+	closingParens []posrange.Pos
 
 	yyParser yyParserImpl
 
@@ -164,6 +89,7 @@ func NewParser(input string, opts ...Opt) *parser { //nolint:revive // unexporte
 	p.injecting = false
 	p.parseErrors = nil
 	p.generatedParserResult = nil
+	p.closingParens = make([]posrange.Pos, 0)
 
 	// Clear lexer struct before reusing.
 	p.lex = Lexer{
@@ -253,6 +179,11 @@ func EnrichParseError(err error, enrich func(parseErr *ParseErr)) {
 func ParseExpr(input string) (expr Expr, err error) {
 	p := NewParser(input)
 	defer p.Close()
+
+	if len(p.closingParens) > 0 {
+		return nil, fmt.Errorf("internal parser error, not all closing parens consumed: %v", p.closingParens)
+	}
+
 	return p.ParseExpr()
 }
 
@@ -283,7 +214,6 @@ func ParseMetricSelector(input string) (m []*labels.Matcher, err error) {
 
 	parseResult := p.parseGenerated(START_METRIC_SELECTOR)
 	if parseResult != nil {
-		checkLabelMatchers(parseResult.(*VectorSelector))
 		m = parseResult.(*VectorSelector).LabelMatchers
 	}
 
@@ -457,7 +387,10 @@ func (p *parser) Lex(lval *yySymType) int {
 	case EOF:
 		lval.item.Typ = EOF
 		p.InjectItem(0)
-	case RIGHT_BRACE, RIGHT_PAREN, RIGHT_BRACKET, DURATION, NUMBER:
+	case RIGHT_PAREN:
+		p.closingParens = append(p.closingParens, lval.item.Pos+posrange.Pos(len(lval.item.Val)))
+		fallthrough
+	case RIGHT_BRACE, RIGHT_BRACKET, DURATION, NUMBER:
 		p.lastClosing = lval.item.Pos + posrange.Pos(len(lval.item.Val))
 	}
 
@@ -518,10 +451,16 @@ func (p *parser) newAggregateExpr(op Item, modifier, args Node) (ret *AggregateE
 	ret = modifier.(*AggregateExpr)
 	arguments := args.(Expressions)
 
+	if len(p.closingParens) == 0 {
+		// Prevents invalid array accesses.
+		// The error is already captured by the parser.
+		return
+	}
 	ret.PosRange = posrange.PositionRange{
 		Start: op.Pos,
-		End:   p.lastClosing,
+		End:   p.closingParens[0],
 	}
+	p.closingParens = p.closingParens[1:]
 
 	ret.Op = op.Typ
 
@@ -926,8 +865,6 @@ func (p *parser) checkAST(node Node) (typ ValueType) {
 				}
 			}
 
-			checkLabelMatchers(n)
-
 			// Skip the check for non-empty matchers because an explicit
 			// metric name is a non-empty matcher.
 			break
@@ -968,9 +905,6 @@ func parseDuration(ds string) (time.Duration, error) {
 	dur, err := model.ParseDuration(ds)
 	if err != nil {
 		return 0, err
-	}
-	if dur == 0 {
-		return 0, errors.New("duration must be greater than 0")
 	}
 	return time.Duration(dur), nil
 }
@@ -1027,11 +961,13 @@ func (p *parser) newMetricNameMatcher(value Item) *labels.Matcher {
 // addOffset is used to set the offset in the generated parser.
 func (p *parser) addOffset(e Node, offset time.Duration) {
 	var orgoffsetp *time.Duration
+	var orgoffsetexprp *DurationExpr
 	var endPosp *posrange.Pos
 
 	switch s := e.(type) {
 	case *VectorSelector:
 		orgoffsetp = &s.OriginalOffset
+		orgoffsetexprp = s.OriginalOffsetExpr
 		endPosp = &s.PosRange.End
 	case *MatrixSelector:
 		vs, ok := s.VectorSelector.(*VectorSelector)
@@ -1040,9 +976,11 @@ func (p *parser) addOffset(e Node, offset time.Duration) {
 			return
 		}
 		orgoffsetp = &vs.OriginalOffset
+		orgoffsetexprp = vs.OriginalOffsetExpr
 		endPosp = &s.EndPos
 	case *SubqueryExpr:
 		orgoffsetp = &s.OriginalOffset
+		orgoffsetexprp = s.OriginalOffsetExpr
 		endPosp = &s.EndPos
 	default:
 		p.addParseErrf(e.PositionRange(), "offset modifier must be preceded by an instant vector selector or range vector selector or a subquery")
@@ -1051,10 +989,49 @@ func (p *parser) addOffset(e Node, offset time.Duration) {
 
 	// it is already ensured by parseDuration func that there never will be a zero offset modifier
 	switch {
-	case *orgoffsetp != 0:
+	case *orgoffsetp != 0 || orgoffsetexprp != nil:
 		p.addParseErrf(e.PositionRange(), "offset may not be set multiple times")
 	case orgoffsetp != nil:
 		*orgoffsetp = offset
+	}
+
+	*endPosp = p.lastClosing
+}
+
+// addOffsetExpr is used to set the offset expression in the generated parser.
+func (p *parser) addOffsetExpr(e Node, expr *DurationExpr) {
+	var orgoffsetp *time.Duration
+	var orgoffsetexprp **DurationExpr
+	var endPosp *posrange.Pos
+
+	switch s := e.(type) {
+	case *VectorSelector:
+		orgoffsetp = &s.OriginalOffset
+		orgoffsetexprp = &s.OriginalOffsetExpr
+		endPosp = &s.PosRange.End
+	case *MatrixSelector:
+		vs, ok := s.VectorSelector.(*VectorSelector)
+		if !ok {
+			p.addParseErrf(e.PositionRange(), "ranges only allowed for vector selectors")
+			return
+		}
+		orgoffsetp = &vs.OriginalOffset
+		orgoffsetexprp = &vs.OriginalOffsetExpr
+		endPosp = &s.EndPos
+	case *SubqueryExpr:
+		orgoffsetp = &s.OriginalOffset
+		orgoffsetexprp = &s.OriginalOffsetExpr
+		endPosp = &s.EndPos
+	default:
+		p.addParseErrf(e.PositionRange(), "offset modifier must be preceded by an instant vector selector or range vector selector or a subquery")
+		return
+	}
+
+	switch {
+	case *orgoffsetp != 0 || *orgoffsetexprp != nil:
+		p.addParseErrf(e.PositionRange(), "offset may not be set multiple times")
+	case orgoffsetexprp != nil:
+		*orgoffsetexprp = expr
 	}
 
 	*endPosp = p.lastClosing
@@ -1131,6 +1108,12 @@ func (p *parser) getAtModifierVars(e Node) (**int64, *ItemType, *posrange.Pos, b
 	}
 
 	return timestampp, preprocp, endPosp, true
+}
+
+func (p *parser) experimentalDurationExpr(e Expr) {
+	if !ExperimentalDurationExpr {
+		p.addParseErrf(e.PositionRange(), "experimental duration expression is not enabled")
+	}
 }
 
 func MustLabelMatcher(mt labels.MatchType, name, val string) *labels.Matcher {
