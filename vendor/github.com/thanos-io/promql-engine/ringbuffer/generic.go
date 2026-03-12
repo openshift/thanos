@@ -7,8 +7,24 @@ import (
 	"context"
 	"math"
 
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/warnings"
+
 	"github.com/prometheus/prometheus/model/histogram"
 )
+
+type Buffer interface {
+	MaxT() int64
+	Push(t int64, v Value)
+	Reset(mint int64, evalt int64)
+	Eval(ctx context.Context, _, _ float64, _ int64) (float64, *histogram.FloatHistogram, bool, warnings.Warnings, error)
+	SampleCount() int
+
+	// to handle extlookback properly, only used by buffers that implement xincrease or xrate
+	ReadIntoLast(f func(*Sample))
+}
+
+func Empty(b Buffer) bool { return b.MaxT() == math.MinInt64 }
 
 type Value struct {
 	F float64
@@ -47,7 +63,17 @@ func NewWithExtLookback(ctx context.Context, size int, selectRange, offset, extL
 	}
 }
 
-func (r *GenericRingBuffer) Len() int { return len(r.items) }
+func (r *GenericRingBuffer) SampleCount() int {
+	c := 0
+	for _, s := range r.items {
+		if s.V.H != nil {
+			c += telemetry.CalculateHistogramSampleCount(s.V.H)
+			continue
+		}
+		c++
+	}
+	return c
+}
 
 // MaxT returns the maximum timestamp of the ring buffer.
 // If the ring buffer is empty, it returns math.MinInt64.
@@ -76,7 +102,8 @@ func (r *GenericRingBuffer) Push(t int64, v Value) {
 	r.items[n].V.F = v.F
 	if v.H != nil {
 		if r.items[n].V.H == nil {
-			r.items[n].V.H = v.H.Copy()
+			h := v.H.Copy()
+			r.items[n].V.H = h
 		} else {
 			v.H.CopyTo(r.items[n].V.H)
 		}
@@ -106,9 +133,8 @@ func (r *GenericRingBuffer) Reset(mint int64, evalt int64) {
 	r.items = r.items[:keep]
 }
 
-func (r *GenericRingBuffer) Eval(ctx context.Context, scalarArg float64, scalarArg2 float64, metricAppearedTs *int64) (float64, *histogram.FloatHistogram, bool, error) {
+func (r *GenericRingBuffer) Eval(ctx context.Context, scalarArg float64, scalarArg2 float64, metricAppearedTs int64) (float64, *histogram.FloatHistogram, bool, warnings.Warnings, error) {
 	return r.call(FunctionArgs{
-		ctx:              ctx,
 		Samples:          r.items,
 		StepTime:         r.currentStep,
 		SelectRange:      r.selectRange,

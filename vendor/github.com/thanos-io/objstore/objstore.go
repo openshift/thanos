@@ -26,6 +26,22 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+type ObjProvider string
+
+const (
+	MEMORY     ObjProvider = "MEMORY"
+	FILESYSTEM ObjProvider = "FILESYSTEM"
+	GCS        ObjProvider = "GCS"
+	S3         ObjProvider = "S3"
+	AZURE      ObjProvider = "AZURE"
+	SWIFT      ObjProvider = "SWIFT"
+	COS        ObjProvider = "COS"
+	ALIYUNOSS  ObjProvider = "ALIYUNOSS"
+	BOS        ObjProvider = "BOS"
+	OCI        ObjProvider = "OCI"
+	OBS        ObjProvider = "OBS"
+)
+
 const (
 	OpIter       = "iter"
 	OpGet        = "get"
@@ -42,9 +58,11 @@ type Bucket interface {
 	io.Closer
 	BucketReader
 
+	Provider() ObjProvider
+
 	// Upload the contents of the reader as an object into the bucket.
 	// Upload should be idempotent.
-	Upload(ctx context.Context, name string, r io.Reader) error
+	Upload(ctx context.Context, name string, r io.Reader, opts ...ObjectUploadOption) error
 
 	// Delete removes the object with the given name.
 	// If object does not exist in the moment of deletion, Delete should throw error.
@@ -174,6 +192,26 @@ func ApplyIterOptions(options ...IterOption) IterParams {
 	out := IterParams{}
 	for _, opt := range options {
 		opt.Apply(&out)
+	}
+	return out
+}
+
+type UploadObjectParams struct {
+	ContentType string
+}
+
+type ObjectUploadOption func(f *UploadObjectParams)
+
+func WithContentType(contentType string) ObjectUploadOption {
+	return func(f *UploadObjectParams) {
+		f.ContentType = contentType
+	}
+}
+
+func ApplyObjectUploadOptions(opts ...ObjectUploadOption) UploadObjectParams {
+	out := UploadObjectParams{}
+	for _, opt := range opts {
+		opt(&out)
 	}
 	return out
 }
@@ -553,7 +591,6 @@ func wrapWithMetrics(b Bucket, metrics *Metrics) *metricBucket {
 		bkt.metrics.ops.WithLabelValues(op)
 		bkt.metrics.opsFailures.WithLabelValues(op)
 		bkt.metrics.opsDuration.WithLabelValues(op)
-		bkt.metrics.opsFetchedBytes.WithLabelValues(op)
 	}
 
 	// fetched bytes only relevant for get, getrange and upload
@@ -562,6 +599,7 @@ func wrapWithMetrics(b Bucket, metrics *Metrics) *metricBucket {
 		OpGetRange,
 		OpUpload,
 	} {
+		bkt.metrics.opsFetchedBytes.WithLabelValues(op)
 		bkt.metrics.opsTransferredBytes.WithLabelValues(op)
 	}
 	return bkt
@@ -581,6 +619,10 @@ type Metrics struct {
 type metricBucket struct {
 	bkt     Bucket
 	metrics *Metrics
+}
+
+func (b *metricBucket) Provider() ObjProvider {
+	return b.bkt.Provider()
 }
 
 func (b *metricBucket) WithExpectedErrs(fn IsOpFailureExpectedFunc) Bucket {
@@ -725,7 +767,7 @@ func (b *metricBucket) Exists(ctx context.Context, name string) (bool, error) {
 	return ok, nil
 }
 
-func (b *metricBucket) Upload(ctx context.Context, name string, r io.Reader) error {
+func (b *metricBucket) Upload(ctx context.Context, name string, r io.Reader, opts ...ObjectUploadOption) error {
 	const op = OpUpload
 	b.metrics.ops.WithLabelValues(op).Inc()
 
@@ -743,7 +785,7 @@ func (b *metricBucket) Upload(ctx context.Context, name string, r io.Reader) err
 		b.metrics.opsTransferredBytes,
 	)
 	defer trc.Close()
-	err := b.bkt.Upload(ctx, name, trc)
+	err := b.bkt.Upload(ctx, name, trc, opts...)
 	if err != nil {
 		if !b.metrics.isOpFailureExpected(err) && ctx.Err() != context.Canceled {
 			b.metrics.opsFailures.WithLabelValues(op).Inc()

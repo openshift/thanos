@@ -129,7 +129,7 @@ func New(opts ...EnvironmentOption) (_ *DockerEnvironment, err error) {
 
 	// Setup the docker network.
 	if out, err := d.exec("docker", "network", "create", "-d", "bridge", d.networkName).CombinedOutput(); err != nil {
-		e.logger.Log(string(out))
+		_ = e.logger.Log(string(out))
 		d.Close()
 		return nil, errors.Wrapf(err, "create docker network '%s'", d.networkName)
 	}
@@ -140,7 +140,7 @@ func New(opts ...EnvironmentOption) (_ *DockerEnvironment, err error) {
 	default: // the "linux" behavior is default
 		out, err := d.exec("docker", "network", "inspect", d.networkName).CombinedOutput()
 		if err != nil {
-			e.logger.Log(string(out))
+			_ = e.logger.Log(string(out))
 			d.Close()
 			return nil, errors.Wrapf(err, "inspect docker network '%s'", d.networkName)
 		}
@@ -427,7 +427,7 @@ func (d *dockerRunnable) Start() (err error) {
 		return errors.Newf("%v is running. Stop or kill it first to restart.", d.Name())
 	}
 
-	d.logger.Log("Starting", d.Name())
+	_ = d.logger.Log("Starting", d.Name())
 
 	// In case of any error, if the container was already created, we
 	// have to cleanup removing it. We ignore the error of the "docker rm"
@@ -479,7 +479,7 @@ func (d *dockerRunnable) Start() (err error) {
 		}
 	}
 
-	d.logger.Log("Ports for container", d.containerName(), ">> Local ports:", d.ports, "Ports available from host:", d.hostPorts)
+	_ = d.logger.Log("Ports for container", d.containerName(), ">> Local ports:", d.ports, "Ports available from host:", d.hostPorts)
 	return nil
 }
 
@@ -497,9 +497,9 @@ func (d *dockerRunnable) Stop() error {
 		return nil
 	}
 
-	d.logger.Log("Stopping", d.Name())
+	_ = d.logger.Log("Stopping", d.Name())
 	if out, err := d.env.exec("docker", "stop", "--time=30", d.containerName()).CombinedOutput(); err != nil {
-		d.logger.Log(string(out))
+		_ = d.logger.Log(string(out))
 		return err
 	}
 	d.usedNetworkName = ""
@@ -511,10 +511,10 @@ func (d *dockerRunnable) Kill() error {
 		return nil
 	}
 
-	d.logger.Log("Killing", d.Name())
+	_ = d.logger.Log("Killing", d.Name())
 
 	if out, err := d.env.exec("docker", "kill", d.containerName()).CombinedOutput(); err != nil {
-		d.logger.Log(string(out))
+		_ = d.logger.Log(string(out))
 		return err
 	}
 
@@ -638,7 +638,7 @@ func (d *dockerRunnable) waitForRunning() (err error) {
 	}
 
 	if len(out) > 0 {
-		d.logger.Log(string(out))
+		_ = d.logger.Log(string(out))
 	}
 	return errors.Wrapf(err, "docker container %s failed to start", d.Name())
 }
@@ -710,8 +710,8 @@ func (d *dockerRunnable) Exec(command Command, opts ...ExecOption) error {
 func (e *DockerEnvironment) existDockerNetwork() (bool, error) {
 	out, err := e.exec("docker", "network", "ls", "--quiet", "--filter", fmt.Sprintf("name=%s", e.networkName)).CombinedOutput()
 	if err != nil {
-		e.logger.Log(string(out))
-		e.logger.Log("Unable to check if docker network", e.networkName, "exists:", err.Error())
+		_ = e.logger.Log(string(out))
+		_ = e.logger.Log("Unable to check if docker network", e.networkName, "exists:", err.Error())
 		return false, err
 	}
 
@@ -765,7 +765,7 @@ func (e *DockerEnvironment) exec(cmd string, args ...string) *exec.Cmd {
 func (e *DockerEnvironment) execContext(ctx context.Context, cmd string, args ...string) *exec.Cmd {
 	c := NewCommand(cmd, args...)
 	if e.verbose {
-		e.logger.Log("dockerEnv:", c.toString())
+		_ = e.logger.Log("dockerEnv:", c.toString())
 	}
 	return c.exec(ctx)
 }
@@ -779,7 +779,7 @@ func (e *DockerEnvironment) close() {
 	for i := len(e.started) - 1; i >= 0; i-- {
 		n := e.started[i].Name()
 		if err := e.started[i].Kill(); err != nil {
-			e.logger.Log("Unable to kill service", n, ":", err.Error())
+			_ = e.logger.Log("Unable to kill service", n, ":", err.Error())
 		}
 	}
 
@@ -799,13 +799,13 @@ func (e *DockerEnvironment) close() {
 			}
 
 			if out, err = e.exec("docker", "rm", "--force", containerID).CombinedOutput(); err != nil {
-				e.logger.Log(string(out))
-				e.logger.Log("Unable to cleanup leftover container", containerID, ":", err.Error())
+				_ = e.logger.Log(string(out))
+				_ = e.logger.Log("Unable to cleanup leftover container", containerID, ":", err.Error())
 			}
 		}
 	} else {
-		e.logger.Log(string(out))
-		e.logger.Log("Unable to cleanup leftover containers:", err.Error())
+		_ = e.logger.Log(string(out))
+		_ = e.logger.Log("Unable to cleanup leftover containers:", err.Error())
 	}
 
 	// Teardown the docker network. In case the network does not exists (ie. this function
@@ -813,17 +813,18 @@ func (e *DockerEnvironment) close() {
 	// an error which may be misleading.
 	if ok, err := e.existDockerNetwork(); ok || err != nil {
 		if out, err := e.exec("docker", "network", "rm", e.networkName).CombinedOutput(); err != nil {
-			e.logger.Log(string(out))
-			e.logger.Log("Unable to remove docker network", e.networkName, ":", err.Error())
+			_ = e.logger.Log(string(out))
+			_ = e.logger.Log("Unable to remove docker network", e.networkName, ":", err.Error())
 		}
 	}
 
 	if e.dir != "" {
-		if err := e.exec("chmod", "-R", "777", e.dir).Run(); err != nil {
-			e.logger.Log("Error while chmod sharedDir", e.dir, "err:", err)
+		if out, err := e.exec("chmod", "-R", "777", e.dir).CombinedOutput(); err != nil {
+			_ = e.logger.Log(string(out))
+			_ = e.logger.Log("Error while chmod sharedDir", e.dir, "err:", err)
 		}
 		if err := os.RemoveAll(e.dir); err != nil {
-			e.logger.Log("Error while removing sharedDir", e.dir, "err:", err)
+			_ = e.logger.Log("Error while removing sharedDir", e.dir, "err:", err)
 		}
 	}
 }

@@ -13,8 +13,10 @@ import (
 	e2eobs "github.com/efficientgo/e2e/observable"
 )
 
+const thanosImage = "quay.io/thanos/thanos:v0.40.1"
+
 func NewThanosQuerier(env e2e.Environment, name string, endpointsAddresses []string, opts ...Option) *e2eobs.Observable {
-	o := options{image: "quay.io/thanos/thanos:v0.27.0"}
+	o := options{image: thanosImage}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -33,7 +35,7 @@ func NewThanosQuerier(env e2e.Environment, name string, endpointsAddresses []str
 		"--query.max-concurrent": "1",
 	}
 	if len(endpointsAddresses) > 0 {
-		args["--store"] = strings.Join(endpointsAddresses, ",")
+		args["--endpoint"] = strings.Join(endpointsAddresses, ",")
 	}
 	if o.flagOverride != nil {
 		args = e2e.MergeFlagsWithoutRemovingEmpty(args, o.flagOverride)
@@ -48,7 +50,7 @@ func NewThanosQuerier(env e2e.Environment, name string, endpointsAddresses []str
 }
 
 func NewThanosSidecar(env e2e.Environment, name string, prom e2e.Linkable, opts ...Option) *e2eobs.Observable {
-	o := options{image: "quay.io/thanos/thanos:v0.27.0"}
+	o := options{image: thanosImage}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -78,7 +80,7 @@ func NewThanosSidecar(env e2e.Environment, name string, prom e2e.Linkable, opts 
 }
 
 func NewThanosStore(env e2e.Environment, name string, bktConfigYaml []byte, opts ...Option) *e2eobs.Observable {
-	o := options{image: "quay.io/thanos/thanos:v0.27.0"}
+	o := options{image: thanosImage}
 	for _, opt := range opts {
 		opt(&o)
 	}

@@ -9,19 +9,17 @@ import (
 	"slices"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/thanos-io/promql-engine/execution/model"
 	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/query"
 
+	"github.com/efficientgo/core/errors"
+	prommodel "github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 )
 
 type countValuesOperator struct {
-	telemetry.OperatorTelemetry
-
-	pool  *model.VectorPool
 	next  model.VectorOperator
 	param string
 
@@ -35,33 +33,27 @@ type countValuesOperator struct {
 	counts []map[int]int
 	series []labels.Labels
 
-	once sync.Once
+	once    sync.Once
+	tempBuf []model.StepVector
 }
 
-func NewCountValues(pool *model.VectorPool, next model.VectorOperator, param string, by bool, grouping []string, opts *query.Options) model.VectorOperator {
+func NewCountValues(next model.VectorOperator, param string, by bool, grouping []string, opts *query.Options) model.VectorOperator {
 	// Grouping labels need to be sorted in order for metric hashing to work.
 	// https://github.com/prometheus/prometheus/blob/8ed39fdab1ead382a354e45ded999eb3610f8d5f/model/labels/labels.go#L162-L181
 	slices.Sort(grouping)
 
 	op := &countValuesOperator{
-		pool:       pool,
 		next:       next,
 		param:      param,
 		stepsBatch: opts.StepsBatch,
 		by:         by,
 		grouping:   grouping,
 	}
-	op.OperatorTelemetry = telemetry.NewTelemetry(op, opts)
-
-	return op
+	return telemetry.NewOperator(telemetry.NewTelemetry(op, opts), op)
 }
 
 func (c *countValuesOperator) Explain() []model.VectorOperator {
 	return []model.VectorOperator{c.next}
-}
-
-func (c *countValuesOperator) GetPool() *model.VectorPool {
-	return c.pool
 }
 
 func (c *countValuesOperator) String() string {
@@ -72,54 +64,59 @@ func (c *countValuesOperator) String() string {
 }
 
 func (c *countValuesOperator) Series(ctx context.Context) ([]labels.Labels, error) {
-	start := time.Now()
-	defer func() { c.AddExecutionTimeTaken(time.Since(start)) }()
-
 	var err error
 	c.once.Do(func() { err = c.initSeriesOnce(ctx) })
 	return c.series, err
 }
 
-func (c *countValuesOperator) Next(ctx context.Context) ([]model.StepVector, error) {
-	start := time.Now()
-	defer func() { c.AddExecutionTimeTaken(time.Since(start)) }()
-
+func (c *countValuesOperator) Next(ctx context.Context, buf []model.StepVector) (int, error) {
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return 0, ctx.Err()
 	default:
 	}
 
 	var err error
 	c.once.Do(func() { err = c.initSeriesOnce(ctx) })
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
 	if c.curStep >= len(c.ts) {
-		return nil, nil
+		return 0, nil
 	}
 
-	batch := c.pool.GetVectorBatch()
-	for i := 0; i < c.stepsBatch; i++ {
+	n := 0
+	maxSteps := min(c.stepsBatch, len(buf))
+
+	for range maxSteps {
 		if c.curStep >= len(c.ts) {
 			break
 		}
-		sv := c.pool.GetStepVector(c.ts[c.curStep])
-		for i, v := range c.counts[c.curStep] {
-			sv.AppendSample(c.pool, uint64(i), float64(v))
+		buf[n] = model.StepVector{T: c.ts[c.curStep]}
+		for id, v := range c.counts[c.curStep] {
+			buf[n].AppendSample(uint64(id), float64(v))
 		}
-		batch = append(batch, sv)
 		c.curStep++
+		n++
 	}
-	return batch, nil
+	return n, nil
 }
 
 func (c *countValuesOperator) initSeriesOnce(ctx context.Context) error {
+	if !prommodel.LabelName(c.param).IsValid() {
+		return errors.Newf("invalid label name %q", c.param)
+	}
+
 	nextSeries, err := c.next.Series(ctx)
 	if err != nil {
 		return err
 	}
+
+	// Allocate outer slice for buffer; inner slices will be allocated by child operators
+	// or grow on demand.
+	c.tempBuf = make([]model.StepVector, c.stepsBatch)
+
 	var (
 		inputIdToHashBucket = make(map[int]uint64)
 		hashToBucketLabels  = make(map[uint64]labels.Labels)
@@ -132,7 +129,7 @@ func (c *countValuesOperator) initSeriesOnce(ctx context.Context) error {
 	for _, lblName := range c.grouping {
 		labelsMap[lblName] = struct{}{}
 	}
-	for i := 0; i < len(nextSeries); i++ {
+	for i := range nextSeries {
 		hash, lbls := hashMetric(builder, nextSeries[i], !c.by, c.grouping, labelsMap, hashingBuf)
 		inputIdToHashBucket[i] = hash
 		if _, ok := hashToBucketLabels[hash]; !ok {
@@ -152,13 +149,14 @@ func (c *countValuesOperator) initSeriesOnce(ctx context.Context) error {
 		default:
 		}
 
-		in, err := c.next.Next(ctx)
+		n, err := c.next.Next(ctx, c.tempBuf)
 		if err != nil {
 			return err
 		}
-		if in == nil {
+		if n == 0 {
 			break
 		}
+		in := c.tempBuf[:n]
 		for i := range in {
 			ts = append(ts, in[i].T)
 			countPerHashbucket := make(map[uint64]map[string]int, len(inputIdToHashBucket))
@@ -200,7 +198,6 @@ func (c *countValuesOperator) initSeriesOnce(ctx context.Context) error {
 			}
 			counts = append(counts, countsPerOutputId)
 		}
-		c.next.GetPool().PutVectors(in)
 	}
 
 	c.ts = ts
