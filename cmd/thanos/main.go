@@ -25,10 +25,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/common/version"
+	"github.com/prometheus/prometheus/promql/parser"
 	"go.uber.org/automaxprocs/maxprocs"
 
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/logging"
+	"github.com/thanos-io/thanos/pkg/logutil"
 	"github.com/thanos-io/thanos/pkg/tracing/client"
 )
 
@@ -66,6 +68,9 @@ func main() {
 	cmd, setup := app.Parse()
 	logger := logging.NewLogger(*logLevel, *logFormat, *debugName)
 
+	// Hacky but temporary
+    parser.Logger = logutil.GoKitLogToSlog(log.With(logger, "component", "prometheus-parser"))
+
 	limits, err := configureGoAutoMemLimit(goMemLimitConf)
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to configure Go runtime memory limits", "err", err)
@@ -95,6 +100,9 @@ func main() {
 		),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)
+
+	// Hacky but temporary
+	metrics.MustRegister(parser.NarrowSelectors)
 
 	// Some packages still use default Register. Replace to have those metrics.
 	prometheus.DefaultRegisterer = metrics

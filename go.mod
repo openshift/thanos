@@ -318,6 +318,10 @@ replace (
 	// Required by Cortex https://github.com/cortexproject/cortex/pull/3051.
 	github.com/bradfitz/gomemcache => github.com/themihai/gomemcache v0.0.0-20180902122335-24332e2d58ab
 
+	// Based on github.com/prometheus/prometheus v0.308.0 used in Thanos v0.41.0
+	// Using the extra check in Prometheus parser to help identify "le"/"quantile" selectors misuses in Prometheus v3.
+	github.com/prometheus/prometheus => github.com/machine424/prometheus v0.0.0-20260312223754-be691e93d050
+
 	// Pin kuberesolver/v5 to support new grpc version. Need to upgrade kuberesolver version on weaveworks/common.
 	github.com/sercand/kuberesolver/v4 => github.com/sercand/kuberesolver/v5 v5.1.1
 

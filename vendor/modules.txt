@@ -1069,7 +1069,7 @@ github.com/prometheus/otlptranslator
 github.com/prometheus/procfs
 github.com/prometheus/procfs/internal/fs
 github.com/prometheus/procfs/internal/util
-# github.com/prometheus/prometheus v0.308.0
+# github.com/prometheus/prometheus v0.308.0 => github.com/machine424/prometheus v0.0.0-20260312223754-be691e93d050
 ## explicit; go 1.24.0
 github.com/prometheus/prometheus/config
 github.com/prometheus/prometheus/discovery
@@ -1991,6 +1991,7 @@ zenhack.net/go/util/deferred
 zenhack.net/go/util/sync/mutex
 # capnproto.org/go/capnp/v3 => capnproto.org/go/capnp/v3 v3.0.0-alpha.30
 # github.com/bradfitz/gomemcache => github.com/themihai/gomemcache v0.0.0-20180902122335-24332e2d58ab
+# github.com/prometheus/prometheus => github.com/machine424/prometheus v0.0.0-20260312223754-be691e93d050
 # github.com/sercand/kuberesolver/v4 => github.com/sercand/kuberesolver/v5 v5.1.1
 # github.com/vimeo/galaxycache => github.com/thanos-community/galaxycache v0.0.0-20211122094458-3a32041a1f1e
 # google.golang.org/grpc => github.com/thanos-community/grpc-go v0.0.0-20251106112228-b9020406f781
