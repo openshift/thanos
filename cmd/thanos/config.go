@@ -206,6 +206,7 @@ type shipperConfig struct {
 	skipCorruptedBlocks   bool
 	hashFunc              string
 	metaFileName          string
+	uploadConcurrency     int
 }
 
 func (sc *shipperConfig) registerFlag(cmd extkingpin.FlagClause) *shipperConfig {
@@ -228,6 +229,7 @@ func (sc *shipperConfig) registerFlag(cmd extkingpin.FlagClause) *shipperConfig 
 	cmd.Flag("hash-func", "Specify which hash function to use when calculating the hashes of produced files. If no function has been specified, it does not happen. This permits avoiding downloading some files twice albeit at some performance cost. Possible values are: \"\", \"SHA256\".").
 		Default("").EnumVar(&sc.hashFunc, "SHA256", "")
 	cmd.Flag("shipper.meta-file-name", "the file to store shipper metadata in").Default(shipper.DefaultMetaFilename).StringVar(&sc.metaFileName)
+	cmd.Flag("shipper.upload-concurrency", "Number of goroutines to use when uploading block files to object storage.").Default("0").IntVar(&sc.uploadConcurrency)
 	return sc
 }
 
@@ -319,7 +321,7 @@ func parseFlagLabels(s []string) (labels.Labels, error) {
 		if len(parts) != 2 {
 			return labels.EmptyLabels(), errors.Errorf("unrecognized label %q", l)
 		}
-		if !model.LabelName.IsValid(model.LabelName(parts[0])) {
+		if !model.UTF8Validation.IsValidLabelName(parts[0]) {
 			return labels.EmptyLabels(), errors.Errorf("unsupported format for label %s", l)
 		}
 		val, err := strconv.Unquote(parts[1])
@@ -349,13 +351,18 @@ func (gml *goMemLimitConfig) registerFlag(cmd extkingpin.FlagClause) *goMemLimit
 	return gml
 }
 
-func configureGoAutoMemLimit(common goMemLimitConfig) error {
+func configureGoAutoMemLimit(common goMemLimitConfig) (int64, error) {
+	var (
+		err    error
+		limits int64 = -1
+	)
+
 	if common.memlimitRatio <= 0.0 || common.memlimitRatio > 1.0 {
-		return errors.New("--auto-gomemlimit.ratio must be greater than 0 and less than or equal to 1.")
+		return limits, errors.New("--auto-gomemlimit.ratio must be greater than 0 and less than or equal to 1.")
 	}
 
 	if common.enableAutoGoMemlimit {
-		if _, err := memlimit.SetGoMemLimitWithOpts(
+		limits, err = memlimit.SetGoMemLimitWithOpts(
 			memlimit.WithRatio(common.memlimitRatio),
 			memlimit.WithProvider(
 				memlimit.ApplyFallback(
@@ -363,10 +370,11 @@ func configureGoAutoMemLimit(common goMemLimitConfig) error {
 					memlimit.FromSystem,
 				),
 			),
-		); err != nil {
-			return errors.Wrap(err, "Failed to set GOMEMLIMIT automatically")
+		)
+		if err != nil {
+			return -1, errors.Wrap(err, "Failed to set GOMEMLIMIT automatically")
 		}
 	}
 
-	return nil
+	return limits, nil
 }

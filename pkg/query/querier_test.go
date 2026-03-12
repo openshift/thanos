@@ -16,9 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/atomic"
+
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
-	"github.com/google/go-cmp/cmp"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/histogram"
@@ -50,7 +51,7 @@ func TestQueryableCreator_MaxResolution(t *testing.T) {
 	t.Parallel()
 
 	testProxy := &testStoreServer{resps: []*storepb.SeriesResponse{}}
-	queryableCreator := NewQueryableCreator(nil, nil, newProxyStore(testProxy), 2, 5*time.Second, dedup.AlgorithmPenalty)
+	queryableCreator := NewQueryableCreator(nil, nil, newProxyStore(testProxy), 2, 5*time.Second, dedup.AlgorithmPenalty, 1)
 
 	oneHourMillis := int64(1*time.Hour) / int64(time.Millisecond)
 	queryable := queryableCreator(
@@ -98,6 +99,7 @@ func TestQuerier_DownsampledData(t *testing.T) {
 		2,
 		timeout,
 		dedup.AlgorithmPenalty,
+		1,
 	)(false,
 		nil,
 		nil,
@@ -362,7 +364,7 @@ func TestQuerier_Select_AfterPromQL(t *testing.T) {
 			// Regression test 1 against https://github.com/thanos-io/thanos/issues/2890.
 			name: "when switching replicas don't miss samples when set with a big enough lookback delta",
 			storeAPI: newProxyStore(func() storepb.StoreServer {
-				s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, nil, "./testdata/issue2890-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
+				s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, labels.EmptyLabels(), "./testdata/issue2890-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
 				testutil.Ok(t, err)
 				return s
 			}()),
@@ -403,7 +405,7 @@ func TestQuerier_Select_AfterPromQL(t *testing.T) {
 						g := gate.New(2)
 						mq := &mockedQueryable{
 							Creator: func(mint, maxt int64) storage.Querier {
-								return newQuerier(nil, mint, maxt, dedup.AlgorithmPenalty, tcase.replicaLabels, nil, tcase.storeAPI, sc.dedup, 0, true, false, g, timeout, nil, NoopSeriesStatsReporter)
+								return newQuerier(nil, mint, maxt, dedup.AlgorithmPenalty, tcase.replicaLabels, nil, tcase.storeAPI, sc.dedup, 0, true, false, g, timeout, nil, NoopSeriesStatsReporter, 1)
 							},
 						}
 						t.Cleanup(func() {
@@ -488,7 +490,7 @@ func TestQuerier_Select(t *testing.T) {
 				},
 			},
 			expectedAfterDedup: []series{{
-				lset: nil,
+				lset: labels.EmptyLabels(),
 				// We don't expect correctness here, it's just random non-replica data.
 				samples: []sample{{1, 1}, {2, 2}, {3, 3}, {5, 5}, {6, 6}, {7, 7}},
 			}},
@@ -497,7 +499,7 @@ func TestQuerier_Select(t *testing.T) {
 		{
 			name: "realistic data with stale marker",
 			storeEndpoints: []storepb.StoreServer{func() storepb.StoreServer {
-				s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, nil, "./testdata/issue2401-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
+				s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, labels.EmptyLabels(), "./testdata/issue2401-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
 				testutil.Ok(t, err)
 				return s
 			}()},
@@ -541,7 +543,7 @@ func TestQuerier_Select(t *testing.T) {
 		{
 			name: "realistic data with stale marker with 100000 step",
 			storeEndpoints: []storepb.StoreServer{func() storepb.StoreServer {
-				s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, nil, "./testdata/issue2401-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
+				s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, labels.EmptyLabels(), "./testdata/issue2401-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
 				testutil.Ok(t, err)
 				return s
 			}()},
@@ -592,7 +594,7 @@ func TestQuerier_Select(t *testing.T) {
 			// Thanks to @Superq and GitLab for real data reproducing this.
 			name: "realistic data with stale marker with hints rate function",
 			storeEndpoints: []storepb.StoreServer{func() storepb.StoreServer {
-				s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, nil, "./testdata/issue2401-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
+				s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, labels.EmptyLabels(), "./testdata/issue2401-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
 				testutil.Ok(t, err)
 				return s
 			}()},
@@ -799,6 +801,7 @@ func TestQuerier_Select(t *testing.T) {
 					timeout,
 					nil,
 					NoopSeriesStatsReporter,
+					1,
 				)
 				t.Cleanup(func() { testutil.Ok(t, q.Close()) })
 
@@ -849,7 +852,7 @@ func newProxyStore(storeAPIs ...storepb.StoreServer) *store.ProxyStore {
 		}
 		cls[i] = &storetestutil.TestClient{
 			Name:        fmt.Sprintf("%v", i),
-			StoreClient: storepb.ServerAsClient(s),
+			StoreClient: storepb.ServerAsClient(s, atomic.Bool{}),
 			MinTime:     math.MinInt64, MaxTime: math.MaxInt64,
 			WithoutReplicaLabelsEnabled: withoutReplicaLabelsEnabled,
 		}
@@ -860,18 +863,11 @@ func newProxyStore(storeAPIs ...storepb.StoreServer) *store.ProxyStore {
 		nil,
 		func() []store.Client { return cls },
 		component.Query,
-		nil,
+		labels.EmptyLabels(),
 		0,
 		store.EagerRetrieval,
 	)
 }
-
-var emptyLabelsSameAsNotAllocatedLabels = cmp.Transformer("", func(l labels.Labels) labels.Labels {
-	if len(l) == 0 {
-		return labels.Labels(nil)
-	}
-	return l
-})
 
 func testSelectResponse(t *testing.T, expected []series, res storage.SeriesSet) {
 	var series []storage.Series
@@ -889,7 +885,7 @@ func testSelectResponse(t *testing.T, expected []series, res storage.SeriesSet) 
 	}())
 
 	for i, s := range series {
-		testutil.WithGoCmp(emptyLabelsSameAsNotAllocatedLabels).Equals(t, expected[i].lset, s.Labels())
+		testutil.Assert(t, labels.Equal(expected[i].Labels(), s.Labels()))
 		samples := expandSeries(t, s.Iterator(nil))
 		expectedCpy := make([]sample, 0, len(expected[i].samples))
 		for _, s := range expected[i].samples {
@@ -914,15 +910,10 @@ func jsonToSeries(t *testing.T, filename string) []series {
 
 	var ss []series
 	for _, ser := range data.Data.Results {
-		var lbls labels.Labels
+		builder := labels.NewBuilder(labels.EmptyLabels())
 		for n, v := range ser.Metric {
-			lbls = append(lbls, labels.Label{
-				Name:  string(n),
-				Value: string(v),
-			})
+			builder.Set(string(n), string(v))
 		}
-		// Label names need to be sorted.
-		sort.Sort(lbls)
 
 		var smpls []sample
 		for _, smp := range ser.Values {
@@ -933,7 +924,7 @@ func jsonToSeries(t *testing.T, filename string) []series {
 		}
 
 		ss = append(ss, series{
-			lset:    lbls,
+			lset:    builder.Labels(),
 			samples: smpls,
 		})
 	}
@@ -1073,7 +1064,7 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 
 	logger := log.NewLogfmtLogger(os.Stderr)
 
-	s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, nil, "./testdata/issue2401-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
+	s, err := store.NewLocalStoreFromJSONMmappableFile(logger, component.Debug, labels.EmptyLabels(), "./testdata/issue2401-seriesresponses.json", store.ScanGRPCCurlProtoStreamMessages)
 	testutil.Ok(t, err)
 
 	t.Run("dedup=false", func(t *testing.T) {
@@ -1090,7 +1081,7 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 
 		timeout := 100 * time.Second
 		g := gate.New(2)
-		q := newQuerier(logger, realSeriesWithStaleMarkerMint, realSeriesWithStaleMarkerMaxt, dedup.AlgorithmPenalty, []string{"replica"}, nil, newProxyStore(s), false, 0, true, false, g, timeout, nil, NoopSeriesStatsReporter)
+		q := newQuerier(logger, realSeriesWithStaleMarkerMint, realSeriesWithStaleMarkerMaxt, dedup.AlgorithmPenalty, []string{"replica"}, nil, newProxyStore(s), false, 0, true, false, g, timeout, nil, NoopSeriesStatsReporter, 1)
 		t.Cleanup(func() {
 			testutil.Ok(t, q.Close())
 		})
@@ -1160,7 +1151,7 @@ func TestQuerierWithDedupUnderstoodByPromQL_Rate(t *testing.T) {
 
 		timeout := 5 * time.Second
 		g := gate.New(2)
-		q := newQuerier(logger, realSeriesWithStaleMarkerMint, realSeriesWithStaleMarkerMaxt, dedup.AlgorithmPenalty, []string{"replica"}, nil, newProxyStore(s), true, 0, true, false, g, timeout, nil, NoopSeriesStatsReporter)
+		q := newQuerier(logger, realSeriesWithStaleMarkerMint, realSeriesWithStaleMarkerMaxt, dedup.AlgorithmPenalty, []string{"replica"}, nil, newProxyStore(s), true, 0, true, false, g, timeout, nil, NoopSeriesStatsReporter, 1)
 		t.Cleanup(func() {
 			testutil.Ok(t, q.Close())
 		})
@@ -1260,9 +1251,9 @@ func (s *testStoreServer) Series(r *storepb.SeriesRequest, srv storepb.Store_Ser
 func storeSeriesResponse(t testing.TB, lset labels.Labels, smplChunks ...[]sample) *storepb.SeriesResponse {
 	var s storepb.Series
 
-	for _, l := range lset {
+	lset.Range(func(l labels.Label) {
 		s.Labels = append(s.Labels, labelpb.ZLabel{Name: l.Name, Value: l.Value})
-	}
+	})
 
 	for _, smpls := range smplChunks {
 		c := chunkenc.NewXORChunk()

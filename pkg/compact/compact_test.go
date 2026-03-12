@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"path"
+	"sync"
 	"testing"
 	"time"
 
@@ -551,6 +553,11 @@ func TestDownsampleProgressCalculate(t *testing.T) {
 }
 
 func TestNoMarkFilterAtomic(t *testing.T) {
+	if testing.
+		Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
 	t.Parallel()
 
 	ctx := context.TODO()
@@ -567,7 +574,7 @@ func TestNoMarkFilterAtomic(t *testing.T) {
 		Name: "coolcounter",
 	})
 
-	for i := 0; i < blocksNum; i++ {
+	for i := range blocksNum {
 		var meta metadata.Meta
 		meta.Version = 1
 		meta.ULID = ulid.MustNew(uint64(i), nil)
@@ -626,4 +633,191 @@ func TestNoMarkFilterAtomic(t *testing.T) {
 		cancel()
 	})
 	testutil.Ok(t, g.Run())
+}
+
+func TestGarbageCollect_FilterRace(t *testing.T) {
+	if testing.
+		Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(timeoutCancel)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	bkt := objstore.NewInMemBucket()
+
+	var metaParent metadata.Meta
+	metaParent.Version = 1
+	metaParent.ULID = ulid.MustNew(uint64(0), nil)
+
+	children := []ulid.ULID{
+		ulid.MustNew(uint64(1), nil), ulid.MustNew(uint64(2), nil), ulid.MustNew(uint64(3), nil),
+	}
+	metaParent.Compaction.Sources = children
+
+	var buf bytes.Buffer
+	testutil.Ok(t, json.NewEncoder(&buf).Encode(&metaParent))
+	testutil.Ok(t, bkt.Upload(ctx, path.Join(metaParent.ULID.String(), metadata.MetaFilename), &buf))
+
+	createBlocks := func() {
+		for _, ch := range children {
+			var metaChild metadata.Meta
+			metaChild.Version = 1
+			metaChild.ULID = ch
+
+			var buf bytes.Buffer
+			testutil.Ok(t, json.NewEncoder(&buf).Encode(&metaChild))
+			testutil.Ok(t, bkt.Upload(ctx, path.Join(metaChild.ULID.String(), metadata.MetaFilename), &buf))
+		}
+	}
+
+	reg := prometheus.NewRegistry()
+
+	baseFetcher, err := block.NewBaseFetcher(
+		log.NewNopLogger(),
+		10,
+		objstore.WithNoopInstr(bkt),
+		block.NewConcurrentLister(log.NewNopLogger(), objstore.WithNoopInstr(bkt)),
+		t.TempDir(),
+		reg,
+	)
+	testutil.Ok(t, err)
+
+	df := block.NewIgnoreDeletionMarkFilter(log.NewNopLogger(), objstore.WithNoopInstr(bkt), 0*time.Second, 1)
+
+	duplicateFilter := block.NewDeduplicateFilter(5)
+	mf := baseFetcher.NewMetaFetcher(reg, []block.MetadataFilter{df, duplicateFilter})
+
+	garbageCollection := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		Name: "test_gc_counter",
+	})
+
+	syncer, err := NewMetaSyncer(log.NewNopLogger(), reg, bkt, mf, duplicateFilter, df, promauto.With(prometheus.NewRegistry()).NewCounter(prometheus.CounterOpts{
+		Name: "test_meta_syncer_syncs",
+	}), garbageCollection, 5*time.Minute)
+	testutil.Ok(t, err)
+
+	blocksCleanedMetric := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		Name: "test_block_cleaned",
+	})
+	blocksCleaner := NewBlocksCleaner(log.NewNopLogger(), objstore.WithNoopInstr(bkt), df, 0*time.Second, blocksCleanedMetric, promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		Name: "test_block_cleaner_errors",
+	}))
+
+	for timeoutCtx.Err() == nil {
+		t.Log("doing iteration")
+
+		testutil.Equals(t, float64(0.0), promtestutil.ToFloat64(garbageCollection))
+
+		createBlocks()
+		for _, ch := range children {
+			testutil.Ok(t, block.MarkForDeletion(context.Background(), log.NewNopLogger(), objstore.WithNoopInstr(bkt), ch, "foo", promauto.With(prometheus.NewRegistry()).NewCounter(
+				prometheus.CounterOpts{Name: "test_block_marked_for_deletion"},
+			)))
+		}
+		testutil.Ok(t, syncer.SyncMetas(context.Background()))
+
+		startWg := &sync.WaitGroup{}
+		startWg.Add(1)
+
+		wg := &sync.WaitGroup{}
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			startWg.Wait()
+			r := rand.Uint32N(20)
+			time.Sleep(time.Duration(r) * time.Millisecond)
+			deleted, err := blocksCleaner.DeleteMarkedBlocks(context.Background())
+			testutil.Ok(t, err)
+			testutil.Ok(t, syncer.GarbageCollect(context.Background(), deleted))
+		}()
+
+		go func() {
+			defer wg.Done()
+			startWg.Wait()
+			for range 100 {
+				testutil.Ok(t, syncer.SyncMetas(context.Background()))
+			}
+		}()
+
+		startWg.Done()
+		wg.Wait()
+	}
+}
+
+func TestCompactExtensions(t *testing.T) {
+	t.Parallel()
+
+	logger := log.NewNopLogger()
+	reg := prometheus.NewRegistry()
+
+	var bkt objstore.Bucket
+	temp := promauto.With(reg).NewCounter(prometheus.CounterOpts{Name: "test_metric_for_group", Help: "this is a test metric for compact extensions"})
+	grouper := NewDefaultGrouper(logger, bkt, false, false, reg, temp, temp, temp, "", 1, 1)
+
+	for _, tcase := range []struct {
+		name          string
+		blocks        map[ulid.ULID]*metadata.Meta
+		outExtensions map[string]any
+	}{
+		{
+			outExtensions: make(map[string]any),
+			name:          "group with different extensions",
+			blocks: map[ulid.ULID]*metadata.Meta{
+				ulid.MustNew(1, nil): {
+					BlockMeta: tsdb.BlockMeta{
+						ULID: ulid.MustNew(1, nil),
+					},
+					Thanos: metadata.Thanos{
+						Extensions: map[string]any{},
+					},
+				},
+				ulid.MustNew(2, nil): {
+					BlockMeta: tsdb.BlockMeta{
+						ULID: ulid.MustNew(2, nil),
+					},
+					Thanos: metadata.Thanos{
+						Extensions: map[string]any{"foo": "bar"},
+					},
+				},
+			},
+		},
+		{
+			outExtensions: map[string]any{"foo": "bar"},
+			name:          "group with same extensions",
+			blocks: map[ulid.ULID]*metadata.Meta{
+				ulid.MustNew(1, nil): {
+					BlockMeta: tsdb.BlockMeta{
+						ULID: ulid.MustNew(1, nil),
+					},
+					Thanos: metadata.Thanos{
+						Extensions: map[string]any{"foo": "bar"},
+					},
+				},
+				ulid.MustNew(2, nil): {
+					BlockMeta: tsdb.BlockMeta{
+						ULID: ulid.MustNew(2, nil),
+					},
+					Thanos: metadata.Thanos{
+						Extensions: map[string]any{"foo": "bar"},
+					},
+				},
+			},
+		},
+	} {
+		t.Run(tcase.name, func(t *testing.T) {
+			groups, err := grouper.Groups(tcase.blocks)
+			testutil.Ok(t, err)
+
+			for _, g := range groups {
+				ext := g.Extensions()
+				testutil.Equals(t, tcase.outExtensions, ext)
+			}
+			testutil.Assert(t, len(groups) > 0)
+		})
+	}
 }

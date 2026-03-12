@@ -39,10 +39,11 @@ func TestRemoteEngine_Warnings(t *testing.T) {
 	qryExpr, err := extpromql.ParseExpr("up")
 	testutil.Ok(t, err)
 
-	plan := logicalplan.NewFromAST(qryExpr, &query.Options{
+	plan, err := logicalplan.NewFromAST(qryExpr, &query.Options{
 		Start: time.Now(),
 		End:   time.Now().Add(2 * time.Hour),
 	}, logicalplan.PlanOptions{})
+	testutil.Ok(t, err)
 
 	t.Run("instant_query", func(t *testing.T) {
 		qry, err := engine.NewInstantQuery(context.Background(), nil, plan.Root(), start)
@@ -77,10 +78,11 @@ func TestRemoteEngine_PartialResponse(t *testing.T) {
 	qryExpr, err := extpromql.ParseExpr("up")
 	testutil.Ok(t, err)
 
-	plan := logicalplan.NewFromAST(qryExpr, &query.Options{
+	plan, err := logicalplan.NewFromAST(qryExpr, &query.Options{
 		Start: time.Now(),
 		End:   time.Now().Add(2 * time.Hour),
 	}, logicalplan.PlanOptions{})
+	testutil.Ok(t, err)
 
 	t.Run("instant_query", func(t *testing.T) {
 		qry, err := engine.NewInstantQuery(context.Background(), nil, plan.Root(), start)
@@ -103,37 +105,42 @@ func TestRemoteEngine_LabelSets(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name            string
-		tsdbInfos       []infopb.TSDBInfo
-		replicaLabels   []string
-		expected        []labels.Labels
-		partitionLabels []string
+		name                       string
+		tsdbInfos                  []infopb.TSDBInfo
+		replicaLabels              []string
+		partitionLabels            []string
+		expectedLabelSets          []labels.Labels
+		expectedPartitionLabelSets []labels.Labels
 	}{
 		{
-			name:      "empty label sets",
-			tsdbInfos: []infopb.TSDBInfo{},
-			expected:  []labels.Labels{},
+			name:                       "empty label sets",
+			tsdbInfos:                  []infopb.TSDBInfo{},
+			expectedLabelSets:          []labels.Labels{},
+			expectedPartitionLabelSets: []labels.Labels{},
 		},
 		{
-			name:          "empty label sets with replica labels",
-			tsdbInfos:     []infopb.TSDBInfo{},
-			replicaLabels: []string{"replica"},
-			expected:      []labels.Labels{},
+			name:                       "empty label sets with replica labels",
+			tsdbInfos:                  []infopb.TSDBInfo{},
+			replicaLabels:              []string{"replica"},
+			expectedLabelSets:          []labels.Labels{},
+			expectedPartitionLabelSets: []labels.Labels{},
 		},
 		{
 			name: "non-empty label sets",
 			tsdbInfos: []infopb.TSDBInfo{{
 				Labels: zLabelSetFromStrings("a", "1"),
 			}},
-			expected: []labels.Labels{labels.FromStrings("a", "1")},
+			expectedLabelSets:          []labels.Labels{labels.FromStrings("a", "1")},
+			expectedPartitionLabelSets: []labels.Labels{labels.FromStrings("a", "1")},
 		},
 		{
 			name: "non-empty label sets with replica labels",
 			tsdbInfos: []infopb.TSDBInfo{{
 				Labels: zLabelSetFromStrings("a", "1", "b", "2"),
 			}},
-			replicaLabels: []string{"a"},
-			expected:      []labels.Labels{labels.FromStrings("b", "2")},
+			replicaLabels:              []string{"a"},
+			expectedLabelSets:          []labels.Labels{labels.FromStrings("b", "2")},
+			expectedPartitionLabelSets: []labels.Labels{labels.FromStrings("b", "2")},
 		},
 		{
 			name: "replica labels not in label sets",
@@ -142,8 +149,9 @@ func TestRemoteEngine_LabelSets(t *testing.T) {
 					Labels: zLabelSetFromStrings("a", "1", "c", "2"),
 				},
 			},
-			replicaLabels: []string{"a", "b"},
-			expected:      []labels.Labels{labels.FromStrings("c", "2")},
+			replicaLabels:              []string{"a", "b"},
+			expectedLabelSets:          []labels.Labels{labels.FromStrings("c", "2")},
+			expectedPartitionLabelSets: []labels.Labels{labels.FromStrings("c", "2")},
 		},
 		{
 			name: "non-empty label sets with partition labels",
@@ -152,8 +160,9 @@ func TestRemoteEngine_LabelSets(t *testing.T) {
 					Labels: zLabelSetFromStrings("a", "1", "c", "2"),
 				},
 			},
-			partitionLabels: []string{"a"},
-			expected:        []labels.Labels{labels.FromStrings("a", "1")},
+			partitionLabels:            []string{"a"},
+			expectedLabelSets:          []labels.Labels{labels.FromStrings("a", "1", "c", "2")},
+			expectedPartitionLabelSets: []labels.Labels{labels.FromStrings("a", "1")},
 		},
 	}
 
@@ -165,7 +174,8 @@ func TestRemoteEngine_LabelSets(t *testing.T) {
 				PartitionLabels: testCase.partitionLabels,
 			})
 
-			testutil.Equals(t, testCase.expected, engine.LabelSets())
+			testutil.Equals(t, testCase.expectedPartitionLabelSets, engine.PartitionLabelSets())
+			testutil.Equals(t, testCase.expectedLabelSets, engine.LabelSets())
 		})
 	}
 }

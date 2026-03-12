@@ -26,7 +26,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/tsdb"
-	"github.com/prometheus/prometheus/tsdb/wlog"
+	"github.com/prometheus/prometheus/util/compression"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
 	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
@@ -35,6 +35,7 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/compressutil"
 	"github.com/thanos-io/thanos/pkg/exemplars"
 	"github.com/thanos-io/thanos/pkg/extgrpc"
 	"github.com/thanos-io/thanos/pkg/extgrpc/snappy"
@@ -48,6 +49,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/runutil"
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
+	"github.com/thanos-io/thanos/pkg/status"
 	"github.com/thanos-io/thanos/pkg/store"
 	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
@@ -72,7 +74,7 @@ func registerReceive(app *extkingpin.App) {
 			return errors.Wrap(err, "parse labels")
 		}
 
-		if !model.LabelName.IsValid(model.LabelName(conf.tenantLabelName)) {
+		if !model.UTF8Validation.IsValidLabelName(conf.tenantLabelName) {
 			return errors.Errorf("unsupported format for tenant label name, got %s", conf.tenantLabelName)
 		}
 		if lset.Len() == 0 {
@@ -93,12 +95,11 @@ func registerReceive(app *extkingpin.App) {
 			MaxBytes:                       int64(conf.tsdbMaxBytes),
 			OutOfOrderCapMax:               conf.tsdbOutOfOrderCapMax,
 			NoLockfile:                     conf.noLockFile,
-			WALCompression:                 wlog.ParseCompressionType(conf.walCompression, string(wlog.CompressionSnappy)),
+			WALCompression:                 compressutil.ParseCompressionType(conf.walCompression, compression.Snappy),
 			MaxExemplars:                   conf.tsdbMaxExemplars,
 			EnableExemplarStorage:          conf.tsdbMaxExemplars > 0,
 			HeadChunksWriteQueueSize:       int(conf.tsdbWriteQueueSize),
 			EnableMemorySnapshotOnShutdown: conf.tsdbMemorySnapshotOnShutdown,
-			EnableNativeHistograms:         conf.tsdbEnableNativeHistograms,
 		}
 
 		// Are we running in IngestorOnly, RouterOnly or RouterIngestor mode?
@@ -233,6 +234,8 @@ func runReceive(
 		multiTSDBOptions = append(multiTSDBOptions, receive.WithMatchersCache(cache))
 	}
 
+	multiTSDBOptions = append(multiTSDBOptions, receive.WithUploadConcurrency(conf.uploadConcurrency))
+
 	dbs := receive.NewMultiTSDB(
 		conf.dataDir,
 		logger,
@@ -285,6 +288,7 @@ func runReceive(
 		DialOpts:             dialOpts,
 		ForwardTimeout:       time.Duration(*conf.forwardTimeout),
 		MaxBackoff:           time.Duration(*conf.maxBackoff),
+		MaxArtificialDelay:   time.Duration(*conf.maxArtificialDelay),
 		TSDBStats:            dbs,
 		Limiter:              limiter,
 
@@ -397,12 +401,37 @@ func runReceive(
 				return nil, errors.New("Not ready")
 			}),
 			info.WithExemplarsInfoFunc(),
+			info.WithStatusInfoFunc(),
+		)
+
+		statusSrv := status.NewServer(
+			component.Receive.String(),
+			status.WithTSDBStatisticsGetter(
+				status.TSDBStatisticsGetterFunc(func(limit int, tenantID string) (map[string]tsdb.Stats, error) {
+					if !httpProbe.IsReady() {
+						return nil, errors.New("not ready")
+					}
+
+					var tenantIDs []string
+					if tenantID != "" {
+						tenantIDs = append(tenantIDs, tenantID)
+					}
+
+					stats := map[string]tsdb.Stats{}
+					for _, ts := range dbs.TenantStats(limit, model.MetricNameLabel, tenantIDs...) {
+						stats[ts.Tenant] = *ts.Stats
+					}
+
+					return stats, nil
+				}),
+			),
 		)
 
 		srv := grpcserver.New(logger, receive.NewUnRegisterer(reg), tracer, grpcLogOpts, logFilterMethods, comp, grpcProbe,
 			grpcserver.WithServer(store.RegisterStoreServer(rw, logger)),
 			grpcserver.WithServer(store.RegisterWritableStoreServer(rw)),
 			grpcserver.WithServer(exemplars.RegisterExemplarsServer(exemplars.NewMultiTSDB(dbs.TSDBExemplars))),
+			grpcserver.WithServer(status.RegisterStatusServer(statusSrv)),
 			grpcserver.WithServer(info.RegisterInfoServer(infoSrv)),
 			grpcserver.WithListen(conf.grpcConfig.bindAddress),
 			grpcserver.WithGracePeriod(conf.grpcConfig.gracePeriod),
@@ -861,6 +890,7 @@ type receiveConfig struct {
 	replicationFactor   uint64
 	forwardTimeout      *model.Duration
 	maxBackoff          *model.Duration
+	maxArtificialDelay  *model.Duration
 	compression         string
 	replicationProtocol string
 	grpcServiceConfig   string
@@ -887,6 +917,7 @@ type receiveConfig struct {
 	ignoreBlockSize       bool
 	allowOutOfOrderUpload bool
 	skipCorruptedBlocks   bool
+	uploadConcurrency     int
 
 	reqLogConfig      *extflag.PathOrContent
 	relabelConfigPath *extflag.PathOrContent
@@ -961,6 +992,8 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("receive.local-endpoint", "Endpoint of local receive node. Used to identify the local node in the hashring configuration. If it's empty AND hashring configuration was provided, it means that receive will run in RoutingOnly mode.").StringVar(&rc.endpoint)
 
 	cmd.Flag("receive.tenant-header", "HTTP header to determine tenant for write requests.").Default(tenancy.DefaultTenantHeader).StringVar(&rc.tenantHeader)
+
+	rc.maxArtificialDelay = extkingpin.ModelDuration(cmd.Flag("receive.artificial-max-delay", "Maximum artificial delay for the 2nd peer.").Default("0s").Hidden())
 
 	cmd.Flag("receive.tenant-certificate-field", "Use TLS client's certificate field to determine tenant for write requests. Must be one of "+tenancy.CertificateFieldOrganization+", "+tenancy.CertificateFieldOrganizationalUnit+" or "+tenancy.CertificateFieldCommonName+". This setting will cause the receive.tenant-header flag value to be ignored.").Default("").EnumVar(&rc.tenantField, "", tenancy.CertificateFieldOrganization, tenancy.CertificateFieldOrganizationalUnit, tenancy.CertificateFieldCommonName)
 
@@ -1038,8 +1071,8 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 		Default("false").Hidden().BoolVar(&rc.tsdbMemorySnapshotOnShutdown)
 
 	cmd.Flag("tsdb.enable-native-histograms",
-		"[EXPERIMENTAL] Enables the ingestion of native histograms.").
-		Default("false").BoolVar(&rc.tsdbEnableNativeHistograms)
+		"(Deprecated) Enables the ingestion of native histograms. This flag is a no-op now and will be removed in the future. Native histogram ingestion is always enabled.").
+		Default("true").BoolVar(&rc.tsdbEnableNativeHistograms)
 
 	cmd.Flag("writer.intern",
 		"[EXPERIMENTAL] Enables string interning in receive writer, for more optimized memory usage.").
@@ -1061,6 +1094,8 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 			"This can trigger compaction without those blocks and as a result will create an overlap situation. Set it to true if you have vertical compaction enabled and wish to upload blocks as soon as possible without caring"+
 			"about order.").
 		Default("false").Hidden().BoolVar(&rc.skipCorruptedBlocks)
+
+	cmd.Flag("shipper.upload-concurrency", "Number of goroutines to use when uploading block files to object storage.").Default("0").IntVar(&rc.uploadConcurrency)
 
 	cmd.Flag("matcher-cache-size", "Max number of cached matchers items. Using 0 disables caching.").Default("0").IntVar(&rc.matcherCacheSize)
 
