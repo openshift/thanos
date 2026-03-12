@@ -69,7 +69,7 @@ func main() {
 	logger := logging.NewLogger(*logLevel, *logFormat, *debugName)
 
 	// Hacky but temporary
-    parser.Logger = logutil.GoKitLogToSlog(log.With(logger, "component", "prometheus-parser"))
+	parser.Logger = logutil.GoKitLogToSlog(log.With(logger, "component", "prometheus-parser"))
 
 	limits, err := configureGoAutoMemLimit(goMemLimitConf)
 	if err != nil {
