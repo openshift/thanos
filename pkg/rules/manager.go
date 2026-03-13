@@ -17,10 +17,11 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/rules"
-	"gopkg.in/yaml.v3"
+	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/extprom"
@@ -208,10 +209,10 @@ type configRuleAdapter struct {
 	PartialResponseStrategy *storepb.PartialResponseStrategy
 
 	group           rulefmt.RuleGroup
-	nativeRuleGroup map[string]interface{}
+	nativeRuleGroup map[string]any
 }
 
-func (g *configRuleAdapter) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (g *configRuleAdapter) UnmarshalYAML(unmarshal func(any) error) error {
 	rs := struct {
 		RuleGroup rulefmt.RuleGroup `yaml:",inline"`
 		Strategy  string            `yaml:"partial_response_strategy"`
@@ -228,7 +229,7 @@ func (g *configRuleAdapter) UnmarshalYAML(unmarshal func(interface{}) error) err
 	}
 	g.group = rs.RuleGroup
 
-	var native map[string]interface{}
+	var native map[string]any
 	if err := unmarshal(&native); err != nil {
 		return errors.Wrap(err, "failed to unmarshal rulefmt.configRuleAdapter")
 	}
@@ -238,9 +239,9 @@ func (g *configRuleAdapter) UnmarshalYAML(unmarshal func(interface{}) error) err
 	return nil
 }
 
-func (g configRuleAdapter) MarshalYAML() (interface{}, error) {
+func (g configRuleAdapter) MarshalYAML() (any, error) {
 	return struct {
-		RuleGroup map[string]interface{} `yaml:",inline"`
+		RuleGroup map[string]any `yaml:",inline"`
 	}{
 		RuleGroup: g.nativeRuleGroup,
 	}, nil
@@ -263,7 +264,7 @@ func (g configRuleAdapter) validate() (errs []error) {
 	set[g.group.Name] = struct{}{}
 
 	for i, r := range g.group.Rules {
-		for _, node := range r.Validate(rulefmt.RuleNode{}) {
+		for _, node := range r.Validate(rulefmt.RuleNode{}, model.UTF8Validation) {
 			var ruleName string
 			if r.Alert != "" {
 				ruleName = r.Alert
@@ -286,9 +287,14 @@ func (g configRuleAdapter) validate() (errs []error) {
 // TODO(bwplotka): Replace this with upstream implementation after https://github.com/prometheus/prometheus/issues/7128 is fixed.
 func ValidateAndCount(group io.Reader) (numRules int, errs errutil.MultiError) {
 	var rgs configGroups
-	d := yaml.NewDecoder(group)
-	d.KnownFields(true)
-	if err := d.Decode(&rgs); err != nil {
+
+	b, err := io.ReadAll(group)
+	if err != nil {
+		errs.Add(err)
+		return 0, errs
+	}
+
+	if err := yaml.UnmarshalStrict(b, &rgs); err != nil {
 		errs.Add(err)
 		return 0, errs
 	}

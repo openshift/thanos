@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"html/template"
+	"maps"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -41,7 +42,7 @@ import (
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/agent"
-	"github.com/prometheus/prometheus/tsdb/wlog"
+	"github.com/prometheus/prometheus/util/compression"
 	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/objstore"
@@ -54,6 +55,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/clientconfig"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/compressutil"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
 	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/extannotations"
@@ -112,8 +114,9 @@ type ruleConfig struct {
 	storeRateLimits    store.SeriesSelectLimits
 	ruleConcurrentEval int64
 
-	extendedFunctionsEnabled bool
-	EnableFeatures           []string
+	extendedFunctionsEnabled   bool
+	EnableFeatures             []string
+	tsdbEnableNativeHistograms bool
 }
 
 type Expression struct {
@@ -170,6 +173,10 @@ func registerRule(app *extkingpin.App) {
 	cmd.Flag("query.enable-x-functions", "Whether to enable extended rate functions (xrate, xincrease and xdelta). Only has effect when used with Thanos engine.").Default("false").BoolVar(&conf.extendedFunctionsEnabled)
 	cmd.Flag("enable-feature", "Comma separated feature names to enable. Valid options for now: promql-experimental-functions (enables promql experimental functions for ruler)").Default("").StringsVar(&conf.EnableFeatures)
 
+	cmd.Flag("tsdb.enable-native-histograms",
+		"(Deprecated) Enables the ingestion of native histograms. This flag is a no-op now and will be removed in the future. Native histogram ingestion is always enabled.").
+		Default("true").BoolVar(&conf.tsdbEnableNativeHistograms)
+
 	conf.rwConfig = extflag.RegisterPathOrContent(cmd, "remote-write.config", "YAML config for the remote-write configurations, that specify servers where samples should be sent to (see https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write). This automatically enables stateless mode for ruler and no series will be stored in the ruler's TSDB. If an empty config (or file) is provided, the flag is ignored and ruler is run with its own TSDB.", extflag.WithEnvSubstitution())
 
 	conf.objStoreConfig = extkingpin.RegisterCommonObjStoreFlags(cmd, "", false)
@@ -193,11 +200,11 @@ func registerRule(app *extkingpin.App) {
 			MaxBlockDuration:  int64(time.Duration(*tsdbBlockDuration) / time.Millisecond),
 			RetentionDuration: int64(time.Duration(*tsdbRetention) / time.Millisecond),
 			NoLockfile:        *noLockFile,
-			WALCompression:    wlog.ParseCompressionType(*walCompression, string(wlog.CompressionSnappy)),
+			WALCompression:    compressutil.ParseCompressionType(*walCompression, compression.Snappy),
 		}
 
 		agentOpts := &agent.Options{
-			WALCompression: wlog.ParseCompressionType(*walCompression, string(wlog.CompressionSnappy)),
+			WALCompression: compressutil.ParseCompressionType(*walCompression, compression.Snappy),
 			NoLockfile:     *noLockFile,
 		}
 
@@ -442,7 +449,9 @@ func runRule(
 			conf.query.dnsSDInterval,
 			5*time.Minute,
 			5*time.Second,
+			conf.evalInterval,
 			dialOpts,
+			[]string{},
 		)
 		if err != nil {
 			return err
@@ -471,9 +480,10 @@ func runRule(
 
 		slogger := logutil.GoKitLogToSlog(logger)
 		// flushDeadline is set to 1m, but it is for metadata watcher only so not used here.
+		// TODO: add type and unit labels support?
 		remoteStore := remote.NewStorage(slogger, reg, func() (int64, error) {
 			return 0, nil
-		}, conf.dataDir, 1*time.Minute, &readyScrapeManager{})
+		}, conf.dataDir, 1*time.Minute, &readyScrapeManager{}, false)
 		if err := remoteStore.ApplyConfig(&config.Config{
 			GlobalConfig: config.GlobalConfig{
 				ExternalLabels: labelsTSDBToProm(conf.lset),
@@ -580,9 +590,7 @@ func runRule(
 	)
 	{
 		if conf.extendedFunctionsEnabled {
-			for k, fn := range parse.XFunctions {
-				parser.Functions[k] = fn
-			}
+			maps.Copy(parser.Functions, parse.XFunctions)
 		}
 
 		if len(conf.EnableFeatures) > 0 {
@@ -863,6 +871,7 @@ func runRule(
 			shipper.WithLabels(func() labels.Labels { return conf.lset }),
 			shipper.WithAllowOutOfOrderUploads(conf.shipper.allowOutOfOrderUpload),
 			shipper.WithSkipCorruptedBlocks(conf.shipper.skipCorruptedBlocks),
+			shipper.WithUploadConcurrency(conf.shipper.uploadConcurrency),
 		)
 
 		ctx, cancel := context.WithCancel(context.Background())

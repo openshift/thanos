@@ -242,7 +242,7 @@ func TestDownsampleNativeHistograms(t *testing.T) {
 		// Check data.
 		for _, c := range chks {
 			ac := c.Chunk.(*AggrChunk)
-			for i := 0; i < 5; i++ {
+			for i := range 5 {
 				at := AggrType(i)
 
 				_, expected := expectedAggregates[at]
@@ -347,7 +347,7 @@ func TestDownsampleNativeHistograms(t *testing.T) {
 
 			for _, c := range downsampledChunks {
 				ac := c.Chunk.(*AggrChunk)
-				for i := 0; i < 5; i++ {
+				for i := range 5 {
 					at := AggrType(i)
 
 					_, expected := expectedAggregates[at]
@@ -1057,7 +1057,7 @@ func validateAggrChunks(t *testing.T, aggrChunks []*AggrChunk, chks []chunks.Met
 		var iters [2]chunkenc.Iterator
 		// we need only 0th and 1st AggrType for alignment check,
 		// but we iterate through all 5 to catch error "invalid size"
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			ac, err := c.Get(AggrType(i))
 			testutil.Ok(t, err, "%s. Get AggrType(%d) from aggrChunk #%d. MinT %d, MaxT %d", d, i, j, chks[j].MinTime, chks[j].MaxTime)
 			if i < 2 {
@@ -1477,7 +1477,7 @@ func TestDownsample(t *testing.T) {
 				expected:   []map[AggrType][]sample{{AggrCounter: {}}},
 			}
 
-			for i := int64(0); i < 120; i++ {
+			for i := range int64(120) {
 				d.inAggr[0][AggrCounter] = append(d.inAggr[0][AggrCounter], sample{t: i, v: float64(i)})
 				d.inAggr[1][AggrCounter] = append(d.inAggr[1][AggrCounter], sample{t: 120 + i, v: float64(120 + i)})
 				d.inAggr[2][AggrCounter] = append(d.inAggr[2][AggrCounter], sample{t: 240 + i, v: float64(240 + i)})
@@ -1930,9 +1930,9 @@ func TestApplyCounterResetsIteratorHistograms(t *testing.T) {
 	histograms := tsdbutil.GenerateTestHistograms(lenChunks * lenChunk)
 
 	var chunks [][]*testiters.HistogramPair
-	for i := 0; i < lenChunks; i++ {
+	for i := range lenChunks {
 		var chunk []*testiters.HistogramPair
-		for j := 0; j < lenChunk; j++ {
+		for j := range lenChunk {
 			chunk = append(chunk, &testiters.HistogramPair{T: int64(i*lenChunk+j) * 100, H: histograms[i*lenChunk+j]})
 		}
 		chunks = append(chunks, chunk)
@@ -2192,10 +2192,10 @@ func (b *memBlock) addSeries(s *series) {
 	b.postings = append(b.postings, sid)
 	b.series = append(b.series, s)
 
-	for _, l := range s.lset {
+	s.lset.Range(func(l labels.Label) {
 		b.symbols[l.Name] = struct{}{}
 		b.symbols[l.Value] = struct{}{}
-	}
+	})
 
 	for i, cm := range s.chunks {
 		if b.minTime == -1 || cm.MinTime < b.minTime {
@@ -2566,7 +2566,7 @@ func TestDownsampleMixedChunkTypes(t *testing.T) {
 	}
 
 	var fSamples []sample
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		ts += 15_000
 		fSamples = append(fSamples, sample{
 			t: ts,
@@ -2773,7 +2773,7 @@ func expectedFloatHistogramsSum(floatHistograms []*histogram.FloatHistogram, fro
 	adjustedFloatHistograms := counterResetAdjustFloatHistograms(floatHistograms)
 	sum := adjustedFloatHistograms[fromIndex]
 	for _, s := range adjustedFloatHistograms[fromIndex+1:] {
-		_, err := sum.Add(s)
+		_, _, _, err := sum.Add(s)
 		if err != nil {
 			panic(err)
 		}
@@ -2789,10 +2789,10 @@ func expectedFloatHistogramsCounter(floatHistograms []*histogram.FloatHistogram,
 }
 
 func sumHistograms(floatHistograms []*histogram.FloatHistogram) *histogram.FloatHistogram {
-	var res *histogram.FloatHistogram = floatHistograms[0].Copy()
+	var res = floatHistograms[0].Copy()
 
 	for _, h := range floatHistograms[1:] {
-		added, err := res.Add(h)
+		added, _, _, err := res.Add(h)
 		if err != nil {
 			panic(err)
 		}
@@ -2810,17 +2810,18 @@ func counterResetAdjustFloatHistograms(floatHistograms []*histogram.FloatHistogr
 		if i == 0 {
 			counter = fh.Copy()
 		} else {
+			// TODO: handle NHCB properly.
 			if fh.DetectReset(previous) {
-				_, err := counter.Add(fh)
+				_, _, _, err := counter.Add(fh)
 				if err != nil {
 					panic(err)
 				}
 			} else {
-				s, err := fh.Copy().Sub(previous)
+				s, _, _, err := fh.Copy().Sub(previous)
 				if err != nil {
 					panic(err)
 				}
-				_, err = counter.Add(s)
+				_, _, _, err = counter.Add(s)
 				if err != nil {
 					panic(err)
 				}

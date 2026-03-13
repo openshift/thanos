@@ -7,9 +7,9 @@ import (
 	"math"
 	"time"
 
+	"github.com/thanos-io/promql-engine/compute"
+
 	"github.com/prometheus/prometheus/model/histogram"
-	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/promql/parser"
 )
 
 type functionCall func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool)
@@ -140,12 +140,6 @@ var instantVectorFuncs = map[string]functionCall{
 		}
 		return h.Sum / h.Count, true
 	},
-	"histogram_fraction": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
-		if h == nil || len(vargs) != 2 {
-			return 0., false
-		}
-		return promql.HistogramFraction(vargs[0], vargs[1], h), true
-	},
 	"histogram_stddev": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
 		if h == nil {
 			return 0., false
@@ -159,62 +153,14 @@ var instantVectorFuncs = map[string]functionCall{
 		return histogramStdVar(h), true
 	},
 	// variants of date time functions with an argument
-	"days_in_month": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
-		if h != nil {
-			return 0., false
-		}
-
-		return daysInMonth(dateFromSampleValue(f)), true
-	},
-	"day_of_month": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
-		if h != nil {
-			return 0., false
-		}
-
-		return dayOfMonth(dateFromSampleValue(f)), true
-	},
-	"day_of_week": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
-		if h != nil {
-			return 0., false
-		}
-
-		return dayOfWeek(dateFromSampleValue(f)), true
-	},
-	"day_of_year": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
-		if h != nil {
-			return 0., false
-		}
-
-		return dayOfYear(dateFromSampleValue(f)), true
-	},
-	"hour": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
-		if h != nil {
-			return 0., false
-		}
-
-		return hour(dateFromSampleValue(f)), true
-	},
-	"minute": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
-		if h != nil {
-			return 0., false
-		}
-
-		return minute(dateFromSampleValue(f)), true
-	},
-	"month": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
-		if h != nil {
-			return 0., false
-		}
-
-		return month(dateFromSampleValue(f)), true
-	},
-	"year": func(f float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
-		if h != nil {
-			return 0., false
-		}
-
-		return year(dateFromSampleValue(f)), true
-	},
+	"days_in_month": dateTimeFunc(daysInMonth),
+	"day_of_month":  dateTimeFunc(dayOfMonth),
+	"day_of_week":   dateTimeFunc(dayOfWeek),
+	"day_of_year":   dateTimeFunc(dayOfYear),
+	"hour":          dateTimeFunc(hour),
+	"minute":        dateTimeFunc(minute),
+	"month":         dateTimeFunc(month),
+	"year":          dateTimeFunc(year),
 	// hack we only have sort functions as argument for "timestamp" possibly so they dont actually
 	// need to sort anything. This is only for compatibility to prometheus as this sort of query does
 	// not make too much sense.
@@ -242,30 +188,14 @@ var noArgFuncs = map[string]noArgFunctionCall{
 		return float64(t) / 1000
 	},
 	// variants of date time functions with no argument
-	"days_in_month": func(t int64) float64 {
-		return daysInMonth(dateFromStepTime(t))
-	},
-	"day_of_month": func(t int64) float64 {
-		return dayOfMonth(dateFromStepTime(t))
-	},
-	"day_of_week": func(t int64) float64 {
-		return dayOfWeek(dateFromStepTime(t))
-	},
-	"day_of_year": func(t int64) float64 {
-		return dayOfYear(dateFromStepTime(t))
-	},
-	"hour": func(t int64) float64 {
-		return hour(dateFromStepTime(t))
-	},
-	"minute": func(t int64) float64 {
-		return minute(dateFromStepTime(t))
-	},
-	"month": func(t int64) float64 {
-		return month(dateFromStepTime(t))
-	},
-	"year": func(t int64) float64 {
-		return year(dateFromStepTime(t))
-	},
+	"days_in_month": dateTimeNoArgFunc(daysInMonth),
+	"day_of_month":  dateTimeNoArgFunc(dayOfMonth),
+	"day_of_week":   dateTimeNoArgFunc(dayOfWeek),
+	"day_of_year":   dateTimeNoArgFunc(dayOfYear),
+	"hour":          dateTimeNoArgFunc(hour),
+	"minute":        dateTimeNoArgFunc(minute),
+	"month":         dateTimeNoArgFunc(month),
+	"year":          dateTimeNoArgFunc(year),
 }
 
 func simpleFunc(f func(float64) float64) functionCall {
@@ -274,6 +204,21 @@ func simpleFunc(f func(float64) float64) functionCall {
 			return 0., false
 		}
 		return f(v), true
+	}
+}
+
+func dateTimeFunc(f func(time.Time) float64) functionCall {
+	return func(v float64, h *histogram.FloatHistogram, vargs ...float64) (float64, bool) {
+		if h != nil {
+			return 0., false
+		}
+		return f(dateFromSampleValue(v)), true
+	}
+}
+
+func dateTimeNoArgFunc(f func(time.Time) float64) noArgFunctionCall {
+	return func(t int64) float64 {
+		return f(dateFromStepTime(t))
 	}
 }
 
@@ -317,26 +262,68 @@ func year(t time.Time) float64 {
 	return float64(t.Year())
 }
 
-var XFunctions = map[string]*parser.Function{
-	"xdelta": {
-		Name:       "xdelta",
-		ArgTypes:   []parser.ValueType{parser.ValueTypeMatrix},
-		ReturnType: parser.ValueTypeVector,
-	},
-	"xincrease": {
-		Name:       "xincrease",
-		ArgTypes:   []parser.ValueType{parser.ValueTypeMatrix},
-		ReturnType: parser.ValueTypeVector,
-	},
-	"xrate": {
-		Name:       "xrate",
-		ArgTypes:   []parser.ValueType{parser.ValueTypeMatrix},
-		ReturnType: parser.ValueTypeVector,
-	},
+// TODO: import from prometheus once exported there.
+func histogramStdDev(h *histogram.FloatHistogram) float64 {
+	mean := h.Sum / h.Count
+	var variance, cVariance float64
+	it := h.AllBucketIterator()
+	for it.Next() {
+		bucket := it.At()
+		if bucket.Count == 0 {
+			continue
+		}
+		var val float64
+		switch {
+		case h.UsesCustomBuckets():
+			// Use arithmetic mean in case of custom buckets.
+			val = (bucket.Upper + bucket.Lower) / 2.0
+		case bucket.Lower <= 0 && bucket.Upper >= 0:
+			// Use zero (effectively the arithmetic mean) in the zero bucket of a standard exponential histogram.
+			val = 0
+		default:
+			// Use geometric mean in case of standard exponential buckets.
+			val = math.Sqrt(bucket.Upper * bucket.Lower)
+			if bucket.Upper < 0 {
+				val = -val
+			}
+		}
+		delta := val - mean
+		variance, cVariance = compute.KahanSumInc(bucket.Count*delta*delta, variance, cVariance)
+	}
+	variance += cVariance
+	variance /= h.Count
+	return math.Sqrt(variance)
 }
 
-// IsExtFunction is a convenience function to determine whether extended range calculations are required.
-func IsExtFunction(functionName string) bool {
-	_, ok := XFunctions[functionName]
-	return ok
+// TODO: import from prometheus once exported there.
+func histogramStdVar(h *histogram.FloatHistogram) float64 {
+	mean := h.Sum / h.Count
+	var variance, cVariance float64
+	it := h.AllBucketIterator()
+	for it.Next() {
+		bucket := it.At()
+		if bucket.Count == 0 {
+			continue
+		}
+		var val float64
+		switch {
+		case h.UsesCustomBuckets():
+			// Use arithmetic mean in case of custom buckets.
+			val = (bucket.Upper + bucket.Lower) / 2.0
+		case bucket.Lower <= 0 && bucket.Upper >= 0:
+			// Use zero (effectively the arithmetic mean) in the zero bucket of a standard exponential histogram.
+			val = 0
+		default:
+			// Use geometric mean in case of standard exponential buckets.
+			val = math.Sqrt(bucket.Upper * bucket.Lower)
+			if bucket.Upper < 0 {
+				val = -val
+			}
+		}
+		delta := val - mean
+		variance, cVariance = compute.KahanSumInc(bucket.Count*delta*delta, variance, cVariance)
+	}
+	variance += cVariance
+	variance /= h.Count
+	return variance
 }

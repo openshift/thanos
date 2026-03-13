@@ -42,9 +42,10 @@ type fileContent interface {
 }
 
 type endpointSettings struct {
-	Strict  bool   `yaml:"strict"`
-	Group   bool   `yaml:"group"`
-	Address string `yaml:"address"`
+	Strict        bool   `yaml:"strict"`
+	Group         bool   `yaml:"group"`
+	Address       string `yaml:"address"`
+	ServiceConfig string `yaml:"service_config"`
 }
 
 type EndpointConfig struct {
@@ -114,6 +115,9 @@ func validateEndpointConfig(cfg EndpointConfig) error {
 	for _, ecfg := range cfg.Endpoints {
 		if dns.IsDynamicNode(ecfg.Address) && ecfg.Strict {
 			return errors.Newf("%s is a dynamically specified endpoint i.e. it uses SD and that is not permitted under strict mode.", ecfg.Address)
+		}
+		if !ecfg.Group && len(ecfg.ServiceConfig) != 0 {
+			return errors.Newf("%s service_config is only valid for endpoint groups.", ecfg.Address)
 		}
 	}
 	return nil
@@ -193,7 +197,9 @@ func setupEndpointSet(
 	dnsSDInterval time.Duration,
 	unhealthyTimeout time.Duration,
 	endpointTimeout time.Duration,
+	queryTimeout time.Duration,
 	dialOpts []grpc.DialOption,
+	injectTestAddresses []string,
 	queryConnMetricLabels ...string,
 ) (*query.EndpointSet, error) {
 	configProvider, err := newEndpointConfigProvider(
@@ -217,6 +223,7 @@ func setupEndpointSet(
 			dns.ResolverType(dnsSDResolver),
 		),
 		dnsSDInterval,
+		injectTestAddresses,
 	)
 	dnsEndpointProvider := dns.NewProvider(
 		logger,
@@ -256,6 +263,33 @@ func setupEndpointSet(
 		}
 	}
 	legacyFileSDCache := cache.New()
+
+	// Perform initial DNS resolution before starting periodic updates.
+	// This ensures that DNS providers have addresses when the first endpoint update runs.
+	{
+		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), dnsSDInterval)
+		defer resolveCancel()
+
+		level.Info(logger).Log("msg", "performing initial DNS resolution for endpoints")
+
+		endpointConfig := configProvider.config()
+		addresses := make([]string, 0, len(endpointConfig.Endpoints))
+		for _, ecfg := range endpointConfig.Endpoints {
+			// Only resolve non-group dynamic endpoints here.
+			// Group endpoints are resolved by the gRPC resolver in its Build() method.
+			if addr := ecfg.Address; dns.IsDynamicNode(addr) && !ecfg.Group {
+				addresses = append(addresses, addr)
+			}
+		}
+		// Note: legacyFileSDCache will be empty at this point since file SD hasn't started yet
+		if len(addresses) > 0 {
+			if err := dnsEndpointProvider.Resolve(resolveCtx, addresses, true); err != nil {
+				level.Error(logger).Log("msg", "initial DNS resolution failed", "err", err)
+			}
+		}
+
+		level.Info(logger).Log("msg", "initial DNS resolution completed")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -321,7 +355,7 @@ func setupEndpointSet(
 		for _, ecfg := range endpointConfig.Endpoints {
 			strict, group, addr := ecfg.Strict, ecfg.Group, ecfg.Address
 			if group {
-				specs = append(specs, query.NewGRPCEndpointSpec(fmt.Sprintf("thanos:///%s", addr), strict, append(dialOpts, extgrpc.EndpointGroupGRPCOpts()...)...))
+				specs = append(specs, query.NewGRPCEndpointSpec(fmt.Sprintf("thanos:///%s", addr), strict, append(dialOpts, extgrpc.EndpointGroupGRPCOpts(ecfg.ServiceConfig)...)...))
 			} else if !dns.IsDynamicNode(addr) {
 				specs = append(specs, query.NewGRPCEndpointSpec(addr, strict, dialOpts...))
 			}
@@ -331,7 +365,7 @@ func setupEndpointSet(
 			specs = append(specs, query.NewGRPCEndpointSpec(addr, false, dialOpts...))
 		}
 		return removeDuplicateEndpointSpecs(specs)
-	}, unhealthyTimeout, endpointTimeout, queryConnMetricLabels...)
+	}, unhealthyTimeout, endpointTimeout, queryTimeout, queryConnMetricLabels...)
 
 	g.Add(func() error {
 		return runutil.Repeat(endpointTimeout, ctx.Done(), func() error {

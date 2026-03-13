@@ -35,6 +35,11 @@ import (
 )
 
 func TestCompactor_WriteSeries_e2e(t *testing.T) {
+	if testing.
+		Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -414,9 +419,10 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			// Not used in this test case.
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action:       relabel.Drop,
-					Regex:        relabel.MustNewRegexp("no-match"),
-					SourceLabels: model.LabelNames{"a"},
+					Action:               relabel.Drop,
+					Regex:                relabel.MustNewRegexp("no-match"),
+					SourceLabels:         model.LabelNames{"a"},
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{
@@ -443,9 +449,10 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			},
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action:       relabel.Drop,
-					Regex:        relabel.MustNewRegexp("1"),
-					SourceLabels: model.LabelNames{"a"},
+					Action:               relabel.Drop,
+					Regex:                relabel.MustNewRegexp("1"),
+					SourceLabels:         model.LabelNames{"a"},
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{
@@ -474,18 +481,20 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			// {a="1"} will be relabeled to {a="3"} while {a="2"} will be relabeled to {a="0"}.
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action:       relabel.Replace,
-					Regex:        relabel.MustNewRegexp("1"),
-					SourceLabels: model.LabelNames{"a"},
-					TargetLabel:  "a",
-					Replacement:  "3",
+					Action:               relabel.Replace,
+					Regex:                relabel.MustNewRegexp("1"),
+					SourceLabels:         model.LabelNames{"a"},
+					TargetLabel:          "a",
+					Replacement:          "3",
+					NameValidationScheme: model.UTF8Validation,
 				},
 				&relabel.Config{
-					Action:       relabel.Replace,
-					Regex:        relabel.MustNewRegexp("2"),
-					SourceLabels: model.LabelNames{"a"},
-					TargetLabel:  "a",
-					Replacement:  "0",
+					Action:               relabel.Replace,
+					Regex:                relabel.MustNewRegexp("2"),
+					SourceLabels:         model.LabelNames{"a"},
+					TargetLabel:          "a",
+					Replacement:          "0",
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{
@@ -516,8 +525,9 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			// Drop all label name "a".
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action: relabel.LabelDrop,
-					Regex:  relabel.MustNewRegexp("a"),
+					Action:               relabel.LabelDrop,
+					Regex:                relabel.MustNewRegexp("a"),
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected:        nil,
@@ -543,8 +553,9 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			// Drop all label name "a".
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action: relabel.LabelDrop,
-					Regex:  relabel.MustNewRegexp("a"),
+					Action:               relabel.LabelDrop,
+					Regex:                relabel.MustNewRegexp("a"),
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{
@@ -571,11 +582,12 @@ func TestCompactor_WriteSeries_e2e(t *testing.T) {
 			// Replace values of label name "a" with "0".
 			modifiers: []Modifier{WithRelabelModifier(
 				&relabel.Config{
-					Action:       relabel.Replace,
-					Regex:        relabel.MustNewRegexp("1|2"),
-					SourceLabels: model.LabelNames{"a"},
-					TargetLabel:  "a",
-					Replacement:  "0",
+					Action:               relabel.Replace,
+					Regex:                relabel.MustNewRegexp("1|2"),
+					SourceLabels:         model.LabelNames{"a"},
+					TargetLabel:          "a",
+					Replacement:          "0",
+					NameValidationScheme: model.UTF8Validation,
 				},
 			)},
 			expected: []seriesSamples{

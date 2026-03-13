@@ -55,7 +55,6 @@ func validateKindName(name string) error {
 	}
 	if !kindNamePattern.MatchString(name) {
 		return errors.Newf("name can have only %v characters due to kind cluster name constraints, got: %v", kindNamePattern.String(), name)
-
 	}
 	return nil
 }
@@ -128,14 +127,14 @@ func NewKindEnvironment(opts ...EnvironmentOption) (_ *KindEnvironment, err erro
 
 	// Setup the kind cluster.
 	if out, err := k.exec("kind", "create", "cluster", "--kubeconfig", k.kubeconfig(), "--config", kindConfigPath, "--name", k.clusterName).CombinedOutput(); err != nil {
-		e.logger.Log(string(out))
+		_ = e.logger.Log(string(out))
 		k.Close()
 		return nil, errors.Wrapf(err, "create kind cluster %q", k.clusterName)
 	}
 
 	out, err := k.exec("kubectl", "--kubeconfig", k.kubeconfig(), "get", "nodes", fmt.Sprintf("%s-control-plane", k.clusterName), "--output", `jsonpath='{.status.addresses}'`).CombinedOutput()
 	if err != nil {
-		e.logger.Log(string(out))
+		_ = e.logger.Log(string(out))
 		k.Close()
 		return nil, errors.Wrapf(err, "get details of kind cluster node '%s-control-plane'", k.clusterName)
 	}
@@ -147,9 +146,9 @@ func NewKindEnvironment(opts ...EnvironmentOption) (_ *KindEnvironment, err erro
 	var addresses []address
 	out = unwrapQuotes(out)
 	if err := json.Unmarshal(out, &addresses); err != nil {
-		e.logger.Log("my string without quotes")
-		e.logger.Log(len(out))
-		e.logger.Log(string(out))
+		_ = e.logger.Log("my string without quotes")
+		_ = e.logger.Log(len(out))
+		_ = e.logger.Log(string(out))
 		k.Close()
 		return nil, errors.Wrap(err, "unmarshal kubectl output to get node IP")
 	}
@@ -433,7 +432,7 @@ func (e *KindEnvironment) exec(cmd string, args ...string) *exec.Cmd {
 func (e *KindEnvironment) execContext(ctx context.Context, cmd string, args ...string) *exec.Cmd {
 	c := NewCommand(cmd, args...)
 	if e.verbose {
-		e.logger.Log("kindEnv:", c.toString())
+		_ = e.logger.Log("kindEnv:", c.toString())
 	}
 	return c.exec(ctx)
 }
@@ -446,16 +445,17 @@ func (e *KindEnvironment) close() {
 	// Teardown the kind cluter.
 	// Kind is idempotent and doesn't care if the cluster doesn't exist, it won't throw an error.
 	if out, err := e.exec("kind", "delete", "cluster", "--name", e.clusterName).CombinedOutput(); err != nil {
-		e.logger.Log(string(out))
-		e.logger.Log("Unable to delete kind cluster", e.clusterName, ":", err.Error())
+		_ = e.logger.Log(string(out))
+		_ = e.logger.Log("Unable to delete kind cluster", e.clusterName, ":", err.Error())
 	}
 
 	if e.dir != "" {
-		if err := e.exec("chmod", "-R", "777", e.dir).Run(); err != nil {
-			e.logger.Log("Error while chmod sharedDir", e.dir, "err:", err)
+		if out, err := e.exec("chmod", "-R", "777", e.dir).CombinedOutput(); err != nil {
+			_ = e.logger.Log(string(out))
+			_ = e.logger.Log("Error while chmod sharedDir", e.dir, "err:", err)
 		}
 		if err := os.RemoveAll(e.dir); err != nil {
-			e.logger.Log("Error while removing sharedDir", e.dir, "err:", err)
+			_ = e.logger.Log("Error while removing sharedDir", e.dir, "err:", err)
 		}
 	}
 }
@@ -549,18 +549,18 @@ func (r *kindRunnable) Start() (err error) {
 		return errors.Newf("%q is running; stop or kill it first to restart", r.Name())
 	}
 
-	r.logger.Log("Starting", r.Name())
+	_ = r.logger.Log("Starting", r.Name())
 
 	// In case of any error, if the container was already created, we
 	// have to cleanup removing it.
 	defer func() {
 		if err != nil {
 			if out, err := r.env.exec("kubernetes", "delete", "deployment", r.Name(), "--ignore-not-found", "--grace-period", "0", "--force").CombinedOutput(); err != nil {
-				r.logger.Log(string(out))
+				_ = r.logger.Log(string(out))
 				return
 			}
 			if out, err := r.env.exec("kubernetes", "delete", "service", r.Name(), "--ignore-not-found", "--grace-period", "0", "--force").CombinedOutput(); err != nil {
-				r.logger.Log(string(out))
+				_ = r.logger.Log(string(out))
 				return
 			}
 		}
@@ -620,7 +620,7 @@ func (r *kindRunnable) Start() (err error) {
 			r.hostPorts[port.Name] = port.NodePort
 		}
 
-		r.logger.Log("Ports for container", r.Name(), ">> Local ports:", r.ports, "Ports available from host:", r.hostPorts)
+		_ = r.logger.Log("Ports for container", r.Name(), ">> Local ports:", r.ports, "Ports available from host:", r.hostPorts)
 	}
 
 	return nil
@@ -631,13 +631,13 @@ func (r *kindRunnable) Stop() error {
 		return nil
 	}
 
-	r.logger.Log("Stopping", r.Name())
+	_ = r.logger.Log("Stopping", r.Name())
 	if out, err := r.env.exec("kubernetes", "delete", "deployment", r.Name(), "--ignore-not-found", "--grace-period", "30").CombinedOutput(); err != nil {
-		r.logger.Log(string(out))
+		_ = r.logger.Log(string(out))
 		return err
 	}
 	if out, err := r.env.exec("kubernetes", "delete", "service", r.Name(), "--ignore-not-found", "--grace-period", "30").CombinedOutput(); err != nil {
-		r.logger.Log(string(out))
+		_ = r.logger.Log(string(out))
 		return err
 	}
 	defer r.mutex.Unlock()
@@ -651,13 +651,13 @@ func (r *kindRunnable) Kill() error {
 		return nil
 	}
 
-	r.logger.Log("Killing", r.Name())
+	_ = r.logger.Log("Killing", r.Name())
 	if out, err := r.env.exec("kubernetes", "delete", "deployment", r.Name(), "--ignore-not-found", "--grace-period", "0", "--force").CombinedOutput(); err != nil {
-		r.logger.Log(string(out))
+		_ = r.logger.Log(string(out))
 		return err
 	}
 	if out, err := r.env.exec("kubernetes", "delete", "service", r.Name(), "--ignore-not-found", "--grace-period", "0", "--force").CombinedOutput(); err != nil {
-		r.logger.Log(string(out))
+		_ = r.logger.Log(string(out))
 		return err
 	}
 
@@ -754,7 +754,7 @@ func (r *kindRunnable) waitForRunning() (err error) {
 	}
 
 	if len(out) > 0 {
-		r.logger.Log(string(out))
+		_ = r.logger.Log(string(out))
 	}
 	return errors.Wrapf(err, "pod %q failed to start", r.Name())
 }
@@ -766,25 +766,25 @@ func (r *kindRunnable) prePullImage(ctx context.Context) (err error) {
 		return errors.Newf("service %q is running; expected stopped", r.Name())
 	}
 
-	if _, err = r.env.execContext(ctx, "docker", "image", "inspect", r.opts.Image).CombinedOutput(); err == nil {
-		return nil
+	if _, err = r.env.execContext(ctx, "docker", "image", "inspect", r.opts.Image).CombinedOutput(); err != nil {
+		cmd := r.env.execContext(ctx, "docker", "pull", r.opts.Image)
+		l := &LinePrefixLogger{prefix: r.Name() + ": ", logger: r.logger}
+		cmd.Stdout = l
+		cmd.Stderr = l
+		if err = cmd.Run(); err != nil {
+			return errors.Wrapf(err, "docker image %q failed to download", r.opts.Image)
+		}
 	}
 
-	// Assuming Error: No such image: <image>.
-	cmd := r.env.execContext(ctx, "docker", "pull", r.opts.Image)
+	return r.loadImageIntoKindCluster(ctx)
+}
+
+func (r *kindRunnable) loadImageIntoKindCluster(ctx context.Context) error {
+	cmd := r.env.execContext(ctx, "kind", "load", "docker-image", "--name", r.env.clusterName, r.opts.Image)
 	l := &LinePrefixLogger{prefix: r.Name() + ": ", logger: r.logger}
 	cmd.Stdout = l
 	cmd.Stderr = l
-	if err = cmd.Run(); err != nil {
-		return errors.Wrapf(err, "docker image %q failed to download", r.opts.Image)
-	}
-
-	if err := r.env.execContext(ctx, "docker", "image", "inspect", r.opts.Image).Run(); err == nil {
-		return errors.Wrapf(err, "load image %q into cluster", r.opts.Image)
-
-	}
-
-	return nil
+	return cmd.Run()
 }
 
 func (r *kindRunnable) WaitReady() (err error) {

@@ -5,18 +5,14 @@ package function
 
 import (
 	"context"
-	"time"
 
 	"github.com/thanos-io/promql-engine/execution/model"
-	"github.com/thanos-io/promql-engine/execution/telemetry"
 	"github.com/thanos-io/promql-engine/logicalplan"
 
 	"github.com/prometheus/prometheus/model/labels"
 )
 
 type noArgFunctionOperator struct {
-	telemetry.OperatorTelemetry
-
 	mint        int64
 	maxt        int64
 	step        int64
@@ -24,7 +20,6 @@ type noArgFunctionOperator struct {
 	stepsBatch  int
 	funcExpr    *logicalplan.FunctionCall
 	call        noArgFunctionCall
-	vectorPool  *model.VectorPool
 	series      []labels.Labels
 	sampleIDs   []uint64
 }
@@ -38,38 +33,29 @@ func (o *noArgFunctionOperator) String() string {
 }
 
 func (o *noArgFunctionOperator) Series(_ context.Context) ([]labels.Labels, error) {
-	start := time.Now()
-	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
-
 	return o.series, nil
 }
 
-func (o *noArgFunctionOperator) GetPool() *model.VectorPool {
-	return o.vectorPool
-}
-
-func (o *noArgFunctionOperator) Next(ctx context.Context) ([]model.StepVector, error) {
-	start := time.Now()
-	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
-
+func (o *noArgFunctionOperator) Next(ctx context.Context, buf []model.StepVector) (int, error) {
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return 0, ctx.Err()
 	default:
 	}
 
 	if o.currentStep > o.maxt {
-		return nil, nil
+		return 0, nil
 	}
 
-	ret := o.vectorPool.GetVectorBatch()
-	for i := 0; i < o.stepsBatch && o.currentStep <= o.maxt; i++ {
-		sv := o.vectorPool.GetStepVector(o.currentStep)
-		sv.Samples = []float64{o.call(o.currentStep)}
-		sv.SampleIDs = o.sampleIDs
-		ret = append(ret, sv)
+	n := 0
+	maxSteps := min(o.stepsBatch, len(buf))
+
+	for i := 0; i < maxSteps && o.currentStep <= o.maxt; i++ {
+		buf[n].Reset(o.currentStep)
+		buf[n].AppendSample(o.sampleIDs[0], o.call(o.currentStep))
+		n++
 		o.currentStep += o.step
 	}
 
-	return ret, nil
+	return n, nil
 }

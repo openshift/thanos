@@ -6,7 +6,6 @@ package function
 import (
 	"context"
 	"math"
-	"time"
 
 	"github.com/thanos-io/promql-engine/execution/model"
 	"github.com/thanos-io/promql-engine/execution/telemetry"
@@ -16,19 +15,15 @@ import (
 )
 
 type scalarOperator struct {
-	pool *model.VectorPool
 	next model.VectorOperator
-	telemetry.OperatorTelemetry
 }
 
-func newScalarOperator(pool *model.VectorPool, next model.VectorOperator, opts *query.Options) *scalarOperator {
+func newScalarOperator(next model.VectorOperator, opts *query.Options) model.VectorOperator {
 	oper := &scalarOperator{
-		pool: pool,
 		next: next,
 	}
 
-	oper.OperatorTelemetry = telemetry.NewTelemetry(oper, opts)
-	return oper
+	return telemetry.NewOperator(telemetry.NewTelemetry(oper, opts), oper)
 }
 
 func (o *scalarOperator) String() string {
@@ -40,46 +35,32 @@ func (o *scalarOperator) Explain() (next []model.VectorOperator) {
 }
 
 func (o *scalarOperator) Series(ctx context.Context) ([]labels.Labels, error) {
-	start := time.Now()
-	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
-
 	return nil, nil
 }
 
-func (o *scalarOperator) GetPool() *model.VectorPool {
-	return o.pool
-}
-
-func (o *scalarOperator) Next(ctx context.Context) ([]model.StepVector, error) {
-	start := time.Now()
-	defer func() { o.AddExecutionTimeTaken(time.Since(start)) }()
-
+func (o *scalarOperator) Next(ctx context.Context, buf []model.StepVector) (int, error) {
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return 0, ctx.Err()
 	default:
 	}
 
-	in, err := o.next.Next(ctx)
+	n, err := o.next.Next(ctx, buf)
 	if err != nil {
-		return nil, err
-	}
-	if len(in) == 0 {
-		return nil, nil
+		return 0, err
 	}
 
-	result := o.GetPool().GetVectorBatch()
-	for _, vector := range in {
-		sv := o.GetPool().GetStepVector(vector.T)
-		if len(vector.Samples) != 1 {
-			sv.AppendSample(o.GetPool(), 0, math.NaN())
+	for i := range n {
+		vector := &buf[i]
+		var val float64
+		if len(vector.Samples) == 1 {
+			val = vector.Samples[0]
 		} else {
-			sv.AppendSample(o.GetPool(), 0, vector.Samples[0])
+			val = math.NaN()
 		}
-		result = append(result, sv)
-		o.next.GetPool().PutStepVector(vector)
+		vector.Reset(vector.T)
+		vector.AppendSample(0, val)
 	}
-	o.next.GetPool().PutVectors(in)
 
-	return result, nil
+	return n, nil
 }
