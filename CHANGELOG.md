@@ -14,6 +14,8 @@ It is recommend to upgrade the storage components first (Receive, Store, etc.) a
 
 ### Fixed
 
+- [#8726](https://github.com/thanos-io/thanos/pull/8726): *: Bump `thanos-community/grpc-go` fork to fix CVE-2026-33186 (CVSS 9.1), an authorization bypass via malformed `:path` headers that could bypass path-based "deny" rules in `grpc/authz` interceptors.
+
 ### Added
 
 ### Changed
