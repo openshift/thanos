@@ -1746,7 +1746,7 @@ google.golang.org/genproto/googleapis/api/monitoredres
 google.golang.org/genproto/googleapis/rpc/code
 google.golang.org/genproto/googleapis/rpc/errdetails
 google.golang.org/genproto/googleapis/rpc/status
-# google.golang.org/grpc v1.76.0 => github.com/thanos-community/grpc-go v0.0.0-20251106112228-b9020406f781
+# google.golang.org/grpc v1.76.0 => github.com/thanos-community/grpc-go v0.0.0-20260331083222-a7315f1dfb76
 ## explicit; go 1.24.0
 google.golang.org/grpc
 google.golang.org/grpc/attributes
@@ -1994,6 +1994,6 @@ zenhack.net/go/util/sync/mutex
 # github.com/prometheus/prometheus => github.com/machine424/prometheus v0.0.0-20260312223754-be691e93d050
 # github.com/sercand/kuberesolver/v4 => github.com/sercand/kuberesolver/v5 v5.1.1
 # github.com/vimeo/galaxycache => github.com/thanos-community/galaxycache v0.0.0-20211122094458-3a32041a1f1e
-# google.golang.org/grpc => github.com/thanos-community/grpc-go v0.0.0-20251106112228-b9020406f781
+# google.golang.org/grpc => github.com/thanos-community/grpc-go v0.0.0-20260331083222-a7315f1dfb76
 # gopkg.in/alecthomas/kingpin.v2 => github.com/alecthomas/kingpin v1.3.8-0.20210301060133-17f40c25f497
 # zenhack.net/go/util => github.com/zenhack/go-util v0.0.0-20231005031245-66f5419c2aea
