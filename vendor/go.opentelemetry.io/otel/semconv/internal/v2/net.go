@@ -287,27 +287,27 @@ func splitHostPort(hostport string) (host string, port int) {
 		addrEnd := strings.LastIndex(hostport, "]")
 		if addrEnd < 0 {
 			// Invalid hostport.
-			return host, port
+			return
 		}
 		if i := strings.LastIndex(hostport[addrEnd:], ":"); i < 0 {
 			host = hostport[1:addrEnd]
-			return host, port
+			return
 		}
 	} else {
 		if i := strings.LastIndex(hostport, ":"); i < 0 {
 			host = hostport
-			return host, port
+			return
 		}
 	}
 
 	host, pStr, err := net.SplitHostPort(hostport)
 	if err != nil {
-		return host, port
+		return
 	}
 
 	p, err := strconv.ParseUint(pStr, 10, 16)
 	if err != nil {
-		return host, port
+		return
 	}
 	return host, int(p) // nolint: gosec  // Bit size of 16 checked above.
 }
