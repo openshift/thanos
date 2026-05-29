@@ -94,7 +94,7 @@ require (
 	golang.org/x/sync v0.15.0
 	golang.org/x/text v0.26.0
 	golang.org/x/time v0.12.0
-	google.golang.org/grpc v1.73.0
+	google.golang.org/grpc v1.79.3
 	google.golang.org/grpc/examples v0.0.0-20211119005141-f45e61797429
 	google.golang.org/protobuf v1.36.6
 	gopkg.in/yaml.v2 v2.4.0
