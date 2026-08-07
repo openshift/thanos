@@ -165,7 +165,7 @@ func (r *Reader) Close() error {
 }
 
 func (r *Reader) freeFirstBufferIfEmpty() bool {
-	if len(r.data) == 0 || r.bufferIdx != len(r.data[0].ReadOnlyData()) {
+	if len(r.data) == 0 || r.bufferIdx != r.data[0].Len() {
 		return false
 	}
 
@@ -256,18 +256,6 @@ func ReadAll(r io.Reader, pool BufferPool) (BufferSlice, error) {
 		w := NewWriter(&result, pool)
 		_, err := wt.WriteTo(w)
 		return result, err
-	}
-
-	if lr, ok := r.(*io.LimitedReader); ok {
-		if wt, ok := lr.R.(io.WriterTo); ok {
-			// This is more optimal since wt knows the size of chunks it wants to
-			// write and, hence, we can allocate buffers of an optimal size to fit
-			// them. E.g. might be a single big chunk, and we wouldn't chop it
-			// into pieces.
-			w := NewWriter(&result, pool)
-			_, err := wt.WriteTo(w)
-			return result, err
-		}
 	}
 nextBuffer:
 	for {
