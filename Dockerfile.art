@@ -2,7 +2,7 @@ FROM brew.registry.redhat.io/rh-osbs/openshift-golang-builder:rhel_9_1.26 as bui
 
 WORKDIR /workspace
 
-COPY thanos .
+COPY . .
 
 ENV GOTOOLCHAIN=local
 ENV CGO_ENABLED=1
