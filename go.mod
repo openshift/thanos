@@ -80,10 +80,10 @@ require (
 	go.uber.org/atomic v1.11.0
 	go.uber.org/automaxprocs v1.5.3
 	go.uber.org/goleak v1.3.0
-	golang.org/x/crypto v0.31.0
-	golang.org/x/net v0.33.0
-	golang.org/x/sync v0.10.0
-	golang.org/x/text v0.21.0
+	golang.org/x/crypto v0.41.0
+	golang.org/x/net v0.42.0
+	golang.org/x/sync v0.16.0
+	golang.org/x/text v0.28.0
 	golang.org/x/time v0.7.0
 	google.golang.org/api v0.195.0 // indirect
 	google.golang.org/genproto v0.0.0-20240823204242-4ba0660f739c // indirect
@@ -273,10 +273,10 @@ require (
 	go.opentelemetry.io/otel/metric v1.31.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.3.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/mod v0.21.0 // indirect
+	golang.org/x/mod v0.26.0 // indirect
 	golang.org/x/oauth2 v0.23.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
-	golang.org/x/tools v0.24.0 // indirect
+	golang.org/x/sys v0.35.0 // indirect
+	golang.org/x/tools v0.35.0 // indirect
 	gonum.org/v1/gonum v0.15.0 // indirect
 	google.golang.org/protobuf v1.35.1
 	howett.net/plist v0.0.0-20181124034731-591f970eefbb // indirect
@@ -301,3 +301,5 @@ replace (
 	// Overriding to use latest commit.
 	gopkg.in/alecthomas/kingpin.v2 => github.com/alecthomas/kingpin v1.3.8-0.20210301060133-17f40c25f497
 )
+
+replace golang.org/x/net => github.com/openshift-sustaining/net v0.43.0-sec.4
