@@ -4,18 +4,16 @@ reviewers:
 - simonpasquier
 - jan--f
 - slashpai
-- marioferh
 - danielmellado
-- rexagod
+- marioferh
 - machine424
 
 approvers:
 - simonpasquier
 - jan--f
 - slashpai
-- marioferh
 - danielmellado
-- rexagod
+- marioferh
 - machine424
 
 emeritus_approvers:
@@ -39,3 +37,4 @@ emeritus_approvers:
 - JoaoBraveCoding
 - juanrh
 - raptorsun
+- rexagod
