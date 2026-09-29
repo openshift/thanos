@@ -1962,7 +1962,7 @@ google.golang.org/grpc/xds/googledirectpath
 # google.golang.org/grpc/examples v0.0.0-20250407062114-b368379ef8f6
 ## explicit; go 1.23.0
 google.golang.org/grpc/examples/features/proto/echo
-# google.golang.org/protobuf v1.36.11
+# google.golang.org/protobuf v1.36.12
 ## explicit; go 1.23
 google.golang.org/protobuf/encoding/protodelim
 google.golang.org/protobuf/encoding/protojson
