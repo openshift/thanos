@@ -253,6 +253,12 @@ func getCipherSuiteIDs(ciphers []string) ([]uint16, error) {
 	for _, cs := range supported {
 		cipherMap[cs.Name] = cs.ID
 	}
+	// The Old TLS Profile includes ciphers which are considered insecure by
+	// the Go toolchain.
+	// Refer to https://redhat.atlassian.net/browse/OCPBUGS-128640
+	for _, cs := range tls.InsecureCipherSuites() {
+		cipherMap[cs.Name] = cs.ID
+	}
 	validNames := make([]string, 0, len(cipherMap))
 	for n := range cipherMap {
 		validNames = append(validNames, n)
