@@ -1,0 +1,24 @@
+FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.26-openshift-4.22 AS builder
+WORKDIR /go/src/github.com/improbable-eng/thanos
+COPY . .
+ENV GOFLAGS="-mod=vendor"
+ENV GO111MODULE=on
+ENV GOPROXY=direct
+# Installing using the upstream Makefile doesn't work with older versions of Git and newer versions of Go.
+# Instead install promu from the upstream tarball.
+# For downstream builds, promu is available from the package repositories.
+RUN if ! yum install -y prometheus-promu; then \
+        curl -s -L https://github.com/prometheus/promu/releases/download/v0.5.0/promu-0.5.0.linux-amd64.tar.gz | tar -xzvf - -C /usr/bin  --strip-components 1 promu-0.5.0.linux-amd64/promu; \
+    fi; \
+    promu build;
+FROM registry.ci.openshift.org/ocp/4.22:base-rhel9
+LABEL io.k8s.display-name="OpenShift Thanos" \
+      io.k8s.description="Highly available Prometheus setup with long term storage capabilities." \
+      io.openshift.tags="prometheus,monitoring" \
+      summary="Highly available Prometheus setup with long term storage capabilities." \
+      maintainer="OpenShift Monitoring Team <team-monitoring@redhat.com>"
+
+COPY --from=builder /go/src/github.com/improbable-eng/thanos/thanos /bin/thanos
+
+USER       nobody
+ENTRYPOINT [ "/bin/thanos" ]

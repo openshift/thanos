@@ -1,0 +1,293 @@
+// Copyright (c) The Thanos Community Authors.
+// Licensed under the Apache License 2.0.
+
+package scan
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"sync"
+
+	"github.com/thanos-io/promql-engine/execution/model"
+	"github.com/thanos-io/promql-engine/execution/telemetry"
+	"github.com/thanos-io/promql-engine/extlabels"
+	"github.com/thanos-io/promql-engine/logicalplan"
+	"github.com/thanos-io/promql-engine/query"
+	"github.com/thanos-io/promql-engine/ringbuffer"
+
+	"github.com/prometheus/prometheus/model/histogram"
+	"github.com/prometheus/prometheus/model/labels"
+)
+
+type subqueryOperator struct {
+	next      model.VectorOperator
+	paramOp   model.VectorOperator
+	paramOp2  model.VectorOperator
+	call      ringbuffer.FunctionCall
+	telemetry telemetry.OperatorTelemetry
+	funcExpr  *logicalplan.FunctionCall
+	subQuery  *logicalplan.Subquery
+	opts      *query.Options
+
+	mint        int64
+	maxt        int64
+	currentStep int64
+	step        int64
+	stepsBatch  int
+
+	onceSeries sync.Once
+	series     []labels.Labels
+
+	lastVectors   []model.StepVector
+	lastCollected int
+	buffers       []*ringbuffer.GenericRingBuffer
+
+	// params holds the function parameter for each step.
+	// quantile_over time and predict_linear use one parameter (params)
+	// double_exponential_smoothing uses two (params, params2) for (sf, tf)
+	params  []float64
+	params2 []float64
+
+	paramBuf  []model.StepVector
+	param2Buf []model.StepVector
+	tempBuf   []model.StepVector
+}
+
+func NewSubqueryOperator(next, paramOp, paramOp2 model.VectorOperator, opts *query.Options, funcExpr *logicalplan.FunctionCall, subQuery *logicalplan.Subquery) (model.VectorOperator, error) {
+	call, err := ringbuffer.NewRangeVectorFunc(funcExpr.Func.Name)
+	if err != nil {
+		return nil, err
+	}
+	step := opts.Step.Milliseconds()
+	if step == 0 {
+		step = 1
+	}
+
+	o := &subqueryOperator{
+		next:          next,
+		paramOp:       paramOp,
+		paramOp2:      paramOp2,
+		call:          call,
+		funcExpr:      funcExpr,
+		subQuery:      subQuery,
+		opts:          opts,
+		mint:          opts.Start.UnixMilli(),
+		maxt:          opts.End.UnixMilli(),
+		currentStep:   opts.Start.UnixMilli(),
+		step:          step,
+		stepsBatch:    opts.StepsBatch,
+		lastCollected: -1,
+		params:        make([]float64, opts.StepsBatch),
+		params2:       make([]float64, opts.StepsBatch),
+	}
+	o.telemetry = telemetry.NewSubqueryTelemetry(o, opts)
+	return telemetry.NewOperator(o.telemetry, o), nil
+}
+
+func (o *subqueryOperator) String() string {
+	return fmt.Sprintf("[subquery] %v()", o.funcExpr.Func.Name)
+}
+
+func (o *subqueryOperator) Explain() (next []model.VectorOperator) {
+	switch o.funcExpr.Func.Name {
+	case "quantile_over_time", "predict_linear":
+		return []model.VectorOperator{o.paramOp, o.next}
+	case "double_exponential_smoothing":
+		return []model.VectorOperator{o.paramOp, o.paramOp2, o.next}
+	default:
+		return []model.VectorOperator{o.next}
+	}
+}
+
+func (o *subqueryOperator) Next(ctx context.Context, buf []model.StepVector) (int, error) {
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
+	if o.currentStep > o.maxt {
+		return 0, nil
+	}
+	if err := o.initSeries(ctx); err != nil {
+		return 0, err
+	}
+
+	if o.paramOp != nil {
+		n, err := o.paramOp.Next(ctx, o.paramBuf)
+		if err != nil {
+			return 0, err
+		}
+		for i := range n {
+			o.params[i] = math.NaN()
+			if len(o.paramBuf[i].Samples) == 1 {
+				o.params[i] = o.paramBuf[i].Samples[0]
+			}
+
+		}
+	}
+
+	if o.paramOp2 != nil { // double_exponential_smoothing
+		n, err := o.paramOp2.Next(ctx, o.param2Buf)
+		if err != nil {
+			return 0, err
+		}
+		for i := range n {
+			o.params2[i] = math.NaN()
+			if len(o.param2Buf[i].Samples) == 1 {
+				o.params2[i] = o.param2Buf[i].Samples[0]
+			}
+
+		}
+	}
+
+	n := 0
+	maxSteps := min(o.stepsBatch, len(buf))
+
+	for i := 0; o.currentStep <= o.maxt && i < maxSteps; i++ {
+		mint := o.currentStep - o.subQuery.Range.Milliseconds() - o.subQuery.OriginalOffset.Milliseconds() + 1
+		maxt := o.currentStep - o.subQuery.OriginalOffset.Milliseconds()
+		for _, b := range o.buffers {
+			b.Reset(mint, maxt+o.subQuery.Offset.Milliseconds())
+		}
+		if len(o.lastVectors) > 0 {
+			for _, v := range o.lastVectors[o.lastCollected+1:] {
+				if v.T > maxt {
+					break
+				}
+				o.collect(v, mint)
+				o.lastCollected++
+			}
+			if o.lastCollected == len(o.lastVectors)-1 {
+
+				o.lastVectors = nil
+				o.lastCollected = -1
+			}
+		}
+
+	ACC:
+		for len(o.lastVectors) == 0 {
+			vecN, err := o.next.Next(ctx, o.tempBuf)
+			if err != nil {
+				return 0, err
+			}
+			if vecN == 0 {
+				break ACC
+			}
+			vectors := o.tempBuf[:vecN]
+			for j, vector := range vectors {
+				if vector.T > maxt {
+					o.lastVectors = vectors
+					o.lastCollected = j - 1
+					break ACC
+				}
+				o.collect(vector, mint)
+			}
+
+		}
+
+		buf[n].Reset(o.currentStep)
+		hint := len(o.buffers)
+		for sampleId, rangeSamples := range o.buffers {
+			f, h, ok, _, err := rangeSamples.Eval(ctx, o.params[i], o.params2[i], math.MinInt64)
+			if err != nil {
+				return 0, err
+			}
+			// Note: warnings from subqueries are currently ignored since we don't have metric names here
+			if ok {
+				if h != nil {
+					buf[n].AppendHistogramWithSizeHint(uint64(sampleId), h, hint)
+				} else {
+					buf[n].AppendSampleWithSizeHint(uint64(sampleId), f, hint)
+				}
+			}
+			o.telemetry.IncrementSamplesAtTimestamp(rangeSamples.SampleCount(), buf[n].T)
+		}
+		n++
+		o.currentStep += o.step
+	}
+
+	return n, nil
+}
+
+func (o *subqueryOperator) collect(v model.StepVector, mint int64) {
+	if v.T < mint {
+		return
+	}
+	for i, s := range v.Samples {
+		buffer := o.buffers[v.SampleIDs[i]]
+		if !ringbuffer.Empty(buffer) && v.T <= buffer.MaxT() {
+			continue
+		}
+		buffer.Push(v.T, ringbuffer.Value{F: s})
+	}
+	for i, s := range v.Histograms {
+		buffer := o.buffers[v.HistogramIDs[i]]
+		if !ringbuffer.Empty(buffer) && v.T < buffer.MaxT() {
+			continue
+		}
+		// Set any "NotCounterReset" and "CounterReset" hints in native
+		// histograms to "UnknownCounterReset" because we might
+		// otherwise miss a counter reset happening in samples not
+		// returned by the subquery, or we might over-detect counter
+		// resets if the sample with a counter reset is returned
+		// multiple times by a high-res subquery. This intentionally
+		// does not attempt to be clever (like detecting if we are
+		// really missing underlying samples or returning underlying
+		// samples multiple times) because subqueries on counters are
+		// inherently problematic WRT counter reset handling, so we
+		// cannot really solve the problem for good. We only want to
+		// avoid problems that happen due to the explicitly set counter
+		// reset hints and go back to the behavior we already know from
+		// float samples.
+		switch s.CounterResetHint {
+		case histogram.NotCounterReset, histogram.CounterReset:
+			s.CounterResetHint = histogram.UnknownCounterReset
+		}
+		buffer.Push(v.T, ringbuffer.Value{H: s})
+	}
+
+}
+
+func (o *subqueryOperator) Series(ctx context.Context) ([]labels.Labels, error) {
+	if err := o.initSeries(ctx); err != nil {
+		return nil, err
+	}
+	return o.series, nil
+}
+
+func (o *subqueryOperator) initSeries(ctx context.Context) error {
+	var err error
+	o.onceSeries.Do(func() {
+
+		o.tempBuf = make([]model.StepVector, o.stepsBatch)
+		if o.paramOp != nil {
+			o.paramBuf = make([]model.StepVector, o.stepsBatch)
+		}
+		if o.paramOp2 != nil {
+			o.param2Buf = make([]model.StepVector, o.stepsBatch)
+		}
+
+		var series []labels.Labels
+		series, err = o.next.Series(ctx)
+		if err != nil {
+			return
+		}
+
+		o.series = make([]labels.Labels, len(series))
+		o.buffers = make([]*ringbuffer.GenericRingBuffer, len(series))
+		for i := range o.buffers {
+			o.buffers[i] = ringbuffer.New(ctx, 8, o.subQuery.Range.Milliseconds(), o.subQuery.Offset.Milliseconds(), o.call)
+		}
+		var b labels.ScratchBuilder
+		for i, s := range series {
+			lbls := s
+			if o.funcExpr.Func.Name != "last_over_time" {
+				lbls = extlabels.DropReserved(s, b)
+			}
+			o.series[i] = lbls
+		}
+
+	})
+	return err
+}

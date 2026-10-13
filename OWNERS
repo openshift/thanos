@@ -1,0 +1,41 @@
+component: "Monitoring"
+
+reviewers:
+- simonpasquier
+- jan--f
+- slashpai
+- marioferh
+- danielmellado
+- rexagod
+- machine424
+
+approvers:
+- simonpasquier
+- jan--f
+- slashpai
+- marioferh
+- danielmellado
+- rexagod
+- machine424
+
+emeritus_approvers:
+- paulfantom
+- dgrisonnet
+- squat
+- kakkoyun
+- metalmatze
+- lilic
+- brancz
+- krasi-georgiev
+- pgier
+- s-urbaniak
+- prashbnair
+- arajkumar
+- PhilipGough
+- bison
+- fpetkovski
+- bwplotka
+- sthaha
+- JoaoBraveCoding
+- juanrh
+- raptorsun

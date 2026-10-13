@@ -1,0 +1,40 @@
+version: "2"
+run:
+  issues-exit-code: 1
+linters:
+  enable:
+    - goconst
+    - godot
+    - misspell
+    - promlinter
+    - unparam
+  settings:
+    goconst:
+      min-occurrences: 5
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - promlinter
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
