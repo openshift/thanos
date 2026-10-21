@@ -1,0 +1,42 @@
+FROM brew.registry.redhat.io/rh-osbs/openshift-golang-builder:rhel_9_1.25 as builder
+
+WORKDIR /workspace
+
+COPY . .
+
+ENV GOTOOLCHAIN=local
+ENV CGO_ENABLED=1
+ENV GOEXPERIMENT=strictfipsruntime
+
+# Konflux prepends: . /cachi2/cachi2.env && …
+# cachi2.env often sets GOFLAGS=-mod=mod, which makes the compiler expect module zips under the
+# prefetch cache (…/pkg/mod/cache/download/*.zip) that Thanos builds hit as missing. The submodule
+# ships vendor/; -mod=vendor avoids that. Pass -mod/-tags on the CLI so they override GOFLAGS.
+ARG TARGETOS TARGETARCH
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -mod=vendor -tags=netgo,slicelabels -o /go/bin/thanos ./cmd/thanos
+
+FROM registry.redhat.io/ubi9/ubi-minimal:latest@sha256:7c372902c8d211db2d25c8277ba534a73b92742a334874dced829a63b0f21221
+WORKDIR /
+
+COPY --from=builder /go/bin/thanos /bin/thanos
+COPY --from=builder /workspace/LICENSE /licenses/.
+
+USER nobody
+ENTRYPOINT [ "/bin/thanos" ]
+
+ARG VERSION=v0.41.0
+LABEL com.redhat.component="coo-thanos-container" \
+      name="cluster-observability-operator/thanos-rhel9" \
+      cpe="cpe:/a:redhat:cluster_observability_operator:1.5::el9" \
+      version="${VERSION}" \
+      release="${VERSION}" \
+      vendor="Red Hat, Inc." \
+      distribution-scope="public" \
+      url="https://github.com/openshift/thanos" \
+      summary="Thanos for Cluster Observability Operator" \
+      io.openshift.expose-services="" \
+      io.openshift.tags="monitoring" \
+      io.k8s.display-name="COO Thanos" \
+      io.k8s.description="Thanos extends Prometheus with highly available, scalable and unlimited metric storage." \
+      maintainer="team-monitoring@redhat.com" \
+      description="Thanos for Cluster Observability Operator"
