@@ -15,7 +15,8 @@ ENV GOEXPERIMENT=strictfipsruntime
 ARG TARGETOS TARGETARCH
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH go build -mod=vendor -tags=netgo,slicelabels -o /go/bin/thanos ./cmd/thanos
 
-FROM registry.redhat.io/ubi9/ubi-minimal:latest@sha256:8eb2830d0936237fc13a1f2f7e45aecf90d69043380ad167fad0343632937f41
+# ART/Doozer handles base image pinning
+FROM registry.redhat.io/ubi9/ubi-minimal:latest
 WORKDIR /
 
 COPY --from=builder /go/bin/thanos /bin/thanos
