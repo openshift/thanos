@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+
+	"github.com/klauspost/compress/internal/race"
 )
 
 var (
@@ -33,7 +35,7 @@ func DecodedLen(src []byte) (int, error) {
 // that the length header occupied.
 func decodedLen(src []byte) (blockLen, headerLen int, err error) {
 	v, n := binary.Uvarint(src)
-	if n <= 0 || v > 0xffffffff {
+	if n <= 0 || n > 5 || v > 0xffffffff {
 		return 0, 0, ErrCorrupt
 	}
 
@@ -63,6 +65,10 @@ func Decode(dst, src []byte) ([]byte, error) {
 	} else {
 		dst = make([]byte, dLen)
 	}
+
+	race.WriteSlice(dst)
+	race.ReadSlice(src[s:])
+
 	if s2Decode(dst, src[s:]) != 0 {
 		return nil, ErrCorrupt
 	}
