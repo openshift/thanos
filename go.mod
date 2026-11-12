@@ -1,6 +1,6 @@
 module github.com/thanos-io/thanos
 
-go 1.24.0
+go 1.25
 
 require (
 	capnproto.org/go/capnp/v3 v3.1.0-alpha.1
@@ -41,7 +41,7 @@ require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jpillora/backoff v1.0.0
 	github.com/json-iterator/go v1.1.12
-	github.com/klauspost/compress v1.18.7
+	github.com/klauspost/compress v1.20.2
 	github.com/leanovate/gopter v0.2.9
 	github.com/lightstep/lightstep-tracer-go v0.26.0
 	github.com/lovoo/gcloud-opentracing v0.3.0
